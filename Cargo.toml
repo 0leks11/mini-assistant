@@ -45,6 +45,9 @@ dotenvy = "0.15"
 # Base64 (for Gemini audio encoding)
 base64 = "0.22"
 
+# Futures utilities (StreamExt, SinkExt)
+futures-util = "0.3"
+
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
