@@ -1,0 +1,22 @@
+# Copy this to config.toml and fill in your values
+# config.toml is gitignored — safe to put non-secret values here
+# Secrets (API keys, passwords) go in .env
+
+[assistant]
+name = "Мини"
+voice = "Aoede"                          # Gemini voice (Aoede/Charon/Fenrir/Kore/Puck)
+languages = ["ru-RU", "en-US"]
+
+[gemini]
+model = "models/gemini-2.0-flash-live-001"
+# api_key — set via GEMINI_API_KEY env var, not here
+
+[audio]
+capture_device = "hw:0,0"               # Mini microphone (verify with: aplay -l)
+playback_device = "hw:0,0"              # Mini speaker
+sample_rate = 16000
+channels = 1
+
+[ha]
+url = "http://192.168.77.2:8123"        # Raspberry Pi address
+# token — set via HA_TOKEN env var, not here

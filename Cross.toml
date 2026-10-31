@@ -1,0 +1,8 @@
+[build.env]
+passthrough = [
+    "GEMINI_API_KEY",
+    "SPOTIFY_USERNAME",
+]
+
+[target.armv7-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main"

@@ -1,0 +1,59 @@
+[package]
+name = "mini-assistant"
+version = "0.1.0"
+edition = "2021"
+authors = ["mini-assistant contributors"]
+description = "Custom voice assistant for Yandex Station Mini 1 (A113X, ARM32)"
+repository = "https://github.com/YOUR_USERNAME/mini-assistant"
+license = "MIT"
+
+[[bin]]
+name = "mini-assistant"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket (Gemini Live API)
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# HTTP client (Home Assistant API)
+reqwest = { version = "0.12", features = ["json"] }
+
+# ALSA audio
+alsa = "0.9"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config file
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Env vars
+dotenvy = "0.15"
+
+# Base64 (for Gemini audio encoding)
+base64 = "0.22"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = "z"    # minimize binary size
+strip = true       # strip debug symbols
+lto = true         # link-time optimization
+codegen-units = 1  # better optimization
+panic = "abort"    # smaller binary
+
+[profile.dev]
+opt-level = 1      # faster dev builds

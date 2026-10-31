@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+
+# Secrets — NEVER commit these
+.env
+config.toml
+*.key
+*.pem
+*.ppn
+.credentials/
+.spotify-credentials
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
