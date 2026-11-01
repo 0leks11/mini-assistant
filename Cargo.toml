@@ -15,13 +15,14 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# WebSocket (Gemini Live API)
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+# WebSocket (Gemini Live API) - pure Rust TLS, perfect for musl & embedded
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
-# HTTP client (Home Assistant API)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (Home Assistant API) - pure Rust TLS with embedded root certificates
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
-# ALSA audio
+# ALSA audio (only on Linux target; dev mock used on macOS)
+[target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
 
 # Serialization

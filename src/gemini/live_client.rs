@@ -70,6 +70,7 @@ pub struct ToolCallRequest {
 }
 
 pub struct GeminiLiveClient {
+    #[allow(dead_code)]
     pub tx_audio: mpsc::Sender<Vec<u8>>,
 }
 

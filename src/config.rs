@@ -74,6 +74,12 @@ impl Config {
             config.gemini.api_key = std::env::var("GEMINI_API_KEY").ok();
         }
         if let Some(ref mut ha) = config.ha {
+            if let Ok(url) = std::env::var("HA_URL") {
+                let trimmed = url.trim();
+                if !trimmed.is_empty() && !trimmed.contains(".x") {
+                    ha.url = trimmed.to_string();
+                }
+            }
             if ha.token.is_none() {
                 ha.token = std::env::var("HA_TOKEN").ok();
             }

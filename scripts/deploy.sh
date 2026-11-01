@@ -34,6 +34,7 @@ echo "📦 Deploying to Mini ($MINI_HOST)..."
 $SSH_CMD "mkdir -p $MINI_DEPLOY_DIR"
 scp -P $MINI_PORT -i $MINI_SSH_KEY $BINARY root@$MINI_HOST:$MINI_DEPLOY_DIR/
 scp -P $MINI_PORT -i $MINI_SSH_KEY config.toml root@$MINI_HOST:$MINI_DEPLOY_DIR/ 2>/dev/null || echo "⚠️  No config.toml found — copy config.example.toml to config.toml first"
+scp -P $MINI_PORT -i $MINI_SSH_KEY .env root@$MINI_HOST:$MINI_DEPLOY_DIR/ 2>/dev/null || echo "⚠️  No .env found — copy .env.example to .env first"
 
 echo "🔍 Verifying binary on Mini..."
 $SSH_CMD "$MINI_DEPLOY_DIR/mini-assistant --version 2>/dev/null || echo 'Binary deployed (no --version yet)'"

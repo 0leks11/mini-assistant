@@ -169,6 +169,7 @@ fn extract_vqe_pcm(payload: &[u8]) -> Option<Vec<u8>> {
 
 /// VQE IPC Audio capture client
 pub struct VqeCapture {
+    #[allow(dead_code)]
     pcm_tx: mpsc::Sender<Vec<u8>>,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }

@@ -8,6 +8,8 @@ mod audio;
 mod config;
 mod gemini;
 mod ha;
+#[allow(dead_code)]
+mod wakeword;
 
 #[tokio::main]
 async fn main() -> Result<()> {
