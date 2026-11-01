@@ -8,7 +8,7 @@ voice = "Aoede"                          # Gemini voice (Aoede/Charon/Fenrir/Kor
 languages = ["ru-RU", "en-US"]
 
 [gemini]
-model = "models/gemini-2.0-flash-live-001"
+model = "models/gemini-3.8-live"
 # api_key — set via GEMINI_API_KEY env var, not here
 
 [audio]
