@@ -27,8 +27,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install Linux audio development libraries
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
       - name: Check formatting, lint and tests
         run: ./scripts/check.sh
