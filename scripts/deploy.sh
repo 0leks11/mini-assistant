@@ -4,8 +4,10 @@
 
 set -euo pipefail
 
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Load .env if exists
-[ -f .env ] && source .env
+[ -f "$PROJECT_DIR/.env" ] && source "$PROJECT_DIR/.env"
 
 MINI_HOST="${MINI_HOST:-192.168.77.110}"
 MINI_PORT="${MINI_PORT:-2222}"
@@ -25,19 +27,23 @@ done
 SSH_CMD="ssh -p $MINI_PORT -i $MINI_SSH_KEY root@$MINI_HOST"
 
 echo "🔨 Building for ARM32 (musl static)..."
-cross build --target $TARGET --release
+docker run --rm \
+  -v "$PROJECT_DIR":/home/rust/src \
+  -v "$HOME"/.cargo/registry:/root/.cargo/registry \
+  -v "$HOME"/.cargo/git:/root/.cargo/git \
+  messense/rust-musl-cross:armv7-musleabihf \
+  cargo build --target "$TARGET" --release
 
-BINARY="target/$TARGET/release/mini-assistant"
-echo "✅ Build done: $(du -sh $BINARY | cut -f1) binary"
+BINARY="$PROJECT_DIR/target/$TARGET/release/mini-assistant"
+echo "✅ Build done: $(du -sh "$BINARY" | cut -f1) binary"
 
 echo "📦 Deploying to Mini ($MINI_HOST)..."
 $SSH_CMD "mkdir -p $MINI_DEPLOY_DIR"
-scp -P $MINI_PORT -i $MINI_SSH_KEY $BINARY root@$MINI_HOST:$MINI_DEPLOY_DIR/
-scp -P $MINI_PORT -i $MINI_SSH_KEY config.toml root@$MINI_HOST:$MINI_DEPLOY_DIR/ 2>/dev/null || echo "⚠️  No config.toml found — copy config.example.toml to config.toml first"
-scp -P $MINI_PORT -i $MINI_SSH_KEY .env root@$MINI_HOST:$MINI_DEPLOY_DIR/ 2>/dev/null || echo "⚠️  No .env found — copy .env.example to .env first"
+scp -P $MINI_PORT -i $MINI_SSH_KEY "$BINARY" root@$MINI_HOST:$MINI_DEPLOY_DIR/
+scp -P $MINI_PORT -i $MINI_SSH_KEY "$PROJECT_DIR/config.toml" root@$MINI_HOST:$MINI_DEPLOY_DIR/ 2>/dev/null || echo "⚠️  No config.toml found"
+scp -P $MINI_PORT -i $MINI_SSH_KEY "$PROJECT_DIR/.env" root@$MINI_HOST:$MINI_DEPLOY_DIR/ 2>/dev/null || echo "⚠️  No .env found"
 
 echo "🔍 Verifying binary on Mini..."
-$SSH_CMD "$MINI_DEPLOY_DIR/mini-assistant --version 2>/dev/null || echo 'Binary deployed (no --version yet)'"
 $SSH_CMD "file $MINI_DEPLOY_DIR/mini-assistant"
 
 echo "✅ Deploy complete!"

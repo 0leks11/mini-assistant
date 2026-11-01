@@ -1,107 +1,49 @@
-# Agent Rules — mini-assistant
+# Правила агентов: mini-assistant
 
-This file defines rules and goals for AI agents (Antigravity, Gemini CLI, etc.)
-working on this project.
+Общие правила рабочего каталога находятся в [../AGENTS.md](../AGENTS.md),
+порядок разработки — в [CONTRIBUTING.md](CONTRIBUTING.md).
+При отдельном клонировании этого репозитория родительский файл может отсутствовать;
+действуют доступные инструкции и правила ниже.
 
-## Project Goal
+## Цель и границы
 
-Replace Yandex `maind` on Yandex Station Mini 1 (YNDX-0004, A113X, ARM32)
-with a fully custom Rust voice assistant stack. No Yandex services or accounts.
+- Цель — собственный голосовой помощник на Mini 1 без сервисов и аккаунтов Яндекса.
+- Разделяй цель, реализацию в коде и подтверждённую работу на устройстве.
+  Наличие модуля или успешная сборка не доказывают готовность голосового диалога.
+- Исследуй существующий код до выбора архитектуры; не объявляй конкретный облачный
+  провайдер, OAuth, wake-word или Spotify реализованными без подтверждения.
+- Отвечай пользователю по-русски. Имена API, символов и команд сохраняй как в коде.
 
-## Target Device
+## Код и совместимость
 
-| Parameter | Value |
-|---|---|
-| SoC | Amlogic A113X — 4× Cortex-A53 |
-| Userspace | ARM32 (ELF32), glibc 2.23 |
-| RAM | ~236 MiB total |
-| Build target | `armv7-unknown-linux-musleabihf` (static, musl) |
-| Audio | ALSA, DU561 DSP/VQE, 4 microphones |
-| SSH | Port 2222, key-only, root |
+- Rust 2021; следуй существующему стилю: `tokio`, `tracing`, `anyhow`/`thiserror`.
+- Для новых публичных API пиши документацию о контракте и ошибках.
+- Целевая среда Mini: ARM32/ELF32, A113X, glibc 2.23, около 236 MiB RAM.
+  64-битный SoC не означает 64-битный userspace.
+- Проверки на macOS используют другую ветку аудиокода и не подтверждают Linux/ALSA.
+- Выбор musl target не доказывает статическую линковку всех native-зависимостей.
+  Для ARM-артефакта проверяй ELF, interpreter, `NEEDED` и совместимость ALSA.
+- Предпочитай ограниченные очереди, явные тайм-ауты и корректное завершение аудио,
+  сетевых соединений и фоновых задач. Не логируй аудио или текст диалога по умолчанию.
 
-## Architecture
+## Выполнение задачи
 
-```
-Mini (A113X):
-  mini-assistant (Rust static binary)
-    ├── wake-word   (Porcupine)
-    ├── alsa-in     (mic capture, VQE tap at 16kHz)
-    ├── gemini      (Gemini Live API, real-time voice)
-    ├── alsa-out    (speaker playback)
-    ├── ha-client   (Home Assistant REST API)
-    ├── led         (sysfs GPIO)
-    └── buttons     (evdev)
-  librespot (Spotify Connect, static Rust)
+1. Прочитай `git status`, затронутые модули и инструкции; сохрани чужие изменения.
+2. Назови ожидаемое поведение, риск и проверки. Для сложной задачи веди план.
+3. Внеси ограниченное изменение и релевантные тесты поведения.
+4. Запусти проверки по [матрице](CONTRIBUTING.md#проверки).
+   Для Rust-кода: `./scripts/check.sh`; предупреждения Clippy считаются ошибками.
+5. Проведи ревью diff: ошибки, регрессии, совместимость, секреты, покрытие.
+6. Коммить только относящиеся к задаче файлы; сообщи результат и непрошедшие проверки.
 
-Pi 4B:
-  Home Assistant only
-```
+## Секреты и устройство
 
-## Development Rules
-
-### Security
-- NEVER hardcode API keys, passwords, or tokens in source code
-- NEVER commit `.env` or `config.toml` (they are gitignored)
-- ALL secrets go in `.env` (local) — use `.env.example` as template
-- Spotify credentials stored in keyring or env, never in git
-
-### Code Style
-- Rust edition 2021
-- Use `tokio` for async runtime
-- Error handling: `anyhow` for application errors, `thiserror` for library errors
-- Logging: `tracing` crate
-- All public functions must have doc comments
-- Run `cargo clippy` before commit — zero warnings policy
-
-### Cross-compilation
-- Target: `armv7-unknown-linux-musleabihf` (musl = no glibc dependency)
-- Tool: `cross` (Docker-based)
-- Build: `cross build --target armv7-unknown-linux-musleabihf --release`
-- Binary must be fully static — verify with: `file target/.../mini-assistant`
-
-### Git Workflow
-- Branch: `main` (stable), `dev` (development), `feature/xxx` (features)
-- Commit format: `type(scope): description`
-  - Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`
-  - Example: `feat(gemini): add real-time audio streaming`
-- Every commit must build successfully for ARM32 target
-- Tag releases: `v0.1.0`, `v0.2.0`, etc.
-
-### Deployment
-- Deploy script: `scripts/deploy.sh`
-- Test on Mini before merging to main
-- Never remove maind until our stack is fully tested in parallel
-
-## Phase Plan
-
-| Phase | Goal | Status |
-|---|---|---|
-| 0 | Setup cross-compilation toolchain | 🔄 In Progress |
-| 1 | librespot (Spotify) on Mini | ⏳ Pending |
-| 1 | Gemini Live voice bridge (test) | ⏳ Pending |
-| 2 | mini-assistant v0.1 Rust binary on Mini | ⏳ Pending |
-| 3 | Wake word + full voice cycle | ⏳ Pending |
-| 4 | Replace maind completely | ⏳ Pending |
-| 5 | Home Assistant voice integration | ⏳ Pending |
-
-## What NOT to do
-
-- Do NOT modify `/etc/init.d/S90maind` until Phase 4
-- Do NOT kill maind manually during testing
-- Do NOT write secrets to any file tracked by git
-- Do NOT use Yandex APIs or accounts
-- Do NOT assume glibc version > 2.23 on Mini
-- Do NOT use Python for final Mini binaries (RAM constraint)
-
-## Authentication Approach
-
-For Gemini: OAuth2 with Google Account (no hardcoded API key)
-- Preferred: device flow OAuth (user logs in once, token refreshed automatically)
-- Reference: how SolidCraft (solidcraft.io) and Antigravity CLI handle Google auth
-- Token stored in: `/data/opt/mini-assistant/.credentials/` (not in git)
-
-For Spotify: OAuth2 PKCE flow via librespot
-- Credentials stored in: `/data/opt/mini-assistant/.spotify-credentials`
-
-For Home Assistant: Long-lived access token
-- Stored in: `.env` → `HA_TOKEN`
+- Секреты храни локально в `.env`/credential store; шаблоны содержат только заглушки.
+  `.env`, `config.toml`, ключи и токены не должны попадать в Git, логи или ответы.
+- Не запускай основной бинарь для обычной локальной проверки: он может включить
+  микрофон, отправлять аудио в облако и вызывать сервисы Home Assistant.
+- Не отключай и не удаляй `maind`, не меняй автозагрузку, OTA, boot или разделы
+  в рамках обычного code-review/сборки. Для таких работ нужен отдельный план
+  миграции с резервной копией и проверенным восстановлением в рамках задачи пользователя.
+- Аппаратный тест выполняй только в согласованном объёме; фиксируй питание,
+  версию/хеш бинаря, параметры аудио, наблюдения и восстановленное состояние.

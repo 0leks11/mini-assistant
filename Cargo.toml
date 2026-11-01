@@ -48,10 +48,6 @@ futures-util = "0.3"
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
-# ALSA audio (only on Linux target; dev mock used on macOS)
-[target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.9"
-
 [profile.release]
 opt-level = "z"    # minimize binary size
 strip = true       # strip debug symbols

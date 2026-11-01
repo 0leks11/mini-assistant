@@ -5,4 +5,4 @@ passthrough = [
 ]
 
 [target.armv7-unknown-linux-musleabihf]
-image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main"
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:edge"

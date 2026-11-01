@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use std::io::Write;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-/// ALSA Playback Controller
+/// Audio Playback Controller using native ALSA aplay process streaming
 pub struct AudioPlayback {
     audio_tx: mpsc::Sender<Vec<u8>>,
     is_interrupted: Arc<AtomicBool>,
@@ -19,75 +21,76 @@ impl AudioPlayback {
         let interrupted_flag = is_interrupted.clone();
 
         std::thread::spawn(move || {
-            info!("Starting ALSA playback worker on '{}' ({} Hz)...", device_name, sample_rate);
+            info!("Starting ALSA audio playback worker on '{}' ({} Hz)...", device_name, sample_rate);
 
-            #[cfg(target_os = "linux")]
-            {
-                use alsa::pcm::{Access, Format, HwParams, PCM};
-                use alsa::Direction;
+            // Locate aplay binary on system (stock Yandex uses /system/workdir/bin/aplay or /usr/bin/aplay)
+            let aplay_path = if std::path::Path::new("/system/workdir/bin/aplay").exists() {
+                "/system/workdir/bin/aplay"
+            } else if std::path::Path::new("/usr/bin/aplay").exists() {
+                "/usr/bin/aplay"
+            } else {
+                "aplay"
+            };
 
-                let pcm = match PCM::new(&device_name, Direction::Playback, false) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!("Failed to open ALSA playback device '{}': {}", device_name, e);
-                        return;
+            let mut current_child: Option<Child> = None;
+
+            while let Some(chunk) = audio_rx.blocking_recv() {
+                if interrupted_flag.load(Ordering::SeqCst) {
+                    if let Some(mut child) = current_child.take() {
+                        debug!("Barge-in interrupt: killing active aplay process");
+                        let _ = child.kill();
+                        let _ = child.wait();
                     }
+                    continue;
+                }
+
+                // If child process is finished or not spawned yet, spawn new aplay instance
+                let need_spawn = match &mut current_child {
+                    None => true,
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => true,
+                        Ok(None) => false,
+                    },
                 };
 
-                let hwp = match HwParams::any(&pcm) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        error!("Failed to get HW params: {}", e);
-                        return;
+                if need_spawn {
+                    let child = Command::new(aplay_path)
+                        .args([
+                            "-q",
+                            "-D", &device_name,
+                            "-r", &sample_rate.to_string(),
+                            "-f", "S16_LE",
+                            "-c", "1",
+                            "-t", "raw",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+
+                    match child {
+                        Ok(c) => current_child = Some(c),
+                        Err(e) => {
+                            // On host (macOS dev), aplay might not exist
+                            debug!("Mock playback (aplay not found / failed: {}), received {} bytes", e, chunk.len());
+                            continue;
+                        }
                     }
-                };
-
-                if let Err(e) = hwp.set_channels(1) {
-                    error!("Failed to set mono channel: {}", e);
-                    return;
-                }
-                if let Err(e) = hwp.set_rate(sample_rate, alsa::ValueOr::Nearest) {
-                    error!("Failed to set rate {}: {}", sample_rate, e);
-                    return;
-                }
-                if let Err(e) = hwp.set_format(Format::s16()) {
-                    error!("Failed to set format S16_LE: {}", e);
-                    return;
-                }
-                if let Err(e) = hwp.set_access(Access::RWInterleaved) {
-                    error!("Failed to set RWInterleaved: {}", e);
-                    return;
-                }
-                if let Err(e) = pcm.hw_params(&hwp) {
-                    error!("Failed to apply hw_params: {}", e);
-                    return;
                 }
 
-                let io = pcm.io_bytes();
-
-                while let Some(chunk) = audio_rx.blocking_recv() {
-                    if interrupted_flag.load(Ordering::SeqCst) {
-                        debug!("Playback interrupted flag set, skipping chunk");
-                        let _ = pcm.drop();
-                        continue;
-                    }
-
-                    if let Err(e) = io.writei(&chunk) {
-                        debug!("ALSA write underrun / error: {}, attempting recover", e);
-                        let _ = pcm.try_recover(e, false);
+                if let Some(ref mut child) = current_child {
+                    if let Some(ref mut stdin) = child.stdin {
+                        if let Err(e) = stdin.write_all(&chunk) {
+                            debug!("Failed to write chunk to aplay: {}", e);
+                            current_child = None;
+                        }
                     }
                 }
             }
 
-            #[cfg(not(target_os = "linux"))]
-            {
-                // Host dev stub (macOS / Windows mock)
-                while let Some(chunk) = audio_rx.blocking_recv() {
-                    if interrupted_flag.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    debug!("Mock audio playback: {} bytes", chunk.len());
-                }
+            if let Some(mut child) = current_child {
+                let _ = child.kill();
+                let _ = child.wait();
             }
         });
 
