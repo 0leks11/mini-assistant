@@ -35,8 +35,9 @@ impl WakeWordEngine for SimpleVadEngine {
         let mut sum_sq = 0.0f64;
         let mut sample_count = 0;
 
-        for chunk in pcm_chunk.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
+        let (chunks, _) = pcm_chunk.as_chunks::<2>();
+        for chunk in chunks {
+            let sample = i16::from_le_bytes(*chunk) as f64;
             sum_sq += sample * sample;
             sample_count += 1;
         }
@@ -46,7 +47,10 @@ impl WakeWordEngine for SimpleVadEngine {
         if rms > self.threshold_rms {
             self.consecutive_active += 1;
             if self.consecutive_active >= self.required_consecutive {
-                debug!("VAD voice detected (RMS: {:.1} > {:.1})", rms, self.threshold_rms);
+                debug!(
+                    "VAD voice detected (RMS: {:.1} > {:.1})",
+                    rms, self.threshold_rms
+                );
                 return true;
             }
         } else {
@@ -69,4 +73,57 @@ impl WakeWordEngine for AlwaysActiveEngine {
         true
     }
     fn reset(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vad_empty_or_short_input() {
+        let mut vad = SimpleVadEngine::new(500.0);
+        assert!(!vad.process(&[]));
+        assert!(!vad.process(&[0x00]));
+    }
+
+    #[test]
+    fn test_vad_silence() {
+        let mut vad = SimpleVadEngine::new(500.0);
+        let silence = [0u8; 512];
+        for _ in 0..10 {
+            assert!(!vad.process(&silence));
+        }
+    }
+
+    #[test]
+    fn test_vad_consecutive_activation() {
+        let mut vad = SimpleVadEngine::new(1000.0);
+
+        // Frame with high energy amplitude (approx ~5000 RMS)
+        let mut loud_frame = Vec::new();
+        for i in 0..256 {
+            let sample: i16 = if i % 2 == 0 { 5000 } else { -5000 };
+            loud_frame.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        // Frame 1: active count = 1, returns false
+        assert!(!vad.process(&loud_frame));
+        // Frame 2: active count = 2, returns false
+        assert!(!vad.process(&loud_frame));
+        // Frame 3: active count = 3 >= required_consecutive (3), returns true!
+        assert!(vad.process(&loud_frame));
+
+        // After reset, counter is zeroed
+        vad.reset();
+        assert!(!vad.process(&loud_frame));
+    }
+
+    #[test]
+    fn test_always_active_engine() {
+        let mut engine = AlwaysActiveEngine;
+        assert!(engine.process(&[]));
+        assert!(engine.process(&[1, 2, 3, 4]));
+        engine.reset();
+        assert!(engine.process(&[]));
+    }
 }

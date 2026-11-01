@@ -21,7 +21,10 @@ impl AudioPlayback {
         let interrupted_flag = is_interrupted.clone();
 
         std::thread::spawn(move || {
-            info!("Starting ALSA audio playback worker on '{}' ({} Hz)...", device_name, sample_rate);
+            info!(
+                "Starting ALSA audio playback worker on '{}' ({} Hz)...",
+                device_name, sample_rate
+            );
 
             // Locate aplay binary on system (stock Yandex uses /system/workdir/bin/aplay or /usr/bin/aplay)
             let aplay_path = if std::path::Path::new("/system/workdir/bin/aplay").exists() {
@@ -57,11 +60,16 @@ impl AudioPlayback {
                     let child = Command::new(aplay_path)
                         .args([
                             "-q",
-                            "-D", &device_name,
-                            "-r", &sample_rate.to_string(),
-                            "-f", "S16_LE",
-                            "-c", "1",
-                            "-t", "raw",
+                            "-D",
+                            &device_name,
+                            "-r",
+                            &sample_rate.to_string(),
+                            "-f",
+                            "S16_LE",
+                            "-c",
+                            "1",
+                            "-t",
+                            "raw",
                         ])
                         .stdin(Stdio::piped())
                         .stdout(Stdio::null())
@@ -72,7 +80,11 @@ impl AudioPlayback {
                         Ok(c) => current_child = Some(c),
                         Err(e) => {
                             // On host (macOS dev), aplay might not exist
-                            debug!("Mock playback (aplay not found / failed: {}), received {} bytes", e, chunk.len());
+                            debug!(
+                                "Mock playback (aplay not found / failed: {}), received {} bytes",
+                                e,
+                                chunk.len()
+                            );
                             continue;
                         }
                     }
@@ -103,7 +115,10 @@ impl AudioPlayback {
     /// Queue audio chunk for playback
     pub async fn play(&self, pcm_chunk: Vec<u8>) -> Result<()> {
         self.is_interrupted.store(false, Ordering::SeqCst);
-        self.audio_tx.send(pcm_chunk).await.context("Playback channel closed")
+        self.audio_tx
+            .send(pcm_chunk)
+            .await
+            .context("Playback channel closed")
     }
 
     /// Immediately interrupt playback (barge-in when user speaks)

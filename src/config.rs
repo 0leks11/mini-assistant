@@ -62,16 +62,15 @@ impl Config {
         let config_path = PathBuf::from("config.toml");
 
         let config_str = if config_path.exists() {
-            std::fs::read_to_string(&config_path)
-                .context("Failed to read config.toml")?
+            std::fs::read_to_string(&config_path).context("Failed to read config.toml")?
         } else {
             // Use defaults for testing
             tracing::warn!("config.toml not found, using defaults");
             include_str!("../config.example.toml").to_string()
         };
 
-        let mut config: Config = toml::from_str(&config_str)
-            .context("Failed to parse config.toml")?;
+        let mut config: Config =
+            toml::from_str(&config_str).context("Failed to parse config.toml")?;
 
         // Override with env vars (secrets should come from env, not config file)
         if config.gemini.api_key.is_none() {
@@ -90,5 +89,47 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_parse_example_toml() {
+        let example_toml = include_str!("../config.example.toml");
+        let config: Config =
+            toml::from_str(example_toml).expect("config.example.toml must be valid TOML");
+        assert_eq!(config.assistant.name, "Мини");
+        assert_eq!(config.assistant.voice, "Aoede");
+        assert_eq!(config.gemini.model, "models/gemini-3.8-live");
+        assert!(config.gemini.api_key.is_none());
+        assert!(config.ha.is_some());
+    }
+
+    #[test]
+    fn test_config_ha_placeholder_ignored() {
+        let toml_str = r#"
+            [assistant]
+            name = "Тест"
+            voice = "Puck"
+            languages = ["ru-RU"]
+
+            [gemini]
+            model = "models/gemini-3.8-live"
+
+            [audio]
+            capture_device = "hw:0,0"
+            playback_device = "hw:0,0"
+            sample_rate = 16000
+            channels = 1
+
+            [ha]
+            url = "http://192.168.77.2:8123"
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.ha.unwrap().url, "http://192.168.77.2:8123");
     }
 }

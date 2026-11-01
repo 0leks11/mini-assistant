@@ -265,3 +265,72 @@ impl Drop for VqeCapture {
         self.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_varint_roundtrip() {
+        let test_values = [0, 1, 127, 128, 159, 253, 300, 16384, 100_000, u64::MAX / 2];
+        for &val in &test_values {
+            let encoded = varint(val);
+            let mut offset = 0;
+            let decoded = read_varint(&encoded, &mut offset).expect("decoding failed");
+            assert_eq!(decoded, val);
+            assert_eq!(offset, encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_read_varint_truncated() {
+        let buf = [0x80u8, 0x80u8];
+        let mut offset = 0;
+        assert_eq!(read_varint(&buf, &mut offset), None);
+    }
+
+    #[test]
+    fn test_build_ipc_request_framing() {
+        let req_pkt = build_ipc_request(3);
+        assert!(req_pkt.len() > 4);
+        let len_prefix =
+            u32::from_le_bytes([req_pkt[0], req_pkt[1], req_pkt[2], req_pkt[3]]) as usize;
+        assert_eq!(req_pkt.len() - 4, len_prefix);
+    }
+
+    #[test]
+    fn test_extract_vqe_pcm_valid() {
+        let pcm_payload = vec![0x12, 0x34, 0x56, 0x78];
+        let mut ch_info = blob(2, b"vqe_0");
+        ch_info.extend_from_slice(&blob(3, &pcm_payload));
+
+        let body = blob(1, &ch_info);
+        let mut payload = blob(252, &body);
+        payload.extend_from_slice(&number(253, 158));
+
+        let extracted = extract_vqe_pcm(&payload);
+        assert_eq!(extracted, Some(pcm_payload));
+    }
+
+    #[test]
+    fn test_extract_vqe_pcm_wrong_kind() {
+        let mut ch_info = blob(2, b"vqe_0");
+        ch_info.extend_from_slice(&blob(3, &[1, 2, 3]));
+        let body = blob(1, &ch_info);
+        let mut payload = blob(252, &body);
+        payload.extend_from_slice(&number(253, 100));
+
+        assert_eq!(extract_vqe_pcm(&payload), None);
+    }
+
+    #[test]
+    fn test_extract_vqe_pcm_different_channel() {
+        let mut ch_info = blob(2, b"raw_mic_0");
+        ch_info.extend_from_slice(&blob(3, &[1, 2, 3]));
+        let body = blob(1, &ch_info);
+        let mut payload = blob(252, &body);
+        payload.extend_from_slice(&number(253, 158));
+
+        assert_eq!(extract_vqe_pcm(&payload), None);
+    }
+}

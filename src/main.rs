@@ -99,10 +99,26 @@ async fn main() -> Result<()> {
                 let ha = ha_arc.clone();
                 let output = match req.function_name.as_str() {
                     "control_home_device" => {
-                        let domain = req.args.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-                        let service = req.args.get("service").and_then(|v| v.as_str()).unwrap_or("");
-                        let entity_id = req.args.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let mut params = req.args.get("parameters").cloned().unwrap_or_else(|| json!({}));
+                        let domain = req
+                            .args
+                            .get("domain")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let service = req
+                            .args
+                            .get("service")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let entity_id = req
+                            .args
+                            .get("entity_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let mut params = req
+                            .args
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
 
                         if let Some(map) = params.as_object_mut() {
                             map.insert("entity_id".to_string(), json!(entity_id));
@@ -114,8 +130,16 @@ async fn main() -> Result<()> {
                         }
                     }
                     "get_device_history" => {
-                        let entity_id = req.args.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let hours = req.args.get("hours_ago").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+                        let entity_id = req
+                            .args
+                            .get("entity_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let hours = req
+                            .args
+                            .get("hours_ago")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(24) as u32;
 
                         match ha.get_entity_history(entity_id, hours).await {
                             Ok(history) => json!({ "status": "success", "history": history }),
@@ -151,15 +175,22 @@ async fn main() -> Result<()> {
 
     // 9. Connect to Gemini Live API
     info!("Connecting to Gemini Live API...");
+    let live_cfg = gemini::LiveClientConfig {
+        api_key,
+        model: config.gemini.model.clone(),
+        voice_name: config.assistant.voice.clone(),
+        system_instruction,
+        has_ha_tools: ha_tools_enabled,
+    };
     let _gemini = gemini::GeminiLiveClient::connect(
-        &api_key,
-        &config.gemini.model,
-        &config.assistant.voice,
-        &system_instruction,
-        ha_tools_enabled,
+        live_cfg,
         rx_mic,
         tx_speaker,
-        if ha_tools_enabled { Some(tool_call_tx) } else { None },
+        if ha_tools_enabled {
+            Some(tool_call_tx)
+        } else {
+            None
+        },
         on_interrupted,
     )
     .await

@@ -70,23 +70,31 @@ pub struct ToolCallRequest {
     pub reply_tx: oneshot::Sender<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LiveClientConfig {
+    pub api_key: String,
+    pub model: String,
+    pub voice_name: String,
+    pub system_instruction: String,
+    pub has_ha_tools: bool,
+}
+
 pub struct GeminiLiveClient;
 
 impl GeminiLiveClient {
     /// Connect to Gemini 2.0 Live API over WebSocket with real-time audio and tool execution.
     pub async fn connect(
-        api_key: &str,
-        model: &str,
-        voice_name: &str,
-        system_instruction_text: &str,
-        has_ha_tools: bool,
+        cfg: LiveClientConfig,
         rx_user_audio: mpsc::Receiver<Vec<u8>>,
         tx_model_audio: mpsc::Sender<Vec<u8>>,
         tool_call_tx: Option<mpsc::Sender<ToolCallRequest>>,
         on_interrupted: Arc<impl Fn() + Send + Sync + 'static>,
     ) -> Result<Self> {
-        let url = format!("{}?key={}", GEMINI_LIVE_URL, api_key);
-        info!("Connecting to Gemini Live API ({url_masked})...", url_masked = format!("{}?key=***", GEMINI_LIVE_URL));
+        let url = format!("{}?key={}", GEMINI_LIVE_URL, cfg.api_key);
+        info!(
+            "Connecting to Gemini Live API ({url_masked})...",
+            url_masked = format!("{}?key=***", GEMINI_LIVE_URL)
+        );
 
         let (ws_stream, _) = connect_async(&url)
             .await
@@ -97,7 +105,7 @@ impl GeminiLiveClient {
 
         // 1. Build Tools Declaration for Home Assistant if enabled
         let mut tools = Vec::new();
-        if has_ha_tools {
+        if cfg.has_ha_tools {
             tools.push(json!({
                 "functionDeclarations": [
                     {
@@ -150,13 +158,13 @@ impl GeminiLiveClient {
 
         // 2. Build Setup Handshake Payload
         let mut setup_obj = json!({
-            "model": model,
+            "model": cfg.model,
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
                     "voiceConfig": {
                         "prebuiltVoiceConfig": {
-                            "voiceName": voice_name
+                            "voiceName": cfg.voice_name
                         }
                     }
                 }
@@ -164,14 +172,17 @@ impl GeminiLiveClient {
             "systemInstruction": {
                 "parts": [
                     {
-                        "text": system_instruction_text
+                        "text": cfg.system_instruction
                     }
                 ]
             }
         });
 
         if !tools.is_empty() {
-            setup_obj.as_object_mut().unwrap().insert("tools".to_string(), Value::Array(tools));
+            setup_obj
+                .as_object_mut()
+                .unwrap()
+                .insert("tools".to_string(), Value::Array(tools));
         }
 
         let setup_msg = json!({ "setup": setup_obj });
@@ -180,7 +191,10 @@ impl GeminiLiveClient {
             .send(Message::Text(setup_msg.to_string()))
             .await
             .context("Failed to send setup message to Gemini Live")?;
-        info!("Sent setup configuration to Gemini Live (voice: {}, ha_tools: {})", voice_name, has_ha_tools);
+        info!(
+            "Sent setup configuration to Gemini Live (voice: {}, ha_tools: {})",
+            cfg.voice_name, cfg.has_ha_tools
+        );
 
         let (tx_outgoing_ws, mut rx_outgoing_ws) = mpsc::channel::<String>(50);
 
@@ -237,8 +251,11 @@ impl GeminiLiveClient {
                                             for part in parts {
                                                 if let Some(inline) = part.inline_data {
                                                     if inline.mime_type.starts_with("audio/pcm") {
-                                                        if let Ok(raw_pcm) = BASE64.decode(&inline.data) {
-                                                            let _ = tx_model_audio.send(raw_pcm).await;
+                                                        if let Ok(raw_pcm) =
+                                                            BASE64.decode(&inline.data)
+                                                        {
+                                                            let _ =
+                                                                tx_model_audio.send(raw_pcm).await;
                                                         }
                                                     }
                                                 }
@@ -281,7 +298,9 @@ impl GeminiLiveClient {
                                                             ]
                                                         }
                                                     });
-                                                    let _ = tx_outgoing_ws.send(tool_resp_msg.to_string()).await;
+                                                    let _ = tx_outgoing_ws
+                                                        .send(tool_resp_msg.to_string())
+                                                        .await;
                                                 }
                                             }
                                         }

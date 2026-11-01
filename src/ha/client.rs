@@ -74,10 +74,8 @@ impl HomeAssistantClient {
 
     /// Formats manageable devices (climate, light, switch, media_player, vacuum) into a concise
     /// text summary for Gemini's system instructions, so it knows all rooms & devices dynamically.
-    pub async fn get_device_summary(&self) -> Result<String> {
-        let entities = self.get_states().await?;
+    pub fn format_device_summary(entities: &[HaEntity]) -> String {
         let mut lines = Vec::new();
-
         lines.push("Доступные устройства в умном доме (Home Assistant):".to_string());
 
         for e in entities {
@@ -85,26 +83,40 @@ impl HomeAssistantClient {
             // Filter to actionable domains
             if matches!(
                 domain,
-                "climate" | "light" | "switch" | "media_player" | "vacuum" | "cover" | "fan" | "water_heater"
+                "climate"
+                    | "light"
+                    | "switch"
+                    | "media_player"
+                    | "vacuum"
+                    | "cover"
+                    | "fan"
+                    | "water_heater"
             ) {
                 let name = e.friendly_name();
-                lines.push(format!("- [{}] id: {} (текущее состояние: {})", name, e.entity_id, e.state));
+                lines.push(format!(
+                    "- [{}] id: {} (текущее состояние: {})",
+                    name, e.entity_id, e.state
+                ));
             }
         }
 
-        Ok(lines.join("\n"))
+        lines.join("\n")
+    }
+
+    /// Fetch device states and format them into a concise text summary
+    pub async fn get_device_summary(&self) -> Result<String> {
+        let entities = self.get_states().await?;
+        Ok(Self::format_device_summary(&entities))
     }
 
     /// Call an action/service in Home Assistant:
     /// e.g. domain="climate", service="set_temperature", payload={"entity_id": "climate.midea", "temperature": 22}
-    pub async fn call_service(
-        &self,
-        domain: &str,
-        service: &str,
-        payload: Value,
-    ) -> Result<Value> {
+    pub async fn call_service(&self, domain: &str, service: &str, payload: Value) -> Result<Value> {
         let url = format!("{}/api/services/{}/{}", self.base_url, domain, service);
-        info!("HA Service Call: {}/{} with payload: {:?}", domain, service, payload);
+        info!(
+            "HA Service Call: {}/{} with payload: {:?}",
+            domain, service, payload
+        );
 
         let resp = self
             .client
@@ -128,16 +140,12 @@ impl HomeAssistantClient {
     }
 
     /// Query history for an entity over the past N hours
-    pub async fn get_entity_history(
-        &self,
-        entity_id: &str,
-        hours_ago: u32,
-    ) -> Result<Value> {
+    pub async fn get_entity_history(&self, entity_id: &str, hours_ago: u32) -> Result<Value> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let start_time = now.saturating_sub((hours_ago as u64) * 3600);
-        
+
         // Format ISO8601 or timestamp
         let url = format!(
             "{}/api/history/period/{}?filter_entity_id={}",
@@ -147,5 +155,74 @@ impl HomeAssistantClient {
         let resp = self.client.get(&url).send().await?;
         let history: Value = resp.json().await?;
         Ok(history)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ha_entity_domain_and_friendly_name() {
+        let entity = HaEntity {
+            entity_id: "climate.midea_ac".to_string(),
+            state: "cool".to_string(),
+            attributes: json!({
+                "friendly_name": "Кондиционер в спальне",
+                "temperature": 22
+            }),
+        };
+
+        assert_eq!(entity.domain(), "climate");
+        assert_eq!(entity.friendly_name(), "Кондиционер в спальне");
+    }
+
+    #[test]
+    fn test_ha_entity_friendly_name_fallback() {
+        let entity = HaEntity {
+            entity_id: "light.kitchen_strip".to_string(),
+            state: "on".to_string(),
+            attributes: json!({}),
+        };
+
+        assert_eq!(entity.domain(), "light");
+        assert_eq!(entity.friendly_name(), "light.kitchen_strip");
+    }
+
+    #[test]
+    fn test_format_device_summary_filtering() {
+        let entities = vec![
+            HaEntity {
+                entity_id: "light.living_room".to_string(),
+                state: "on".to_string(),
+                attributes: json!({ "friendly_name": "Люстра в гостиной" }),
+            },
+            HaEntity {
+                entity_id: "climate.ac".to_string(),
+                state: "heat".to_string(),
+                attributes: json!({ "friendly_name": "Сплит" }),
+            },
+            // Sensor and automation should be filtered out
+            HaEntity {
+                entity_id: "sensor.temperature_balcony".to_string(),
+                state: "18.5".to_string(),
+                attributes: json!({ "friendly_name": "Датчик температуры" }),
+            },
+            HaEntity {
+                entity_id: "automation.night_mode".to_string(),
+                state: "on".to_string(),
+                attributes: json!({ "friendly_name": "Ночной режим" }),
+            },
+        ];
+
+        let summary = HomeAssistantClient::format_device_summary(&entities);
+        assert!(summary.contains("Люстра в гостиной"));
+        assert!(summary.contains("light.living_room"));
+        assert!(summary.contains("Сплит"));
+        assert!(summary.contains("climate.ac"));
+
+        // Must not contain filtered entities
+        assert!(!summary.contains("sensor.temperature_balcony"));
+        assert!(!summary.contains("automation.night_mode"));
     }
 }
