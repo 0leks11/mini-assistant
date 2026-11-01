@@ -1,4 +1,3 @@
-use anyhow::Result;
 use tracing::debug;
 
 pub trait WakeWordEngine: Send + Sync {

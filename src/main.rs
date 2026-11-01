@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
 
     // 10. Start VQE Audio Capture (Mini yio_audio IPC at 127.0.0.1:9850)
     info!("Starting VQE audio capture from yio_audio:9850...");
-    let mut vqe_capture = match audio::VqeCapture::start(tx_mic).await {
+    let vqe_capture = match audio::VqeCapture::start(tx_mic).await {
         Ok(c) => Some(c),
         Err(e) => {
             warn!("Could not connect to yio_audio:9850: {}", e);

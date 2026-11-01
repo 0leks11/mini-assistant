@@ -63,16 +63,14 @@ pub struct FunctionCall {
 }
 
 pub struct ToolCallRequest {
+    #[allow(dead_code)]
     pub call_id: String,
     pub function_name: String,
     pub args: Value,
     pub reply_tx: oneshot::Sender<Value>,
 }
 
-pub struct GeminiLiveClient {
-    #[allow(dead_code)]
-    pub tx_audio: mpsc::Sender<Vec<u8>>,
-}
+pub struct GeminiLiveClient;
 
 impl GeminiLiveClient {
     /// Connect to Gemini 2.0 Live API over WebSocket with real-time audio and tool execution.
@@ -184,7 +182,6 @@ impl GeminiLiveClient {
             .context("Failed to send setup message to Gemini Live")?;
         info!("Sent setup configuration to Gemini Live (voice: {}, ha_tools: {})", voice_name, has_ha_tools);
 
-        let (tx_audio, mut rx_audio_forward) = mpsc::channel::<Vec<u8>>(100);
         let (tx_outgoing_ws, mut rx_outgoing_ws) = mpsc::channel::<String>(50);
 
         // Task 1: Outgoing WebSocket messages sender
@@ -309,6 +306,6 @@ impl GeminiLiveClient {
             }
         });
 
-        Ok(Self { tx_audio })
+        Ok(Self)
     }
 }

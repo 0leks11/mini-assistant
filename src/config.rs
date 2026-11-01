@@ -19,6 +19,7 @@ pub struct AssistantConfig {
     /// Gemini voice to use for responses
     pub voice: String,
     /// Languages to understand: ["ru-RU", "en-US"]
+    #[allow(dead_code)]
     pub languages: Vec<String>,
 }
 
@@ -34,12 +35,15 @@ pub struct GeminiConfig {
 #[derive(Debug, Deserialize)]
 pub struct AudioConfig {
     /// ALSA capture device (microphone)
+    #[allow(dead_code)]
     pub capture_device: String,
     /// ALSA playback device (speaker)
     pub playback_device: String,
     /// Sample rate for capture (Hz)
+    #[allow(dead_code)]
     pub sample_rate: u32,
     /// Channels for capture
+    #[allow(dead_code)]
     pub channels: u16,
 }
 

@@ -21,10 +21,6 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # HTTP client (Home Assistant API) - pure Rust TLS with embedded root certificates
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
-# ALSA audio (only on Linux target; dev mock used on macOS)
-[target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.9"
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,6 +47,10 @@ futures-util = "0.3"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
+
+# ALSA audio (only on Linux target; dev mock used on macOS)
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
 
 [profile.release]
 opt-level = "z"    # minimize binary size
