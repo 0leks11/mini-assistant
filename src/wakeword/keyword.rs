@@ -148,7 +148,7 @@ impl WakeWordEngine for KeywordEngine {
                 );
                 detected = true;
             } else if let Some(candidate) = detector.take_last_candidate() {
-                if candidate.score > 0.25 {
+                if candidate.score > 0.38 {
                     debug!(
                         name = %candidate.name,
                         candidate_score = candidate.score,
