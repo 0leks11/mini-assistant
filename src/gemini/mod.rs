@@ -1,3 +1,3 @@
 pub mod live_client;
 
-pub use live_client::{GeminiLiveClient, LiveClientConfig, ToolCallRequest};
+pub use live_client::{GeminiLiveClient, LiveClientConfig, ToolCallRequest, UserAudio};

@@ -11,7 +11,7 @@ docker run --rm \
   -v "$HOME"/.cargo/registry:/root/.cargo/registry \
   -v "$HOME"/.cargo/git:/root/.cargo/git \
   messense/rust-musl-cross:armv7-musleabihf \
-  cargo build --target "$TARGET" --release
+  cargo build --locked --target "$TARGET" --release
 
 BINARY="$PROJECT_DIR/target/$TARGET/release/mini-assistant"
 echo ""

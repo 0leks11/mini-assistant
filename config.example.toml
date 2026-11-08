@@ -4,19 +4,59 @@
 
 [assistant]
 name = "Мини"
+provider = "gemini"                     # "gemini" or "openai"
 voice = "Aoede"                          # Gemini voice (Aoede/Charon/Fenrir/Kore/Puck)
+# Labels do not train a detector. A private enrolled reference is required.
+wake_words = ["штучка", "штучка-интеллект"]
+# wakeword_model = "/bkupgrade/data/opt/mini-assistant/keyword.rpw"
 languages = ["ru-RU", "en-US"]
 
 [gemini]
 model = "models/gemini-3.8-live"
 # api_key — set via GEMINI_API_KEY env var, not here
 
+# Used only with assistant.provider = "openai". Set OPENAI_API_KEY locally.
+# [openai]
+# model = "gpt-realtime"
+# voice = "marin"
+
 [audio]
-capture_device = "hw:0,0"               # Mini microphone (verify with: aplay -l)
-playback_device = "hw:0,0"              # Mini speaker
+capture_device = "hw:0,2"               # Mini microphone hardware capture (hw:0,2 8ch S32_LE)
+capture_backend = "alsa"                # "alsa" (direct hw:0,2 capture via mini_pcm_source) or "vqe" (vendor maind :9850)
+playback_device = "default"              # Mini speaker (routes through dmixer/softvol)
 sample_rate = 16000
 channels = 1
 
 [ha]
-url = "http://192.168.77.2:8123"        # Raspberry Pi address
+url = "http://192.168.1.113:8123"        # Raspberry Pi address
 # token — set via HA_TOKEN env var, not here
+# allowed_entities = [
+#     "climate.midea_xiao_air_conditioner"
+# ]
+
+# [weather]
+# enabled = false
+# provider = "open-meteo"
+# default_location = "batumi"
+# cache_ttl_minutes = 60
+
+# [alarms]
+# enabled = true
+# data_dir = "/bkupgrade/data/opt/mini-assistant/alarms"
+# timezone = "Asia/Tbilisi"
+# melody_path = "/bkupgrade/data/opt/mini-assistant/sounds/alarm.wav"
+# max_duration_secs = 300
+# volume_ramp_secs = 20
+
+# [spotify]
+# enabled = true
+# web_port = 8080
+# client_id = "your_spotify_client_id"
+# token_file = "/bkupgrade/data/opt/mini-assistant/spotify_token.txt"
+
+# [wifi]
+# enabled = true
+# interface = "wlan0"
+# dns_port = 53
+# portal_port = 80
+

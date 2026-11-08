@@ -1,5 +1,6 @@
+pub mod alsa_capture;
 pub mod playback;
-pub mod vqe_ipc;
 
-pub use playback::AudioPlayback;
-pub use vqe_ipc::VqeCapture;
+#[allow(unused_imports)]
+pub use alsa_capture::{AlsaCapture, AlsaCaptureConfig, ChannelMode, Decimator};
+pub use playback::{AudioPlayback, PlaybackBackend, ALARM_RESPONSE_ID};

@@ -3,13 +3,25 @@ name = "mini-assistant"
 version = "0.1.0"
 edition = "2021"
 authors = ["mini-assistant contributors"]
-description = "Custom voice assistant for Yandex Station Mini 1 (A113X, ARM32)"
+description = "Custom voice assistant for GPT Mini (A113X, ARM32)"
 repository = "https://github.com/YOUR_USERNAME/mini-assistant"
 license = "MIT"
 
 [[bin]]
 name = "mini-assistant"
 path = "src/main.rs"
+
+[[bin]]
+name = "keyword-enroll"
+path = "src/bin/keyword_enroll.rs"
+
+[[bin]]
+name = "alarm-cli"
+path = "src/bin/alarm_cli.rs"
+
+[[bin]]
+name = "bcm-attach"
+path = "src/bin/bcm_attach.rs"
 
 [dependencies]
 # Async runtime
@@ -27,10 +39,15 @@ serde_json = "1"
 
 # Config file
 toml = "0.8"
+# RFC3339 history windows without an external date command on Mini.
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros", "serde"] }
 
 # Error handling
 anyhow = "1"
 thiserror = "2"
+
+# System / libc (for Linux termios and ioctl)
+libc = "0.2"
 
 # Logging
 tracing = "0.1"
@@ -47,6 +64,10 @@ futures-util = "0.3"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
+
+# Personal MFCC/DTW keyword references, source adaptation without NN/Candle.
+rustpotter = { path = "vendor/rustpotter-ref", default-features = false }
+hound = "3.5.1"
 
 [profile.release]
 opt-level = "z"    # minimize binary size

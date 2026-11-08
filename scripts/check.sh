@@ -8,3 +8,4 @@ cd -- "$SCRIPT_DIR/.."
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+python3 -B -m unittest discover -s tests -p 'test_*.py' -v
