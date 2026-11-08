@@ -23,13 +23,13 @@ impl KeywordEngine {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(0.50);
+            .unwrap_or(0.48);
 
         let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.30);
+            .unwrap_or(0.25);
 
         let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
             .ok()
@@ -48,7 +48,7 @@ impl KeywordEngine {
             min_scores,
             score_mode,
             gain_normalizer_enabled: true,
-            band_pass_enabled: true,
+            band_pass_enabled: false,
         };
 
         info!(
@@ -59,9 +59,44 @@ impl KeywordEngine {
             "Loaded personal wake-word detector with calibrated parameters"
         );
 
-        let detector =
+        let mut detector =
             rustpotter::personal_reference_detector_with_config(reference, &detector_cfg)
                 .map_err(anyhow::Error::msg)?;
+
+        // Support compound wake-word ("Штучка-Интеллект") alongside primary "Штучка"
+        let compound_path = std::env::var_os("MINI_WAKEWORD_COMPOUND_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                path.parent()
+                    .map(|p| p.join("alias-compound.rpw"))
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from("/data/opt/mini-assistant/alias-compound.rpw")
+                    })
+            });
+
+        if compound_path.exists() {
+            match WakewordRef::load_from_file(
+                compound_path
+                    .to_str()
+                    .context("Invalid compound reference path")?,
+            ) {
+                Ok(compound_ref) => {
+                    if let Err(e) = detector.add_wakeword_ref("shtuchka-intellect", compound_ref) {
+                        tracing::warn!(
+                            "Failed to add compound wake-word 'shtuchka-intellect': {e}"
+                        );
+                    } else {
+                        info!(
+                            path = ?compound_path,
+                            "Loaded compound wake-word 'shtuchka-intellect' into detector"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not load compound wake-word reference: {e}");
+                }
+            }
+        }
         let frame_bytes = detector.get_bytes_per_frame();
         anyhow::ensure!(
             (2..=8192).contains(&frame_bytes),
@@ -104,19 +139,22 @@ impl WakeWordEngine for KeywordEngine {
             let bytes: Vec<_> = self.pending.drain(..self.frame_bytes).collect();
             if let Some(detection) = detector.process_bytes(&bytes) {
                 info!(
+                    name = %detection.name,
                     score = detection.score,
                     avg_score = detection.avg_score,
                     counter = detection.counter,
-                    "Wake-word «Штучка» detected! Opening voice pipeline"
+                    gain = detection.gain,
+                    "Wake-word detected! Opening voice pipeline"
                 );
                 detected = true;
-            } else if let Some(partial) = detector.get_partial_detection() {
-                if partial.score > 0.35 {
+            } else if let Some(candidate) = detector.take_last_candidate() {
+                if candidate.score > 0.25 {
                     debug!(
-                        partial_score = partial.score,
-                        avg_score = partial.avg_score,
-                        counter = partial.counter,
-                        "KWS partial candidate score"
+                        name = %candidate.name,
+                        candidate_score = candidate.score,
+                        avg_score = candidate.avg_score,
+                        gain = candidate.gain,
+                        "KWS candidate score"
                     );
                 }
             }

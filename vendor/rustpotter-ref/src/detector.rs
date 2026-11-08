@@ -70,6 +70,8 @@ pub struct Rustpotter {
     max_mfcc_frames: usize,
     /// Stores the partial detection with greater score while waiting for the detection countdown to be zero.
     partial_detection: Option<RustpotterDetection>,
+    /// Latest candidate match (even below full detection threshold) for telemetry and barge-in.
+    last_candidate: Option<RustpotterDetection>,
     /// Countdown until detection fires.
     /// Whenever a better partial detection is found, it is set to the double of the max number of feature frames in the wakeword samples.
     /// When it gets to zero and a partial detection exists, it'll be considered the final detection.
@@ -128,6 +130,7 @@ impl Rustpotter {
             max_mfcc_frames: 0,
             wakewords: HashMap::new(),
             partial_detection: None,
+            last_candidate: None,
             detection_countdown: 0,
             rms_level: 0.,
             gain: 1.,
@@ -188,6 +191,14 @@ impl Rustpotter {
     /// Returns a reference to the current partial detection if any.
     pub fn get_partial_detection(&self) -> Option<&RustpotterDetection> {
         self.partial_detection.as_ref()
+    }
+    /// Returns a reference to the latest candidate detection if any.
+    pub fn get_last_candidate(&self) -> Option<&RustpotterDetection> {
+        self.last_candidate.as_ref()
+    }
+    /// Takes the latest candidate detection for telemetry and state tracking.
+    pub fn take_last_candidate(&mut self) -> Option<RustpotterDetection> {
+        self.last_candidate.take()
     }
     /// Returns the rms level of the last frame (before gain normalization)
     pub fn get_rms_level(&self) -> f32 {
@@ -267,6 +278,7 @@ impl Rustpotter {
     pub fn reset(&mut self) {
         self.buffering = true;
         self.partial_detection = None;
+        self.last_candidate = None;
         self.audio_mfcc_window.clear();
         self.mfcc_extractor.reset();
         if let Some(vad) = self.vad_detector.as_mut() {
@@ -408,19 +420,23 @@ impl Rustpotter {
         None
     }
     fn run_wakeword_detectors(&mut self) -> Option<RustpotterDetection> {
+        let candidate_avg_threshold = (self.avg_threshold * 0.5).min(0.20);
+        let candidate_threshold = (self.threshold * 0.5).min(0.25);
         let mut wakeword_detections = self
             .wakewords
             .values()
             .filter_map(|wakeword| {
                 wakeword.run_detection(
                     self.audio_mfcc_window.clone(),
-                    self.avg_threshold,
-                    self.threshold,
+                    candidate_avg_threshold,
+                    candidate_threshold,
                 )
             })
             .collect::<Vec<RustpotterDetection>>();
         wakeword_detections.sort_by(|a, b| b.score.total_cmp(&a.score));
-        wakeword_detections.into_iter().next()
+        let best = wakeword_detections.into_iter().next();
+        self.last_candidate = best.clone();
+        best.filter(|d| d.score >= self.threshold && d.avg_score >= self.avg_threshold)
     }
     fn is_detection_done(&self, detection: &RustpotterDetection) -> bool {
         if self.detection_countdown == 0 {
@@ -461,7 +477,7 @@ impl Rustpotter {
     }
 }
 /// Encapsulates the detection information.
-#[cfg_attr(feature = "debug", derive(Debug))]
+#[derive(Debug, Clone)]
 pub struct RustpotterDetection {
     /// Detected wakeword name.
     pub name: String,

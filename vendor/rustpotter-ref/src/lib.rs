@@ -32,12 +32,12 @@ pub struct PersonalDetectorConfig {
 impl Default for PersonalDetectorConfig {
     fn default() -> Self {
         Self {
-            threshold: 0.52,
-            avg_threshold: 0.35,
+            threshold: 0.48,
+            avg_threshold: 0.25,
             min_scores: 2,
             score_mode: ScoreMode::Max,
             gain_normalizer_enabled: true,
-            band_pass_enabled: true,
+            band_pass_enabled: false,
         }
     }
 }
@@ -48,8 +48,8 @@ pub fn personal_reference_detector_with_config(
     detector_cfg: &PersonalDetectorConfig,
 ) -> Result<Rustpotter, String> {
     reference.validate_personal_reference()?;
-    reference.threshold = Some(detector_cfg.threshold);
-    reference.avg_threshold = Some(detector_cfg.avg_threshold);
+    reference.threshold = None;
+    reference.avg_threshold = None;
     let mut config = RustpotterConfig::default();
     config.fmt.sample_rate = 16_000;
     config.fmt.sample_format = SampleFormat::I16;

@@ -468,6 +468,26 @@ async fn main() -> Result<()> {
             ));
             let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+            let is_soloist_playing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let soloist_poller_client = soloist_client.clone();
+            let soloist_playing_flag = is_soloist_playing.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(2500));
+                loop {
+                    interval.tick().await;
+                    match soloist_poller_client.get_status().await {
+                        Ok(status) => {
+                            let playing = status.state == spotify::PlaybackState::Playing;
+                            soloist_playing_flag
+                                .store(playing, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            soloist_playing_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
             // 4e. Initialize Wi-Fi Setup and Mute Button Watcher
             let wifi_cfg = config.wifi.clone().unwrap_or_default();
             if wifi_cfg.enabled {
@@ -938,6 +958,7 @@ async fn main() -> Result<()> {
             let playback_for_mic = playback.clone();
             let alarm_for_mic = alarm_runner.as_ref().map(|runner| runner.player.clone());
             let soloist_for_mic = soloist_client.clone();
+            let soloist_playing_for_mic = is_soloist_playing.clone();
             let voice_active_for_mic = voice_active.clone();
             tokio::spawn(async move {
                 use std::sync::atomic::Ordering;
@@ -1023,7 +1044,9 @@ async fn main() -> Result<()> {
                         mic_authorization.cancel();
                         playback_for_mic.interrupt();
                         let soloist = soloist_for_mic.clone();
+                        let soloist_playing = soloist_playing_for_mic.clone();
                         tokio::spawn(async move {
+                            soloist_playing.store(false, Ordering::Relaxed);
                             if let Err(e) = soloist.pause().await {
                                 debug!("Soloist manual arm pause error: {e}");
                             }
@@ -1043,7 +1066,8 @@ async fn main() -> Result<()> {
                     let is_speaker_playing = playback_for_mic.is_playing()
                         || alarm_for_mic
                             .as_ref()
-                            .is_some_and(|alarm| alarm.is_ringing());
+                            .is_some_and(|alarm| alarm.is_ringing())
+                        || soloist_playing_for_mic.load(Ordering::Relaxed);
 
                     let current_auth_turn = mic_authorization.current_turn();
                     if let Some(turn_id) = current_auth_turn {
@@ -1106,7 +1130,9 @@ async fn main() -> Result<()> {
                         mic_authorization.cancel();
                         playback_for_mic.interrupt();
                         let soloist = soloist_for_mic.clone();
+                        let soloist_playing = soloist_playing_for_mic.clone();
                         tokio::spawn(async move {
+                            soloist_playing.store(false, Ordering::Relaxed);
                             if let Err(e) = soloist.pause().await {
                                 debug!("Soloist barge-in pause skipped or error: {e}");
                             }
@@ -1236,9 +1262,21 @@ async fn main() -> Result<()> {
                         config.audio.capture_backend
                     );
 
+                    let mic_channel_mode = match std::env::var("MINI_MIC_CHANNEL").as_deref() {
+                        Ok("avg4") => audio::ChannelMode::Avg4,
+                        Ok("ch1") => audio::ChannelMode::Ch(1),
+                        Ok("ch2") => audio::ChannelMode::Ch(2),
+                        Ok("ch3") => audio::ChannelMode::Ch(3),
+                        _ => audio::ChannelMode::Ch0,
+                    };
+                    info!(
+                        ?mic_channel_mode,
+                        "Configured microphone channel extraction (default: Ch0 primary mic)"
+                    );
+
                     let alsa_cfg = audio::AlsaCaptureConfig {
                         device: config.audio.capture_device.clone(),
-                        channel_mode: audio::ChannelMode::Avg4,
+                        channel_mode: mic_channel_mode,
                         bit_shift: 16,
                         gain: mic_gain,
                         custom_arecord_path: None,

@@ -46,7 +46,7 @@ impl Default for GainNormalizationConfig {
             enabled: false,
             gain_ref: None,
             min_gain: 0.1,
-            max_gain: 1.0,
+            max_gain: 6.0,
         }
     }
 }
@@ -65,7 +65,7 @@ impl Default for BandPassConfig {
         BandPassConfig {
             enabled: false,
             low_cutoff: 80.,
-            high_cutoff: 400.,
+            high_cutoff: 7500.,
         }
     }
 }
