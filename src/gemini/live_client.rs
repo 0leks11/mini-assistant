@@ -122,6 +122,7 @@ pub struct LiveClientConfig {
     pub has_weather_tools: bool,
     pub has_alarm_tools: bool,
     pub has_spotify_tools: bool,
+    pub has_volume_tools: bool,
     pub has_stop_dialogue: bool,
     pub endpoint: Option<String>,
     /// A shared renderer epoch is advanced only by its interruption callback.
@@ -829,6 +830,41 @@ async fn run_single_session(
         function_declarations.extend(crate::spotify::spotify_tool_declarations());
     }
 
+    if cfg.has_volume_tools {
+        function_declarations.extend(vec![
+            json!({
+                "name": "set_volume",
+                "description": "Установить громкость колонки от 0 до 10. 0 = тишина, 10 = максимум. Вызывай при фразах «громкость 5», «поставь громкость на 3», «сделай громкость 7».",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "level": {
+                            "type": "INTEGER",
+                            "description": "Уровень громкости от 0 до 10"
+                        }
+                    },
+                    "required": ["level"]
+                }
+            }),
+            json!({
+                "name": "volume_up",
+                "description": "Увеличить громкость на один шаг. Вызывай при фразах «громче», «погромче», «прибавь звук», «сделай громче».",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            }),
+            json!({
+                "name": "volume_down",
+                "description": "Уменьшить громкость на один шаг. Вызывай при фразах «тише», «потише», «убавь звук», «сделай тише».",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            }),
+        ]);
+    }
+
     if cfg.has_stop_dialogue {
         function_declarations.push(json!({
             "name": "stop_dialogue",
@@ -888,8 +924,8 @@ async fn run_single_session(
         .await
         .context("Failed to send setup message to Gemini Live")?;
     info!(
-        "Sent setup configuration to Gemini Live (voice: {}, ha_tools: {}, weather_tools: {}, alarm_tools: {}, spotify_tools: {})",
-        cfg.voice_name, cfg.has_ha_tools, cfg.has_weather_tools, cfg.has_alarm_tools, cfg.has_spotify_tools
+        "Sent setup configuration to Gemini Live (voice: {}, ha_tools: {}, weather_tools: {}, alarm_tools: {}, spotify_tools: {}, volume_tools: {})",
+        cfg.voice_name, cfg.has_ha_tools, cfg.has_weather_tools, cfg.has_alarm_tools, cfg.has_spotify_tools, cfg.has_volume_tools
     );
 
     // Wait for setupComplete confirmation from server before starting audio stream
@@ -1119,6 +1155,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1176,6 +1213,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             // Point to a non-listening port on loopback
             endpoint: Some("ws://127.0.0.1:1".to_string()),
@@ -1232,6 +1270,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1281,6 +1320,7 @@ mod tests {
             has_weather_tools: true,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1339,6 +1379,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: true,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1402,6 +1443,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: true,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1466,6 +1508,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: true,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -2071,6 +2114,7 @@ mod tests {
             has_weather_tools: true,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(endpoint),
             cancellation_epoch: Some(Arc::new(AtomicU64::new(0))),
@@ -2252,6 +2296,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(endpoint),
             cancellation_epoch: Some(playback.cancellation_epoch_handle()),

@@ -86,16 +86,21 @@ pub async fn handle_spotify_tool_call(
     req: &crate::gemini::ToolCallRequest,
 ) -> Option<serde_json::Value> {
     match req.function_name.as_str() {
-        "spotify_pause" => match soloist.pause().await {
-            Ok(()) => {
+        "spotify_pause" => {
+            if let Ok(()) = soloist.pause().await {
                 info!("Soloist pause executed successfully");
-                Some(serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }))
+                return Some(serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }));
             }
-            Err(e) => {
-                warn!("Soloist pause failed: {e}");
-                Some(serde_json::json!({ "status": "error", "message": e.to_string() }))
+            // Fallback to Web API
+            let mut web_guard = web_client_lock.write().await;
+            if let Some(client) = web_guard.as_mut() {
+                if let Ok(()) = client.pause(None).await {
+                    info!("Spotify Web API pause executed successfully");
+                    return Some(serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }));
+                }
             }
-        },
+            Some(serde_json::json!({ "status": "error", "message": "Не удалось поставить музыку на паузу" }))
+        }
         "spotify_play" => {
             let query = req.args.get("query").and_then(|v| v.as_str());
             let clean_query = query.map(|s| s.trim()).filter(|s| !s.is_empty());
@@ -114,7 +119,7 @@ pub async fn handle_spotify_tool_call(
                 .unwrap_or(false);
 
             if let Some(q) = clean_query.filter(|_| !is_generic) {
-                // If specific query, try Web API search if authenticated
+                // Specific query: try Web API search and play
                 let mut web_guard = web_client_lock.write().await;
                 if let Some(client) = web_guard.as_mut() {
                     match client.search_and_play(q).await {
@@ -123,46 +128,67 @@ pub async fn handle_spotify_tool_call(
                             return Some(serde_json::json!({ "status": "ok", "message": msg }));
                         }
                         Err(e) => {
-                            warn!("Spotify Web API search failed: {e}; resuming local playback");
+                            warn!("Spotify Web API search failed: {e}; trying local resume");
                         }
                     }
                 }
             }
 
             // Resume local soloist playback
-            match soloist.resume().await {
-                Ok(()) => {
-                    info!("Soloist resume executed successfully");
-                    Some(
+            if let Ok(()) = soloist.resume().await {
+                info!("Soloist resume executed successfully");
+                return Some(
+                    serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
+                );
+            }
+
+            // Fallback to Web API resume / search_and_play
+            let mut web_guard = web_client_lock.write().await;
+            if let Some(client) = web_guard.as_mut() {
+                if let Ok(()) = client.resume(None).await {
+                    info!("Spotify Web API resume succeeded");
+                    return Some(
                         serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
-                    )
+                    );
                 }
-                Err(e) => {
-                    warn!("Soloist resume failed: {e}");
-                    Some(serde_json::json!({ "status": "error", "message": e.to_string() }))
+                // If resume fails (e.g. no active context), search and play top music
+                let fallback_q = clean_query.unwrap_or("популярные треки");
+                if let Ok(msg) = client.search_and_play(fallback_q).await {
+                    info!("Spotify Web API fallback play succeeded: {msg}");
+                    return Some(serde_json::json!({ "status": "ok", "message": msg }));
                 }
             }
+
+            Some(serde_json::json!({ "status": "error", "message": "Не удалось возобновить воспроизведение музыки" }))
         }
-        "spotify_next" => match soloist.next().await {
-            Ok(()) => {
+        "spotify_next" => {
+            if let Ok(()) = soloist.next().await {
                 info!("Soloist next executed successfully");
-                Some(serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }))
+                return Some(serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }));
             }
-            Err(e) => {
-                warn!("Soloist next failed: {e}");
-                Some(serde_json::json!({ "status": "error", "message": e.to_string() }))
+            let mut web_guard = web_client_lock.write().await;
+            if let Some(client) = web_guard.as_mut() {
+                if let Ok(()) = client.next(None).await {
+                    info!("Spotify Web API next executed successfully");
+                    return Some(serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }));
+                }
             }
-        },
-        "spotify_previous" => match soloist.previous().await {
-            Ok(()) => {
+            Some(serde_json::json!({ "status": "error", "message": "Не удалось переключить трек" }))
+        }
+        "spotify_previous" => {
+            if let Ok(()) = soloist.previous().await {
                 info!("Soloist previous executed successfully");
-                Some(serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }))
+                return Some(serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }));
             }
-            Err(e) => {
-                warn!("Soloist previous failed: {e}");
-                Some(serde_json::json!({ "status": "error", "message": e.to_string() }))
+            let mut web_guard = web_client_lock.write().await;
+            if let Some(client) = web_guard.as_mut() {
+                if let Ok(()) = client.previous(None).await {
+                    info!("Spotify Web API previous executed successfully");
+                    return Some(serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }));
+                }
             }
-        },
+            Some(serde_json::json!({ "status": "error", "message": "Не удалось переключить трек назад" }))
+        }
         "spotify_volume" => {
             let pct = req
                 .args
@@ -170,43 +196,57 @@ pub async fn handle_spotify_tool_call(
                 .and_then(|v| v.as_u64())
                 .map(|v| v.min(100) as u8)
                 .unwrap_or(40);
-            match soloist.set_volume(pct).await {
-                Ok(()) => {
-                    info!(volume = pct, "Soloist volume set successfully");
-                    Some(serde_json::json!({
-                        "status": "ok",
-                        "message": format!("Громкость установлена на {pct}%")
-                    }))
-                }
-                Err(e) => {
-                    warn!("Soloist set_volume failed: {e}");
-                    Some(serde_json::json!({ "status": "error", "message": e.to_string() }))
-                }
+
+            // Also update master software volume
+            let level = crate::audio::volume::set_volume_pct(pct);
+
+            let _ = soloist.set_volume(pct).await;
+            let mut web_guard = web_client_lock.write().await;
+            if let Some(client) = web_guard.as_mut() {
+                let _ = client.set_volume(pct, None).await;
             }
+
+            info!(volume = pct, level, "Spotify volume updated");
+            Some(serde_json::json!({
+                "status": "ok",
+                "message": format!("Громкость установлена на {pct}% (уровень {level})")
+            }))
         }
-        "spotify_current_track" => match soloist.get_status().await {
-            Ok(status) => {
+        "spotify_current_track" => {
+            if let Ok(status) = soloist.get_status().await {
                 if let Some(t) = status.track {
                     let msg = format!("Сейчас играет: {} — {}", t.artist, t.name);
-                    Some(serde_json::json!({
+                    return Some(serde_json::json!({
                         "status": "ok",
                         "artist": t.artist,
                         "title": t.name,
                         "album": t.album,
                         "message": msg
-                    }))
-                } else {
-                    Some(serde_json::json!({
-                        "status": "ok",
-                        "message": "Сейчас ничего не играет"
-                    }))
+                    }));
                 }
             }
-            Err(e) => {
-                warn!("Soloist get_status failed: {e}");
-                Some(serde_json::json!({ "status": "error", "message": e.to_string() }))
+            // Fallback to Web API playback state
+            let mut web_guard = web_client_lock.write().await;
+            if let Some(client) = web_guard.as_mut() {
+                if let Ok(Some(state)) = client.get_playback_state().await {
+                    if let Some(item) = state.item {
+                        let artist_names: Vec<String> = item.artists.into_iter().map(|a| a.name).collect();
+                        let artist_str = artist_names.join(", ");
+                        let msg = format!("Сейчас играет: {} — {}", artist_str, item.name);
+                        return Some(serde_json::json!({
+                            "status": "ok",
+                            "artist": artist_str,
+                            "title": item.name,
+                            "message": msg
+                        }));
+                    }
+                }
             }
-        },
+            Some(serde_json::json!({
+                "status": "ok",
+                "message": "Сейчас ничего не играет"
+            }))
+        }
         _ => None,
     }
 }

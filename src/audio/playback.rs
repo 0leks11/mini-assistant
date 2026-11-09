@@ -115,12 +115,14 @@ pub fn convert_24k_mono_to_48k_stereo(mono_24k: &[u8], last_sample: &mut Option<
     if sample_count == 0 {
         return Vec::new();
     }
+    let vol_level = crate::audio::volume::current_level();
     // Each mono sample produces 2 stereo frames = 4 samples = 8 bytes
     let mut out = Vec::with_capacity(sample_count * 8);
 
     for i in 0..sample_count {
         let raw = i16::from_le_bytes([mono_24k[2 * i], mono_24k[2 * i + 1]]);
-        let s_curr = raw.clamp(-16000, 16000);
+        let scaled = crate::audio::volume::scale_sample(raw, vol_level);
+        let s_curr = scaled.clamp(-16000, 16000);
 
         let s_mid = match *last_sample {
             Some(s_prev) => ((s_prev as i32 + s_curr as i32) / 2) as i16,
@@ -1309,6 +1311,7 @@ mod tests {
             has_weather_tools: false,
             has_alarm_tools: false,
             has_spotify_tools: false,
+            has_volume_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(format!("ws://{addr}/ws")),
             cancellation_epoch: Some(playback.cancellation_epoch_handle()),

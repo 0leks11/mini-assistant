@@ -191,6 +191,7 @@ async fn run_preflight_check(
                 has_weather_tools: false,
                 has_alarm_tools: false,
                 has_spotify_tools: false,
+                has_volume_tools: false,
                 has_stop_dialogue: false,
                 endpoint: None,
                 cancellation_epoch: None,
@@ -493,6 +494,10 @@ async fn main() -> Result<()> {
                 }
             });
 
+            // 4d2. Start VL53L0 proximity gesture volume reader task
+            let _vl53_task =
+                audio::vl53::spawn_vl53_volume_task(Some((*soloist_client).clone()));
+
             // 4e. Initialize Wi-Fi Setup and Mute Button Watcher
             let wifi_cfg = config.wifi.clone().unwrap_or_default();
             if wifi_cfg.enabled {
@@ -641,8 +646,19 @@ async fn main() -> Result<()> {
                     2. При фразах «продолжи музыку», «включи музыку», «играй» — вызови 'spotify_play'. Если назван конкретный трек, исполнитель или плейлист («включи рок», «включи Queen») — передай этот текст в параметр 'query'.\n\
                     3. При фразах «следующий трек», «дальше», «переключи песню» — вызови 'spotify_next'.\n\
                     4. При фразах «предыдущий трек», «назад» — вызови 'spotify_previous'.\n\
-                    5. При фразах «громкость музыки на 50», «сделай потише/погромче» — вызови 'spotify_volume' с числовым значением volume_percent (0-100).\n\
+                    5. При фразах «громкость музыки на 50», «сделай потише/погромче музыку» — вызови 'spotify_volume' с числовым значением volume_percent (0-100).\n\
                     После успешного выполнения подтверждай голосом предельно лаконично (1-2 слова): «Пауза», «Включила», «Следующий».\n"
+                );
+            }
+
+            let volume_tools_enabled = tools_allowed;
+            if volume_tools_enabled {
+                system_instruction.push_str(
+                    "\n\nУПРАВЛЕНИЕ ГРОМКОСТЬЮ (шкала от 0 до 10, инструменты 'set_volume', 'volume_up', 'volume_down'):\n\
+                    1. При фразах «громкость 5», «громкость 3», «поставь громкость на 7», «громкость 10», «сделай громкость 8» — ОБЯЗАТЕЛЬНО вызови инструмент 'set_volume' с числовым параметром level (0-10).\n\
+                    2. При фразах «громче», «погромче», «прибавь звук», «сделай громче» — ОБЯЗАТЕЛЬНО вызови 'volume_up'.\n\
+                    3. При фразах «тише», «потише», «убавь звук», «сделай тише» — ОБЯЗАТЕЛЬНО вызови 'volume_down'.\n\
+                    После успешного выполнения подтверждай голосом предельно лаконично (1-2 слова): «Громкость 5», «Сделала громче», «Сделала тише».\n"
                 );
             }
 
@@ -665,7 +681,8 @@ async fn main() -> Result<()> {
             let any_tools_enabled = ha_tools_enabled
                 || weather_tools_enabled
                 || alarm_tools_enabled
-                || spotify_tools_enabled;
+                || spotify_tools_enabled
+                || volume_tools_enabled;
             let (tool_call_tx, mut tool_call_rx) = mpsc::channel::<gemini::ToolCallRequest>(20);
             let suppress_followup = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let suppress_followup_for_mic = suppress_followup.clone();
@@ -717,6 +734,53 @@ async fn main() -> Result<()> {
                         .await
                         {
                             let _ = req.reply_tx.send(sp_out);
+                            continue;
+                        }
+
+                        // Try Volume tools (scale 0-10)
+                        if req.function_name == "set_volume" {
+                            let level = req
+                                .args
+                                .get("level")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v.min(10) as u8)
+                                .unwrap_or(5);
+                            let new_level = crate::audio::volume::set_volume_level(level);
+                            let soloist_client_for_vol = soloist_for_tools.clone();
+                            tokio::spawn(async move {
+                                let _ = soloist_client_for_vol.set_volume(new_level * 10).await;
+                            });
+                            let _ = req.reply_tx.send(json!({
+                                "status": "ok",
+                                "level": new_level,
+                                "message": format!("Громкость {}", new_level)
+                            }));
+                            continue;
+                        }
+                        if req.function_name == "volume_up" {
+                            let new_level = crate::audio::volume::volume_up();
+                            let soloist_client_for_vol = soloist_for_tools.clone();
+                            tokio::spawn(async move {
+                                let _ = soloist_client_for_vol.set_volume(new_level * 10).await;
+                            });
+                            let _ = req.reply_tx.send(json!({
+                                "status": "ok",
+                                "level": new_level,
+                                "message": format!("Громкость {}", new_level)
+                            }));
+                            continue;
+                        }
+                        if req.function_name == "volume_down" {
+                            let new_level = crate::audio::volume::volume_down();
+                            let soloist_client_for_vol = soloist_for_tools.clone();
+                            tokio::spawn(async move {
+                                let _ = soloist_client_for_vol.set_volume(new_level * 10).await;
+                            });
+                            let _ = req.reply_tx.send(json!({
+                                "status": "ok",
+                                "level": new_level,
+                                "message": format!("Громкость {}", new_level)
+                            }));
                             continue;
                         }
 
@@ -1256,6 +1320,7 @@ async fn main() -> Result<()> {
                         has_weather_tools: weather_tools_enabled,
                         has_alarm_tools: alarm_tools_enabled,
                         has_spotify_tools: spotify_tools_enabled,
+                        has_volume_tools: volume_tools_enabled,
                         has_stop_dialogue: any_tools_enabled,
                         endpoint: None,
                         cancellation_epoch: Some(cancellation_epoch),
