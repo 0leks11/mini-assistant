@@ -119,16 +119,32 @@ pub async fn handle_spotify_tool_call(
                 .unwrap_or(false);
 
             if let Some(q) = clean_query.filter(|_| !is_generic) {
-                // Specific query: try Web API search and play
+                // Specific query: search via Web API and play directly through local Soloist speaker
                 let mut web_guard = web_client_lock.write().await;
                 if let Some(client) = web_guard.as_mut() {
-                    match client.search_and_play(q).await {
-                        Ok(msg) => {
-                            info!("Spotify search_and_play succeeded: {msg}");
-                            return Some(serde_json::json!({ "status": "ok", "message": msg }));
+                    match client.search(q, "track,playlist", 1).await {
+                        Ok(results) => {
+                            if let Some(track) = results.tracks.first() {
+                                if let Ok(()) = soloist.play_uri(&track.uri).await {
+                                    let artist = track.artists.first().map(|a| a.name.as_str()).unwrap_or("");
+                                    let msg = if artist.is_empty() {
+                                        format!("Включаю {}", track.name)
+                                    } else {
+                                        format!("Включаю {} — {}", track.name, artist)
+                                    };
+                                    info!("Played track via local Soloist: {msg}");
+                                    return Some(serde_json::json!({ "status": "ok", "message": msg }));
+                                }
+                            } else if let Some(playlist) = results.playlists.first() {
+                                if let Ok(()) = soloist.play_uri(&playlist.uri).await {
+                                    let msg = format!("Включаю плейлист {}", playlist.name);
+                                    info!("Played playlist via local Soloist: {msg}");
+                                    return Some(serde_json::json!({ "status": "ok", "message": msg }));
+                                }
+                            }
                         }
                         Err(e) => {
-                            warn!("Spotify Web API search failed: {e}; trying local resume");
+                            warn!("Spotify Web API search failed: {e}; falling back to local resume");
                         }
                     }
                 }
@@ -139,6 +155,14 @@ pub async fn handle_spotify_tool_call(
                 info!("Soloist resume executed successfully");
                 return Some(
                     serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
+                );
+            }
+
+            // If resume didn't work (nothing queued), try playing default top hits playlist
+            if let Ok(()) = soloist.play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").await {
+                info!("Soloist started default top hits playlist");
+                return Some(
+                    serde_json::json!({ "status": "ok", "message": "Включаю популярные треки" }),
                 );
             }
 
@@ -159,7 +183,7 @@ pub async fn handle_spotify_tool_call(
                 }
             }
 
-            Some(serde_json::json!({ "status": "error", "message": "Не удалось возобновить воспроизведение музыки" }))
+            Some(serde_json::json!({ "status": "error", "message": "Не удалось запустить музыку. Убедитесь, что Spotify Connect подключен к колонке." }))
         }
         "spotify_next" => {
             if let Ok(()) = soloist.next().await {
