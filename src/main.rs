@@ -327,6 +327,11 @@ async fn main() -> Result<()> {
                 return wait_for_alarm_shutdown().await;
             }
 
+            let playback = match local_playback {
+                Some(playback) => playback,
+                None => start_audio_output(&config.audio, dry_run)?,
+            };
+
             let voice = config.voice_settings()?;
             let provider = voice.provider;
             let api_key = match voice.api_key {
@@ -517,6 +522,7 @@ async fn main() -> Result<()> {
                     });
 
                     let alarm_for_btn = alarm_runner.as_ref().map(|runner| runner.player.clone());
+                    let playback_for_btn = playback.clone();
                     tokio::spawn(async move {
                         while let Some(event) = rx_btn.recv().await {
                             if let buttons::MuteButtonEvent::ShortPress { duration } = event {
@@ -529,6 +535,14 @@ async fn main() -> Result<()> {
                                         alarm.stop();
                                         continue;
                                     }
+                                }
+                                if playback_for_btn.is_playing() {
+                                    info!(
+                                        duration_ms = duration.as_millis(),
+                                        "Hardware button short press: interrupting assistant playback"
+                                    );
+                                    playback_for_btn.interrupt();
+                                    continue;
                                 }
                             }
                             if let Err(e) = coord
@@ -878,12 +892,7 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // 7. Initialize ALSA Playback (24000 Hz, 16-bit mono from Gemini Live)
-            let playback = match local_playback {
-                Some(playback) => playback,
-                None => start_audio_output(&config.audio, dry_run)?,
-            };
-
+            // 7. Initialize ALSA Playback interrupt hook
             let playback_for_interrupt = playback.clone();
             let on_interrupted = Arc::new(move || {
                 playback_for_interrupt.interrupt();
@@ -902,7 +911,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(18.0);
+                .unwrap_or(55.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -990,7 +999,7 @@ async fn main() -> Result<()> {
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|v| (1..=60).contains(v))
-                    .unwrap_or(10);
+                    .unwrap_or(5);
                 let mut echo_until = Instant::now() + Duration::from_secs(1);
                 let mut utterance_started = Instant::now();
                 let mut last_turn_seen: Option<u64> = None;
@@ -1140,6 +1149,14 @@ async fn main() -> Result<()> {
                     let frames = gate.process_frame(chunk);
                     let mut now_active = gate.is_active();
                     if !was_active && now_active {
+                        // Prevent acoustic self-interruption: if the assistant's own voice
+                        // is currently playing or within echo decay, discard the acoustic trigger.
+                        if playback_for_mic.is_playing() || now < echo_until {
+                            debug!("Discarded acoustic activation during assistant speech/echo tail");
+                            gate.reset_gate();
+                            continue;
+                        }
+
                         mic_authorization.cancel();
                         playback_for_mic.interrupt();
                         if let Some(ref alarm) = alarm_for_mic {
