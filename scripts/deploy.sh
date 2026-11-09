@@ -229,14 +229,7 @@ if [ -f "$BCM_ATTACH_BIN" ]; then
     HAVE_BCM_ATTACH=1
 fi
 
-if [ -f "$PROJECT_DIR/config.toml" ]; then
-    upload_file "$PROJECT_DIR/config.toml" "$MINI_DEPLOY_DIR/config.toml.new"
-fi
-if [ -f "$PROJECT_DIR/.env" ]; then
-    upload_file "$PROJECT_DIR/.env" "$MINI_DEPLOY_DIR/.env.new"
-fi
-
-# All files staged successfully; now atomically commit the bundle
+# All binaries staged and verified; atomically commit binary bundle
 ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/mini-assistant.new $MINI_DEPLOY_DIR/mini-assistant && chmod 755 $MINI_DEPLOY_DIR/mini-assistant"
 
 if [ "$HAVE_BCM_ATTACH" -eq 1 ]; then
@@ -251,17 +244,23 @@ if [ "$HAVE_SOURCE" -eq 1 ]; then
     ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/mini_pcm_source.new $MINI_DEPLOY_DIR/mini_pcm_source && chmod 755 $MINI_DEPLOY_DIR/mini_pcm_source"
 fi
 
-if [ -f "$PROJECT_DIR/config.toml" ]; then
-    ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/config.toml.new $MINI_DEPLOY_DIR/config.toml"
+# Deploy config only if remote does not have it, or with explicit intent
+REMOTE_HAS_CONFIG="$(ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "[ -f $MINI_DEPLOY_DIR/config.toml ] && echo 1 || echo 0")"
+if [ "$REMOTE_HAS_CONFIG" -eq 0 ] && [ -f "$PROJECT_DIR/config.toml" ]; then
+    echo "📋 Staging initial config.toml on device..."
+    upload_file "$PROJECT_DIR/config.toml" "$MINI_DEPLOY_DIR/config.toml"
 else
-    echo "⚠️  No local config.toml found; existing remote configuration is unchanged"
+    echo "ℹ️  Remote config.toml already exists on device; preserving device settings (voice, etc.)"
 fi
 
-if [ -f "$PROJECT_DIR/.env" ]; then
-    ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/.env.new $MINI_DEPLOY_DIR/.env"
+# NEVER blindly overwrite remote .env with local template/stale settings
+REMOTE_HAS_ENV="$(ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "[ -f $MINI_DEPLOY_DIR/.env ] && echo 1 || echo 0")"
+if [ "$REMOTE_HAS_ENV" -eq 0 ] && [ -f "$PROJECT_DIR/.env" ]; then
+    echo "🔒 Staging initial .env on device..."
+    upload_file "$PROJECT_DIR/.env" "$MINI_DEPLOY_DIR/.env"
     ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "chmod 600 $MINI_DEPLOY_DIR/.env"
 else
-    echo "⚠️  No local .env found; existing remote credentials are unchanged"
+    echo "ℹ️  Remote .env already exists on device; preserving calibrated credentials and thresholds"
 fi
 
 echo "🔍 Verifying binary on Mini..."
