@@ -93,12 +93,12 @@ check "rollback binary present" $?
 # 3. Processes: exactly one of each, no duplicates
 PROCS="$(REMOTE "ps | grep -v grep")"
 count_of() { printf '%s\n' "$PROCS" | grep -c "$1"; }
-[ "$(count_of '/mini-assistant$')" -eq 1 ]; check "single mini-assistant" $? \
-    "(count=$(count_of '/mini-assistant$'))"
+[ "$(count_of 'opt/mini-assistant/mini-assistant')" -eq 1 ]; check "single mini-assistant" $? \
+    "(count=$(count_of 'opt/mini-assistant/mini-assistant'))"
 [ "$(count_of 'run-supervisor.sh')" -ge 1 ]; check "supervisor running" $?
 [ "$(count_of 'mini_pcm_source')" -ge 1 ]; check "mic capture helper" $?
 [ "$(count_of 'soloist-env/soloist')" -ge 1 ]; check "soloist process" $?
-[ "$(count_of 'bcm-attach')" -ge 1 ]; check "bcm-attach running" $?
+[ "$(count_of '/bcm-attach')" -ge 1 ]; check "bcm-attach running" $?
 
 # 4. Spotify Soloist session
 STATUS="$(REMOTE "$MINI_DEPLOY_DIR/soloist-ctl status 2>&1")"
