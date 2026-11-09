@@ -31,17 +31,36 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# 5. Main loop for mini-assistant voice runtime & companions
+# 5. Continuous background watchdog for dependent daemons & hardware settings
+# Runs concurrently with the main voice daemon, checking health every 4 seconds.
+watchdog_loop() {
+    while true; do
+        sleep 4
+        # Hardware memory barrier
+        echo 2 > /proc/sys/abi/cp15_barrier 2>/dev/null || true
+        # Proximity sensor active
+        echo 1 > /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null || true
+
+        # Watchdog: Spotify Soloist engine
+        if [ -x "$DIR/soloist-env/soloist-run.sh" ] && ! ps | grep -v grep | grep -q "soloist-env/soloist"; then
+            echo "[$(date -Iseconds 2>/dev/null || date)] Watchdog: Spotify Soloist not running; starting..." >> "$LOGFILE"
+            nohup "$DIR/soloist-env/soloist-run.sh" > "$DIR/soloist.log" 2>&1 &
+        fi
+
+        # Watchdog: Bluetooth attach
+        if [ -x "$DIR/bcm-attach" ] && ! ps | grep -v grep | grep -q "$DIR/bcm-attach"; then
+            echo "[$(date -Iseconds 2>/dev/null || date)] Watchdog: bcm-attach not running; starting..." >> "$LOGFILE"
+            setsid "$DIR/bcm-attach" > "$DIR/bcm-attach.log" 2>&1 &
+        fi
+    done
+}
+
+watchdog_loop &
+WATCHDOG_PID=$!
+trap 'kill $WATCHDOG_PID 2>/dev/null' EXIT HUP INT TERM
+
+# 6. Main restart loop for mini-assistant voice runtime
 while true; do
-    # Ensure VL53 sensor is enabled
-    echo 1 > /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null || true
-
-    # Keep Spotify Soloist alive
-    if [ -x "$DIR/soloist-env/soloist-run.sh" ] && ! ps | grep -v grep | grep -q "soloist-env/soloist"; then
-        echo "[$(date -Iseconds 2>/dev/null || date)] Starting Spotify Soloist engine..." >> "$LOGFILE"
-        nohup "$DIR/soloist-env/soloist-run.sh" > "$DIR/soloist.log" 2>&1 &
-    fi
-
     if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)" -gt 2097152 ]; then
         mv -f "$LOGFILE" "$LOGFILE.old" 2>/dev/null || true
     fi
