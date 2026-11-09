@@ -516,8 +516,21 @@ async fn main() -> Result<()> {
                         }
                     });
 
+                    let alarm_for_btn = alarm_runner.as_ref().map(|runner| runner.player.clone());
                     tokio::spawn(async move {
                         while let Some(event) = rx_btn.recv().await {
+                            if let buttons::MuteButtonEvent::ShortPress { duration } = event {
+                                if let Some(ref alarm) = alarm_for_btn {
+                                    if alarm.is_ringing() {
+                                        info!(
+                                            duration_ms = duration.as_millis(),
+                                            "Hardware button short press: stopping ringing alarm"
+                                        );
+                                        alarm.stop();
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Err(e) = coord
                                 .handle_button_event_with_addr(event, dns_bind, portal_bind)
                                 .await
@@ -1129,6 +1142,12 @@ async fn main() -> Result<()> {
                     if !was_active && now_active {
                         mic_authorization.cancel();
                         playback_for_mic.interrupt();
+                        if let Some(ref alarm) = alarm_for_mic {
+                            if alarm.is_ringing() {
+                                info!("Acoustic wake-word barge-in: stopping ringing alarm");
+                                alarm.stop();
+                            }
+                        }
                         let soloist = soloist_for_mic.clone();
                         let soloist_playing = soloist_playing_for_mic.clone();
                         tokio::spawn(async move {
@@ -1236,13 +1255,6 @@ async fn main() -> Result<()> {
             };
             let mut voice_client = match connection {
                 Ok(client) => client,
-                Err(_) if alarm_runner.is_some() => {
-                    warn!(
-                        "{} startup failed; continuing with local alarms",
-                        provider.name()
-                    );
-                    return wait_for_alarm_shutdown().await;
-                }
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("Failed to start {}", provider.name()))
@@ -1300,10 +1312,6 @@ async fn main() -> Result<()> {
             .await;
             if let Err(error) = capture_result {
                 voice_client.stop().await;
-                if alarm_runner.is_some() {
-                    warn!("Voice capture unavailable; continuing with local alarms");
-                    return wait_for_alarm_shutdown().await;
-                }
                 return Err(error);
             }
 

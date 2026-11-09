@@ -23,13 +23,13 @@ impl KeywordEngine {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(0.48);
+            .unwrap_or(0.38);
 
         let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.25);
+            .unwrap_or(0.20);
 
         let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
             .ok()
