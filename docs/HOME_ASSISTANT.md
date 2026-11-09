@@ -1,84 +1,80 @@
-# Home Assistant Integration in mini-assistant
+# Интеграция Home Assistant
 
-`mini-assistant` connects directly to Home Assistant REST API and registers function declarations (tools) in the **Gemini 2.0 Live API**.
+Это экспериментальный REST-клиент и обработчик function calls текущего
+Gemini Live-прототипа. Наличие клиента и host-тестов не подтверждает сквозное
+голосовое управление реальной Mini. `200 OK` от HTML-интерфейса HA также
+не проверяет авторизацию REST API.
 
----
+## Включение и локальная политика
 
-## How It Works
+HA tools по умолчанию выключены. Для включения нужны URL, токен и **явный
+непустой список разрешённых сущностей**. Пример локального `config.toml`:
 
-```
-User says: "Включи кондиционер в спальне на 22 градуса"
-     ↓
-Mini 4-mic array + DU561 (echo cancellation)
-     ↓
-yio_audio IPC (16kHz PCM) → mini-assistant
-     ↓
-Gemini 2.0 Live WebSocket
-     ↓
-Gemini understands intent & calls tool:
-  control_home_device(
-    domain: "climate",
-    service: "set_temperature",
-    entity_id: "climate.midea_bedroom",
-    parameters: {"temperature": 22}
-  )
-     ↓
-mini-assistant executes POST http://PI_IP:8123/api/services/climate/set_temperature
-     ↓
-Home Assistant sets Midea AC to 22°C
-     ↓
-mini-assistant sends toolResponse to Gemini WebSocket
-     ↓
-Gemini speaks back: "Включила кондиционер в спальне на 22 градуса."
-     ↓
-ALSA playback on Mini speaker (24kHz S16_LE)
-```
-
----
-
-## Supported Commands
-
-### 1. Direct Device Control (`control_home_device`)
-- **Climate / Midea:**
-  - *"Включи кондиционер"* → `climate/turn_on`
-  - *"Поставь кондиционер на 24 градуса"* → `climate/set_temperature`
-  - *"Переключи кондиционер на обогрев / охлаждение"* → `climate/set_hvac_mode`
-- **Lights & Switches:**
-  - *"Включи свет на кухне"* → `light/turn_on`
-  - *"Сделай свет в зале потише"* → `light/turn_on` (brightness)
-  - *"Выключи розетку / утюг"* → `switch/turn_off`
-- **Delayed & Scheduled Actions:**
-  - *"Выключи свет через 5 минут"* → handled by Gemini scheduling or HA timers.
-
-### 2. Device History & Analytics (`get_device_history`)
-- *"Сколько раз за день включался чайник?"*
-- *"Какая температура была ночью в спальне?"*
-- *"Когда в последний раз открывалась дверь?"*
-
----
-
-## Dynamic Entity Refresh
-
-Every time `mini-assistant` connects:
-1. It queries `GET /api/states` from Home Assistant.
-2. It filters actionable devices (climate, light, switch, vacuum, fan, cover).
-3. It dynamically builds a device roster (friendly names, room IDs, current states).
-4. It injects this roster into Gemini's system instructions.
-
-If you add a new device or room in Home Assistant, **mini-assistant automatically knows about it upon restart or refresh!**
-
----
-
-## Configuration
-
-In `.env`:
-```bash
-HA_URL=http://192.168.77.2:8123
-HA_TOKEN=eyJh... # Long-lived access token from HA Profile
-```
-
-In `config.toml`:
 ```toml
 [ha]
 url = "http://192.168.77.2:8123"
+allowed_entities = ["light.living_room", "climate.bedroom", "sensor.room_temperature"]
 ```
+
+Это примеры ID; заменить их реальными сущностями, которыми разрешено управлять
+или историю которых разрешено передавать модели. Настоящий токен хранится
+в исключённом из Git `.env`:
+
+```dotenv
+HA_URL=http://192.168.77.2:8123
+HA_TOKEN=your_long_lived_token
+```
+
+`HA_URL` переопределяет URL существующей секции `[ha]`; `HA_TOKEN` используется,
+если токен не задан в TOML. Без секции `[ha]` HA-интеграция не включается.
+Секреты в TOML не рекомендуются. Подходящий адрес зависит от сети Mini;
+пример Lab-адреса не является автоматическим обнаружением Pi.
+
+LLM предлагает действие, но локальный клиент повторно проверяет его перед
+HTTP-запросом. Список устройств в prompt не считается авторизацией.
+
+## Что допускается сейчас
+
+- `light`: `turn_on` (необязательно `brightness` 0–255 или `brightness_pct`
+  0–100) и `turn_off`.
+- `switch`: `turn_on` и `turn_off`.
+- `climate`: `turn_on`, `turn_off`, `set_temperature` с конечным числом,
+  `set_hvac_mode` с известным HA-режимом. Поддержку режима и температурные
+  пределы конкретного кондиционера дополнительно проверяет HA.
+- История только явно разрешённых сущностей: окно 1–168 часов, RFC3339 start
+  и явный end, `minimal_response` и `no_attributes`.
+
+`entity_id` должен быть одной строкой из allowlist, а его домен должен
+совпадать с доменом сервиса. Произвольные сервисы, неизвестные параметры,
+`area_id`, `device_id`, `target`, массивы ID и широкие селекторы отвергаются.
+Другие устройства могут быть явно разрешены для чтения истории, но это
+не разрешает выполнять их сервисы. Пустой allowlist отключает tools.
+
+## Обмен данными и ограничения
+
+При старте приложение получает `/api/states`, оставляет только разрешённые
+сущности и передаёт их имена, ID и состояния в инструкции модели. Данные
+не печатаются в обычный лог. Это snapshot на момент старта: подписки на
+изменения, загрузки area/room registry и автоматического refresh пока нет.
+
+Все запросы имеют HTTP deadline 5 секунд и предел JSON-ответа 1 MiB.
+HTTP-ошибки, невалидный JSON и превышение размера не считаются успехом.
+Redirects не выполняются; в диагностике нет тела серверной ошибки или
+полного action payload. После успешного POST модель получает только
+`accepted: true`, без списка changed states, сторонних сущностей и attributes.
+Это подтверждение приёма сервером, а не доказательство физического переключения. Таймаут после POST не доказывает, что устройство
+не изменилось: перед повторением надо проверить состояние. Автоматического
+повторного выполнения клиент не делает.
+
+Отложенных команд, расписаний, постоянной истории диалога и самостоятельного
+таймера сейчас нет. Их нельзя обещать в ответе, пока отдельный исполнитель
+и его сохранение состояния не реализованы и не проверены.
+
+## Проверки
+
+Unit-тесты проверяют allowlist, типы/селекторы и построение окна истории.
+HTTP fixtures слушают только `127.0.0.1` на случайном порту: проверяют ошибку
+400 и фильтрацию roster без обращения к настоящему HA. Для этих тестов среда
+должна разрешать локальный loopback. Host-тесты не включают реальные устройства.
+
+Контракт API: [официальная документация HA REST](https://contributors.home-assistant.io/core/internals/rest-api/).

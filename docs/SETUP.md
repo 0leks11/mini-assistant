@@ -1,114 +1,144 @@
-# Mini-Assistant Setup & Deployment Guide
+# Подготовка и ограниченный запуск
 
-This guide walks you through compiling and running `mini-assistant` on your Yandex Station Mini 1.
+Это инструкция подготовки экспериментального клиента, не подтверждение его
+готовности. Сначала изучить [архитектуру](ARCHITECTURE.md) и текущие blockers
+из ревью. До устранения input/handshake/playback gaps сквозной тест не считать
+безопасной проверкой по умолчанию.
 
----
+## Локальные проверки
 
-## Prerequisites on Mac
+Нужны Rust с rustfmt/clippy и Python 3 для изолированных deployment fixtures:
 
-1. **Rust & ARM32 Target:**
-   ```bash
-   rustup target add armv7-unknown-linux-musleabihf
-   ```
+```sh
+./scripts/check.sh
+```
 
-2. **Docker:**
-   Ensure Docker Desktop is running on your Mac (`docker --version`).
+Команда не запускает main, не читает настоящие credentials и не подключается
+к Mini/Pi или API. HTTP fixtures могут слушать только loopback временный порт.
+Запрет bind в песочнице — ограничение среды, его нельзя выдавать за сбой HA.
 
-3. **Cross Compiler:**
-   ```bash
-   cargo install cross --git https://github.com/cross-rs/cross
-   ```
+## Конфигурация
 
----
+Из корня приложения, без перезаписи существующих файлов:
 
-## Step 1: Configuration & Secrets
+```sh
+if [ ! -e .env ]; then (umask 077; cp .env.example .env); fi
+if [ ! -e config.toml ]; then (umask 077; cp config.example.toml config.toml); fi
+```
 
-1. Navigate to the project directory:
-   ```bash
-   cd /Users/oleksii/Documents/gpt-mini/mini-assistant
-   ```
+Заполнить локально API key и параметры соединений. Не публиковать `.env`.
+`MINI_SSH_KEY` — абсолютный путь к существующему ключу Mini; переменная
+`MINI_JUMP_HOST`, если нужна, задаёт отдельный SSH-переход через Pi. `-i` для
+Mini не аутентифицирует шлюз: Pi использует свою запись SSH config/agent или
+пароль. Не отключать проверку host key, чтобы обойти ошибку подключения.
 
-2. Create your `.env` file (this file is gitignored and will never be committed):
-   ```bash
-   cat << 'EOF' > .env
-   GEMINI_API_KEY=your_gemini_api_key_here
-   HA_URL=http://192.168.77.2:8123
-   HA_TOKEN=your_ha_long_lived_token_here
-   MINI_HOST=192.168.77.110
-   MINI_PORT=2222
-   MINI_SSH_KEY=~/.ssh/your_mini_key
-   EOF
-   ```
+HA должен быть доступен по адресу, достижимому **с Mini**, а не только с Mac.
+Открывающаяся страница `:8123` доказывает HTTP-доступность frontend. Валидность
+токена подтверждается отдельным авторизованным read-only запросом `/api/`.
+Для управления нужен явный локальный allowlist; см. [HA](HOME_ASSISTANT.md).
 
-3. Copy the configuration template:
-   ```bash
-   cp config.example.toml config.toml
-   ```
+## ARM-сборка
 
----
+Нужен работающий Docker с образом для ARM32 musl. Текущий `build.sh` запускает
+Docker напрямую; наличие `cross` для этого скрипта не требуется:
 
-## Step 2: Build Binary for Mini (ARM32 Static)
-
-Run the automated build script:
-```bash
+```sh
 ./scripts/build.sh
+file target/armv7-unknown-linux-musleabihf/release/mini-assistant
 ```
 
-This uses `cross` inside Docker to compile a fully static musl binary (`armv7-unknown-linux-musleabihf`). It has zero external glibc dependencies and runs natively on the Mini's kernel (Linux 4.9.68).
+Инструментом `readelf`/`llvm-readelf` проверить ELF32 ARM, hard-float flags,
+interpreter и `NEEDED`; записать SHA256. Совместимость с ядром и реальными
+syscalls проверяется на конкретном устройстве отдельно. Не делать вывод о
+совместимости только по слову musl или размеру бинаря.
 
----
+## Preflight перед изменением Mini
 
-## Step 3: Deploy to Mini
+Подтвердить питание, модель, firmware/userspace, pinned SSH identity, свободную
+память, существующие процессы и доступность проверенного `aplay` с vendor
+libraries. Использовать проверенный ALSA `default`; raw `hw:*` не подставлять
+для моно 24 kHz без отдельной проверки native TDM/PCM контракта.
 
-Deploy the binary and config over SSH:
-```bash
-./scripts/deploy.sh
+Определить свои каталоги, config/env permissions, backup и остановку своих
+процессов. Не использовать открытие всего WAN или изменение NAT/DNS как
+скрытый шаг deployment. Если сеть действительно надо менять, нужен отдельный
+baseline и точечный откат каждого изменения.
+
+## Deployment и smoke test
+
+`./scripts/deploy.sh` — явная операция изменения устройства, отдельно от
+quality checks. Прочитать текущий скрипт до использования. Ошибка передачи
+конфига или секрета не должна завершаться сообщением об успешном deployment.
+
+Запускать main только в предусмотренном опыте с ограничением длительности
+и планом cleanup. Захват начинается после setupComplete; передачу открывает
+энергетический VAD, а не wake-word, поэтому он не защищает от достаточно громкой
+фоновой речи. До проверки barge-in и завершения дочернего
+`aplay` не считать Ctrl-C достаточным доказательством полной очистки.
+
+Фиксировать отдельно: запуск ELF, подписку/формат входа, принятие setup сервером,
+реальное аудио, авторизованный HA read-only ответ, затем разрешённые HA-действия.
+Строка «pipeline active» или `ShareContextRelease` эти проверки не заменяет.
+После опыта проверить отсутствие своих процессов и восстановление baseline.
+
+## Spotify
+
+Ручной режим Connect предназначен для отдельной пробы на Mini. `librespot`
+принимает подключение из Spotify на телефоне, выдаёт стерео PCM через stdout,
+а `mini-assistant` преобразует его для `mini_pcm_sink`. На телефоне и Mini
+используем доверенную LAN. Подготовка музыки не требует ключей Gemini или
+OpenAI. Перед пробой проверить свободное место и остановить обычную службу
+ассистента в согласованном окне. Проверить, что в это время нет звонка или
+ближайшего будильника. После пробы восстановить обычную службу.
+
+Сборка на Mac/Linux с Docker и `readelf` из корня приложения.
+
+```sh
+./scripts/build_librespot.sh
 ```
 
----
+Для опыта скопировать `librespot` из `target/librespot-arm32/` рядом с
+кандидатом `mini-assistant` в отдельный каталог на Mini, сверить SHA-256 и
+проверить путь до действующего `mini_pcm_sink`. На Mini из каталога опыта
+запустить в foreground и выбрать «GPT Mini» в Spotify на телефоне.
 
-## Step 4: Run & Test on Mini
-
-SSH into the Mini:
-```bash
-ssh -p 2222 -i ~/.ssh/your_mini_key root@192.168.77.110
+```sh
+MINI_PCM_SINK_PATH=/data/opt/mini-assistant/mini_pcm_sink \
+  ./mini-assistant --spotify-connect "$PWD/librespot" --config "$PWD/config.toml"
 ```
 
-Run the assistant in the foreground to monitor live logs:
-```bash
-cd /data/opt/mini-assistant
-./mini-assistant
+Признаки успешной пробы — слышимый трек, пауза из телефона, остановка по
+`Ctrl-C`, отсутствие дочерних процессов и освобождение динамика. Режим
+без автозапуска, с приглушённой стартовой громкостью и без постоянного
+кэша учётных данных. Подписка Spotify Premium требуется `librespot`.
+[librespot](https://github.com/librespot-org/librespot/tree/v0.8.0)
+
+## Переключение голосового провайдера
+
+Существующий конфиг без `assistant.provider` выбирает Gemini. Для OpenAI
+в копии конфига выставить `provider = "openai"` в `[assistant]` и добавить
+свою доступную Realtime-модель и её голос в `[openai]`.
+
+```toml
+[openai]
+model = "gpt-realtime"
+voice = "marin"
 ```
 
-### What You Will See in Logs:
-1. `mini-assistant starting on Yandex Station Mini`
-2. `Connecting to Home Assistant... Synchronized devices: [Midea, Lights, ...]`
-3. `Connecting to Gemini Live API... Connected successfully`
-4. `Starting VQE audio capture from yio_audio:9850... Subscribed to vqe_0`
-5. `🚀 mini-assistant full audio + Home Assistant pipeline is active!`
+Ключ `OPENAI_API_KEY` держать в приватном `.env`. Для Gemini используется
+`GEMINI_API_KEY`. Для первого теста каждого провайдера команды запускаются
+из отдельного каталога с его конфигом. При `--check --conversation-only`
+открывается только сессия провайдера без микрофона, динамика и запросов HA.
+Обычный `--conversation-only` открывает аудиоустройства, но отключает HA,
+погоду, изменение расписания и запуск тестового планировщика.
 
----
+```sh
+./mini-assistant --check --conversation-only --config "$PWD/config.toml"
+./mini-assistant --conversation-only --config "$PWD/config.toml"
+```
 
-## Step 5: Try Voice Commands!
-
-Speak directly to the Mini:
-- *"Привет, как дела?"* → Gemini speaks back through the Mini's speaker!
-- *"Включи кондиционер на 23 градуса"* → Gemini triggers `control_home_device` → Home Assistant sets Midea AC temperature!
-- *"Выключи свет в спальне"* → Gemini triggers `light/turn_off`!
-- *"Сколько раз включался чайник?"* → Gemini queries history and answers!
-
----
-
-## Step 6: Spotify Connect (Optional)
-
-To enable Spotify Connect:
-1. Build `librespot`:
-   ```bash
-   ./scripts/build_librespot.sh
-   ```
-2. Copy `bin/librespot` to Mini (`/data/opt/librespot/`).
-3. Run `librespot` on Mini:
-   ```bash
-   /data/opt/librespot/librespot --name "Mini" --backend alsa --bitrate 320
-   ```
-4. Open Spotify on your phone or Mac — "Mini" appears as an available speaker!
+Ручное открытие реплики на стенде использует `SIGUSR1` точному PID
+тестового процесса. В штатном режиме с загруженным эталоном используется
+«Штучка». Для проверки контекста нужны две реплики в одной сессии.
+Вход через ChatGPT OAuth и повторное открытие микрофона после уточнения
+выделены в отдельные шаги. [OpenAI Realtime](https://developers.openai.com/api/docs/guides/realtime-conversations)

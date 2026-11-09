@@ -1,8 +1,12 @@
 # Build artifacts
 /target/
+mini_pcm_sink
+mini_pcm_source
 
 # Secrets — NEVER commit these
 .env
+.env.*
+!.env.example
 config.toml
 *.key
 *.pem
@@ -21,3 +25,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Private personal keyword templates / enrollment audio
+*.rpw
+/enrollment/

@@ -1,79 +1,52 @@
 # mini-assistant
 
-Custom voice assistant for **Yandex Station Mini 1** (A113X, ARM32).  
-Replaces Yandex `maind` with a fully open, custom Rust stack.
+Экспериментальный Rust-клиент для Mini 1 (A113X, ARM32). Цель — собственный
+голосовой ассистент с Home Assistant и музыкой без сервисов Яндекса.
+Полная замена `maind` и сквозной голосовой цикл пока не подтверждены.
 
-**No Yandex services. No Yandex accounts. Full hardware reuse.**
+## Что есть сейчас
 
-## What it does
-
-- 🎤 Wake word detection ("Эй Мини" or any custom word)
-- 🔊 Real-time voice dialog via **Gemini Live API**
-- 🎵 **Spotify Connect** via librespot
-- 🏠 **Home Assistant** voice control
-- 💡 LED + button control
-
-## Hardware
-
-| | |
+| Компонент | Статус |
 |---|---|
-| Device | Yandex Station Mini 1 (YNDX-0004) |
-| SoC | Amlogic A113X, 4× Cortex-A53 |
-| RAM | 236 MiB |
-| Audio | DU561 DSP, 4 microphones |
-| Build target | `armv7-unknown-linux-musleabihf` (static musl) |
+| VQE input | Клиент локального `yio_audio:9850`, parser tests; точный формат речи требует проверки |
+| Gemini Live | Провайдер по умолчанию. Локальные WebSocket-тесты покрывают две реплики, переподключение и отмену |
+| Playback | Поток в дочерний `aplay`; штатные ALSA libraries/config остаются runtime-зависимостями |
+| Home Assistant | REST-клиент и ограниченный локальной политикой executor; реальный API/действия отдельно |
+| Wake-word | Локальный персональный KWS. Без эталона остаётся ручная активация. Надёжность на обычной дистанции ожидает приёмки |
+| Spotify Connect | Ручной режим с `librespot` ARM32 и PCM-рендерером. Проверка звука и привязки с телефона ожидает Mini |
+| LED, кнопки, долговременная память | Не реализованы в текущем приложении |
+| OpenAI Realtime | Опциональный провайдер с `OPENAI_API_KEY`, только разговор. Вход через ChatGPT и голосовые инструменты для OpenAI ещё не подключены |
 
-## Quick Start
+Захват стартует после готовности выбранной сессии. Локальный детектор или
+явная ручная активация открывает одну реплику. VAD определяет начало и конец
+речи внутри разрешённого окна. Локальные тесты используют заглушки и
+синтетический PCM. [Порядок проверки провайдеров и Spotify](docs/SETUP.md)
 
-```bash
-# 1. Install cross-compiler
-cargo install cross --git https://github.com/cross-rs/cross
+## Рабочий цикл
 
-# 2. Add ARM32 target
-rustup target add armv7-unknown-linux-musleabihf
+Прочитать [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md),
+[архитектуру](docs/ARCHITECTURE.md) и [SETUP](docs/SETUP.md).
 
-# 3. Configure
-cp config.example.toml config.toml  # edit with your values
-cp .env.example .env                 # add your API keys
-
-# 4. Build
-./scripts/build.sh
-
-# 5. Deploy to Mini
-./scripts/deploy.sh
+```sh
+./scripts/check.sh
 ```
 
-## Project Structure
+Настройка локальных файлов сохраняет существующие секреты:
 
-```
-src/
-├── main.rs          # Entry point
-├── config.rs        # Configuration
-├── audio/           # ALSA capture + playback
-├── gemini/          # Gemini Live API client
-├── wakeword/        # Wake word detection (Porcupine)
-├── ha/              # Home Assistant client
-├── led/             # LED controller (sysfs)
-└── buttons/         # Button handler (evdev)
-scripts/
-├── build.sh         # Build for ARM32
-└── deploy.sh        # Deploy to Mini via SSH
-docs/
-├── ARCHITECTURE.md  # System architecture
-├── SETUP.md         # Full setup guide
-└── HARDWARE.md      # Mini hardware details
+```sh
+if [ ! -e .env ]; then (umask 077; cp .env.example .env); fi
+if [ ! -e config.toml ]; then (umask 077; cp config.example.toml config.toml); fi
 ```
 
-## Architecture
+`scripts/build.sh` запускает Docker image `messense/rust-musl-cross` для
+`armv7-unknown-linux-musleabihf`. `scripts/deploy.sh` изменяет Mini и не является
+тестом. Перед ним нужен актуальный preflight и план восстановления.
 
-See [AGENTS.md](AGENTS.md) for full rules and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for system design.
+## Железо и границы
 
-## Security
+A113X/Cortex-A53, но исследованный userspace — **ELF32 ARM/armhf**, glibc 2.23,
+около 236 MiB RAM. Проверять конкретный ELF и native runtime; статическая
+линковка Rust не заменяет `aplay`, DSP, kernel driver и ALSA config.
 
-- API keys go in `.env` — never in git
-- Config secrets via environment variables
-- SSH key-only access to Mini
-
-## License
-
-MIT
+Все настоящие credentials остаются в локальных `.env`/credential store.
+Root SSH Mini и авторизация SSH шлюза Pi — разные подключения.

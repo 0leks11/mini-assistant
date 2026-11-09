@@ -47,7 +47,10 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Нужен Rust toolchain с `rustfmt` и `clippy`. Текущий Rust-код не зависит от
+После Rust tests тот же скрипт запускает offline deployment fixtures:
+`python3 -B -m unittest discover -s tests -p 'test_*.py' -v`.
+Нужны Python 3 (stdlib) и Rust toolchain с `rustfmt` и `clippy`.
+Текущий Rust-код не зависит от
 `alsa`/`alsa-sys`: воспроизведение передаётся отдельному процессу `aplay`.
 Поэтому `libasound2-dev` и `pkg-config` сейчас не являются требованиями этих
 host-проверок. Cargo может скачать зависимости при первом запуске.
@@ -63,13 +66,19 @@ Linux и macOS после push/PR в GitHub. Без публикации реп�
 Linux runner также не подтверждает работоспособность аудиовыхода.
 CI не является ARM-сборкой и не проверяет Mini.
 
+Loopback HTTP fixtures допустимы: они используют временный порт, ограниченный
+timeout и fake response без реального аккаунта. Запрет `bind` песочницей
+отмечай как ограничение среды и запускай разрешённый локальный тест в подходящем
+окружении; не подменяй его успешным skip или настоящим HA endpoint.
+
 Перед аппаратным тестом отдельно проверь доступность исполняемого `aplay`
 на Mini, его ABI и native-зависимости, поддерживаемый ALSA device и точные
 параметры PCM. Затем выполни ограниченный тест с фактическим подтверждением
 звука. Статический Rust-бинарь не устраняет зависимость runtime от `aplay`,
 его библиотек, драйверов и настройки аудиотракта.
 
-Для подготовки артефакта, когда настроены `cross`, Docker и native-зависимости:
+Для подготовки артефакта, когда настроены Docker image и native-зависимости
+(текущий скрипт не требует установленного `cross`):
 
 ```bash
 ./scripts/build.sh
