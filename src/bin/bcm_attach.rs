@@ -288,10 +288,12 @@ mod linux_uart {
             );
             let flags = u32::from_ne_bytes(buf.bytes[16..20].try_into().unwrap_or_default());
             let is_up = (flags & (1 << 0)) != 0;
-            let is_running = (flags & (1 << 1)) != 0;
+            let is_running = (flags & (1 << 2)) != 0;
+            let is_pscan = (flags & (1 << 3)) != 0;
+            let is_iscan = (flags & (1 << 4)) != 0;
 
             Ok(format!(
-                "hci{dev_id}: BD_ADDR={addr}, Flags=0x{flags:08X} (UP={is_up}, RUNNING={is_running})"
+                "hci{dev_id}: BD_ADDR={addr}, Flags=0x{flags:08X} (UP={is_up}, RUNNING={is_running}, PSCAN={is_pscan}, ISCAN={is_iscan})"
             ))
         }
     }
@@ -412,6 +414,17 @@ mod linux_uart {
             Ok(info_str) => {
                 info!(info = %info_str, "HCI device initialized and brought UP");
                 println!("{info_str}");
+
+                // Initialize discoverable & connectable piscan mode with name "GPT Mini"
+                match mini_assistant::bluetooth::linux_bt::set_discoverable_linux(0) {
+                    Ok(msg) => {
+                        info!(%msg, "Bluetooth discoverable piscan mode enabled");
+                        println!("{msg}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Could not set Bluetooth discoverable mode: {e:#}");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("Could not bring UP hci0 via ioctl: {e:#}");

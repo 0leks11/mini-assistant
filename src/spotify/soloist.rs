@@ -47,8 +47,9 @@ pub struct SoloistStatus {
 
 impl SoloistStatus {
     /// True if the current track has completed playback (EOF reached).
+    /// Tracks within 3000ms of end are considered completed.
     pub fn is_at_eof(&self) -> bool {
-        self.duration_ms > 0 && self.position_ms >= self.duration_ms
+        self.duration_ms > 0 && self.position_ms + 3000 >= self.duration_ms
     }
 
     /// True if Soloist is actively emitting audio (playing and not past track end).
@@ -209,9 +210,9 @@ impl SoloistClient {
             })
         });
 
-        // If the track duration has elapsed, Soloist has reached EOF and is no longer
-        // emitting sound, even if internal status remains "playing". Treat as Stopped.
-        let state = if state == PlaybackState::Playing && duration_ms > 0 && position_ms >= duration_ms {
+        // If the track duration has elapsed (or within 3000ms EOF window), Soloist has finished
+        // playback and is no longer emitting sound, even if internal status remains "playing" or "paused".
+        let state = if duration_ms > 0 && position_ms + 3000 >= duration_ms {
             PlaybackState::Stopped
         } else {
             state
@@ -251,6 +252,28 @@ mod tests {
         assert!(status.is_at_eof());
         assert!(!status.is_actually_playing());
         assert_eq!(status.position_ms, 585193);
+        assert_eq!(status.duration_ms, 195640);
+    }
+
+    #[test]
+    fn test_parse_status_json_near_eof_within_3s_treated_as_stopped() {
+        let json = r#"{
+            "type": "playback_state",
+            "status": "playing",
+            "item": {
+                "uri": "spotify:track:0d8cGMosMcPJA8UsxQCtZq",
+                "playback": { "duration_ms": 195640 }
+            },
+            "position": { "position_ms": 194000, "speed": 1 },
+            "volume": 40,
+            "is_active": true
+        }"#;
+
+        let status = SoloistClient::parse_status_json(json).unwrap();
+        assert_eq!(status.state, PlaybackState::Stopped);
+        assert!(status.is_at_eof());
+        assert!(!status.is_actually_playing());
+        assert_eq!(status.position_ms, 194000);
         assert_eq!(status.duration_ms, 195640);
     }
 

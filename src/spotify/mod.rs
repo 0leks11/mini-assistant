@@ -162,14 +162,24 @@ pub async fn handle_spotify_tool_call(
             if !is_ended {
                 // Resume local soloist playback
                 if let Ok(()) = soloist.resume().await {
-                    info!("Soloist resume executed successfully");
-                    return Some(
-                        serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
-                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    let actually_playing = soloist
+                        .get_status()
+                        .await
+                        .map(|s| s.is_actually_playing())
+                        .unwrap_or(true);
+
+                    if actually_playing {
+                        info!("Soloist resume executed successfully and playback is active");
+                        return Some(
+                            serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
+                        );
+                    }
+                    warn!("Soloist resume succeeded but track is at EOF or not active; starting playlist");
                 }
             }
 
-            // If ended or resume didn't work (nothing queued), play default top hits playlist
+            // If ended or resume didn't work (nothing queued / at EOF), play default top hits playlist
             if let Ok(()) = soloist.play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").await {
                 info!("Soloist started default top hits playlist");
                 return Some(
