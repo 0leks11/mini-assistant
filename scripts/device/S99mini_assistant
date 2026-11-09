@@ -1,0 +1,86 @@
+#!/bin/sh
+# /etc/init.d/S99mini_assistant
+# Native voice assistant supervisor for GPT Mini.
+#
+# Invariant enforced here: at most ONE run-supervisor.sh and ONE
+# mini-assistant process. Previous versions killed a single PID from
+# /run/mini-assistant.pid, so a stale supervisor survived `stop` and
+# respawned a second assistant - that produced duplicate processes,
+# doubled microphone/idle behaviour and confusing "music is dead" reports.
+
+DIR=/data/opt/mini-assistant
+SUPERVISOR=$DIR/run-supervisor.sh
+PIDFILE=/run/mini-assistant.pid
+LOGFILE=$DIR/assistant.log
+
+count_supervisors() {
+    ps | grep -v grep | grep -c "run-supervisor.sh"
+}
+
+count_assistants() {
+    ps | grep -v grep | grep -c "$DIR/mini-assistant"
+}
+
+kill_matching() {
+    # $1 = extended regexp, $2 = signal
+    for pid in $(ps | grep -v grep | grep -E "$1" | awk '{print $1}'); do
+        kill "-$2" "$pid" 2>/dev/null || true
+    done
+}
+
+stop_all() {
+    # Supervisors first: while one is alive it will respawn its child.
+    kill_matching "run-supervisor.sh" TERM
+    sleep 2
+    kill_matching "$DIR/mini-assistant" TERM
+    sleep 2
+    # Anything that ignored TERM (e.g. blocked in a syscall) is force-killed
+    # so a restart never leaves a duplicate behind.
+    kill_matching "run-supervisor.sh" KILL
+    kill_matching "$DIR/mini-assistant" KILL
+    rm -f "$PIDFILE"
+}
+
+case "$1" in
+    start)
+        RUNNING=$(count_supervisors)
+        if [ "$RUNNING" -gt 0 ]; then
+            echo "mini-assistant already running ($RUNNING supervisor(s), $(count_assistants) assistant(s))"
+            exit 0
+        fi
+        echo "Starting mini-assistant supervisor..."
+        nohup /bin/sh "$SUPERVISOR" >> "$LOGFILE" 2>&1 &
+        echo $! > "$PIDFILE"
+        echo "mini-assistant started (supervisor pid $(cat "$PIDFILE"))"
+        ;;
+    stop)
+        echo "Stopping mini-assistant..."
+        stop_all
+        echo "mini-assistant stopped"
+        ;;
+    restart)
+        stop_all
+        sleep 1
+        exec /bin/sh "$0" start
+        ;;
+    status)
+        SUP=$(count_supervisors)
+        ASST=$(count_assistants)
+        echo "supervisors: $SUP"
+        echo "assistants:  $ASST"
+        # The supervisor's watchdog runs as a shell subshell, so a healthy
+        # single instance shows two run-supervisor.sh processes. The reliable
+        # signal for duplicates is the assistant count.
+        if [ "$ASST" -eq 1 ] && [ "$SUP" -ge 1 ] && [ "$SUP" -le 2 ]; then
+            echo "mini-assistant healthy"
+            exit 0
+        fi
+        echo "mini-assistant DEGRADED (expected 1 assistant and 1 supervisor tree)"
+        exit 1
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit 0

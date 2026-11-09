@@ -277,6 +277,14 @@ if [ -f "$SUPERVISOR_SRC" ]; then
     ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/run-supervisor.sh.new $MINI_DEPLOY_DIR/run-supervisor.sh && chmod 755 $MINI_DEPLOY_DIR/run-supervisor.sh"
 fi
 
+# Init script is part of the runtime contract too: a stale copy that cannot
+# kill a surviving supervisor is what produces duplicated assistants.
+INIT_SRC="$PROJECT_DIR/scripts/device/S99mini_assistant"
+if [ -f "$INIT_SRC" ]; then
+    echo "📦 Installing init script..."
+    cat "$INIT_SRC" | ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "cat > /etc/init.d/S99mini_assistant.new && mv -f /etc/init.d/S99mini_assistant.new /etc/init.d/S99mini_assistant && chmod 755 /etc/init.d/S99mini_assistant"
+fi
+
 # Record provenance on the device: commit -> build -> sha256 -> deploy.
 GIT_COMMIT="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -n "$(git -C "$PROJECT_DIR" status --porcelain 2>/dev/null)" ]; then
