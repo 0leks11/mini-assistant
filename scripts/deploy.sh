@@ -22,6 +22,7 @@ require_value() {
 
 # Parse arguments before reading any configuration; --help has no side effects.
 SKIP_BUILD=0
+RESTART=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --host) require_value "$@"; CLI_HOST="$2"; shift 2 ;;
@@ -29,6 +30,7 @@ while [[ $# -gt 0 ]]; do
         --key)  require_value "$@"; CLI_KEY="$2"; shift 2 ;;
         --jump) require_value "$@"; CLI_JUMP="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
+        --restart) RESTART=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument" >&2; usage >&2; exit 2 ;;
     esac
@@ -229,6 +231,9 @@ if [ -f "$BCM_ATTACH_BIN" ]; then
     HAVE_BCM_ATTACH=1
 fi
 
+# Keep the previous binary so a bad release can be rolled back without a rebuild.
+ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "[ -f $MINI_DEPLOY_DIR/mini-assistant ] && cp -f $MINI_DEPLOY_DIR/mini-assistant $MINI_DEPLOY_DIR/mini-assistant.prev || true"
+
 # All binaries staged and verified; atomically commit binary bundle
 ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/mini-assistant.new $MINI_DEPLOY_DIR/mini-assistant && chmod 755 $MINI_DEPLOY_DIR/mini-assistant"
 
@@ -263,8 +268,38 @@ else
     echo "ℹ️  Remote .env already exists on device; preserving calibrated credentials and thresholds"
 fi
 
+# Supervisor is part of the runtime, not device-local state: without it the
+# watchdog that keeps Soloist/bcm-attach alive is silently lost on re-image.
+SUPERVISOR_SRC="$PROJECT_DIR/scripts/run-supervisor.sh"
+if [ -f "$SUPERVISOR_SRC" ]; then
+    echo "📦 Uploading supervisor script..."
+    upload_file "$SUPERVISOR_SRC" "$MINI_DEPLOY_DIR/run-supervisor.sh.new"
+    ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "mv -f $MINI_DEPLOY_DIR/run-supervisor.sh.new $MINI_DEPLOY_DIR/run-supervisor.sh && chmod 755 $MINI_DEPLOY_DIR/run-supervisor.sh"
+fi
+
+# Record provenance on the device: commit -> build -> sha256 -> deploy.
+GIT_COMMIT="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$PROJECT_DIR" status --porcelain 2>/dev/null)" ]; then
+    GIT_DIRTY=dirty
+    echo "⚠️  WARNING: worktree is dirty; this build does not correspond to a commit:"
+    git -C "$PROJECT_DIR" status --short | sed 's/^/    /'
+else
+    GIT_DIRTY=clean
+fi
+DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'commit=%s\ndirty=%s\nbinary_sha256=%s\nbuilt_at=%s\ndeployed_at=%s\n' \
+    "$GIT_COMMIT" "$GIT_DIRTY" "$LOCAL_HASH" \
+    "$(git -C "$PROJECT_DIR" log -1 --format=%cI 2>/dev/null || echo unknown)" "$DEPLOYED_AT" \
+    | ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "cat > $MINI_DEPLOY_DIR/BUILD_INFO && chmod 644 $MINI_DEPLOY_DIR/BUILD_INFO"
+
 echo "🔍 Verifying binary on Mini..."
 ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "ls -lh $MINI_DEPLOY_DIR/mini-assistant && sha256sum $MINI_DEPLOY_DIR/mini-assistant"
 
+if [ "$RESTART" -eq 1 ]; then
+    echo "🔄 Restarting under supervisor..."
+    ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "if [ -x /etc/init.d/S99mini_assistant ]; then /etc/init.d/S99mini_assistant stop >/dev/null 2>&1 || true; sleep 1; /etc/init.d/S99mini_assistant start; else echo 'ERROR: init script missing' >&2; exit 1; fi"
+fi
+
 echo "✅ Deploy complete!"
 echo "   Run on Mini: $MINI_DEPLOY_DIR/mini-assistant"
+echo "   Verify with: $PROJECT_DIR/scripts/verify_deploy.sh"
