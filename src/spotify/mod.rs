@@ -1,10 +1,12 @@
 //! Standalone Spotify Connect controller and Web API client for GPT Mini.
 
 pub mod crypto;
+pub mod ducking;
 pub mod local_server;
 pub mod soloist;
 pub mod web_api;
 
+pub use ducking::MusicDucker;
 pub use local_server::{load_persisted_token, SpotifyWebServer};
 #[allow(unused_imports)]
 pub use soloist::{CurrentTrackInfo, PlaybackState, SoloistClient, SoloistStatus};
@@ -150,15 +152,24 @@ pub async fn handle_spotify_tool_call(
                 }
             }
 
-            // Resume local soloist playback
-            if let Ok(()) = soloist.resume().await {
-                info!("Soloist resume executed successfully");
-                return Some(
-                    serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
-                );
+            // Query Soloist status to check if it has reached EOF or stopped
+            let soloist_status = soloist.get_status().await.ok();
+            let is_ended = soloist_status
+                .as_ref()
+                .map(|s| s.is_at_eof() || s.state == PlaybackState::Stopped)
+                .unwrap_or(false);
+
+            if !is_ended {
+                // Resume local soloist playback
+                if let Ok(()) = soloist.resume().await {
+                    info!("Soloist resume executed successfully");
+                    return Some(
+                        serde_json::json!({ "status": "ok", "message": "Воспроизведение возобновлено" }),
+                    );
+                }
             }
 
-            // If resume didn't work (nothing queued), try playing default top hits playlist
+            // If ended or resume didn't work (nothing queued), play default top hits playlist
             if let Ok(()) = soloist.play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").await {
                 info!("Soloist started default top hits playlist");
                 return Some(
@@ -189,6 +200,11 @@ pub async fn handle_spotify_tool_call(
             if let Ok(()) = soloist.next().await {
                 info!("Soloist next executed successfully");
                 return Some(serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }));
+            }
+            // Fallback: if Soloist had no queue (e.g. played single track to EOF), start top hits
+            if let Ok(()) = soloist.play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").await {
+                info!("Soloist next started default playlist fallback");
+                return Some(serde_json::json!({ "status": "ok", "message": "Включаю следующий трек" }));
             }
             let mut web_guard = web_client_lock.write().await;
             if let Some(client) = web_guard.as_mut() {

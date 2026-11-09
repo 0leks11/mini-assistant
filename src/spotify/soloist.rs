@@ -41,6 +41,20 @@ pub struct SoloistStatus {
     pub track: Option<CurrentTrackInfo>,
     pub volume: u8,
     pub is_active: bool,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+}
+
+impl SoloistStatus {
+    /// True if the current track has completed playback (EOF reached).
+    pub fn is_at_eof(&self) -> bool {
+        self.duration_ms > 0 && self.position_ms >= self.duration_ms
+    }
+
+    /// True if Soloist is actively emitting audio (playing and not past track end).
+    pub fn is_actually_playing(&self) -> bool {
+        self.state == PlaybackState::Playing && !self.is_at_eof()
+    }
 }
 
 impl SoloistClient {
@@ -159,6 +173,12 @@ impl SoloistClient {
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
 
+        let position_ms = v
+            .pointer("/position/position_ms")
+            .and_then(|p| p.as_u64())
+            .unwrap_or(0);
+
+        let mut duration_ms = 0;
         let track = v.get("item").and_then(|item| {
             let uri = item.get("uri")?.as_str()?.to_string();
             let name = item
@@ -175,7 +195,7 @@ impl SoloistClient {
                 .pointer("/parent/entity/decorations/identity/name")
                 .and_then(|a| a.as_str())
                 .map(|s| s.to_string());
-            let duration_ms = item
+            duration_ms = item
                 .pointer("/playback/duration_ms")
                 .and_then(|d| d.as_u64())
                 .unwrap_or(0);
@@ -189,11 +209,21 @@ impl SoloistClient {
             })
         });
 
+        // If the track duration has elapsed, Soloist has reached EOF and is no longer
+        // emitting sound, even if internal status remains "playing". Treat as Stopped.
+        let state = if state == PlaybackState::Playing && duration_ms > 0 && position_ms >= duration_ms {
+            PlaybackState::Stopped
+        } else {
+            state
+        };
+
         Ok(SoloistStatus {
             state,
             track,
             volume,
             is_active,
+            position_ms,
+            duration_ms,
         })
     }
 }
@@ -201,6 +231,28 @@ impl SoloistClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_status_json_eof_treated_as_stopped() {
+        let json = r#"{
+            "type": "playback_state",
+            "status": "playing",
+            "item": {
+                "uri": "spotify:track:0d8cGMosMcPJA8UsxQCtZq",
+                "playback": { "duration_ms": 195640 }
+            },
+            "position": { "position_ms": 585193, "speed": 1 },
+            "volume": 40,
+            "is_active": true
+        }"#;
+
+        let status = SoloistClient::parse_status_json(json).unwrap();
+        assert_eq!(status.state, PlaybackState::Stopped);
+        assert!(status.is_at_eof());
+        assert!(!status.is_actually_playing());
+        assert_eq!(status.position_ms, 585193);
+        assert_eq!(status.duration_ms, 195640);
+    }
 
     #[test]
     fn test_parse_status_json_paused() {

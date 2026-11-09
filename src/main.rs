@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 pub mod alarms;
 mod audio;
+pub mod bluetooth;
 pub mod buttons;
 mod config;
 mod gemini;
@@ -192,6 +193,7 @@ async fn run_preflight_check(
                 has_alarm_tools: false,
                 has_spotify_tools: false,
                 has_volume_tools: false,
+                has_bluetooth_tools: false,
                 has_stop_dialogue: false,
                 endpoint: None,
                 cancellation_epoch: None,
@@ -467,11 +469,12 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // 4d. Initialize Spotify Soloist Controller
+            // 4d. Initialize Spotify Soloist Controller & Music Ducker
             let soloist_client = Arc::new(spotify::SoloistClient::new(
                 spotify_cfg.soloist_ctl.clone(),
                 spotify_cfg.ws_url.clone(),
             ));
+            let music_ducker = Arc::new(spotify::MusicDucker::new());
             let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let is_soloist_playing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -483,7 +486,7 @@ async fn main() -> Result<()> {
                     interval.tick().await;
                     match soloist_poller_client.get_status().await {
                         Ok(status) => {
-                            let playing = status.state == spotify::PlaybackState::Playing;
+                            let playing = status.is_actually_playing();
                             soloist_playing_flag
                                 .store(playing, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -697,6 +700,7 @@ async fn main() -> Result<()> {
                 let alarm_tz_tools = alarm_tz.clone();
                 let spotify_client_opt = spotify_client_holder.clone();
                 let soloist_for_tools = soloist_client.clone();
+                let ducker_for_tools = music_ducker.clone();
 
                 tokio::spawn(async move {
                     while let Some(req) = tool_call_rx.recv().await {
@@ -733,12 +737,18 @@ async fn main() -> Result<()> {
                         )
                         .await
                         {
+                            ducker_for_tools.cancel();
+                            if req.function_name == "spotify_play" {
+                                suppress_followup_for_tools
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
                             let _ = req.reply_tx.send(sp_out);
                             continue;
                         }
 
                         // Try Volume tools (scale 0-10)
                         if req.function_name == "set_volume" {
+                            ducker_for_tools.cancel();
                             let level = req
                                 .args
                                 .get("level")
@@ -758,6 +768,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         if req.function_name == "volume_up" {
+                            ducker_for_tools.cancel();
                             let new_level = crate::audio::volume::volume_up();
                             let soloist_client_for_vol = soloist_for_tools.clone();
                             tokio::spawn(async move {
@@ -771,6 +782,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         if req.function_name == "volume_down" {
+                            ducker_for_tools.cancel();
                             let new_level = crate::audio::volume::volume_down();
                             let soloist_client_for_vol = soloist_for_tools.clone();
                             tokio::spawn(async move {
@@ -781,6 +793,25 @@ async fn main() -> Result<()> {
                                 "level": new_level,
                                 "message": format!("Громкость {}", new_level)
                             }));
+                            continue;
+                        }
+
+                        if req.function_name == "enable_bluetooth" {
+                            info!("Gemini requested enable_bluetooth");
+                            match crate::bluetooth::enable_discoverable(0).await {
+                                Ok(msg) => {
+                                    let _ = req.reply_tx.send(json!({
+                                        "status": "ok",
+                                        "message": msg
+                                    }));
+                                }
+                                Err(e) => {
+                                    let _ = req.reply_tx.send(json!({
+                                        "status": "error",
+                                        "message": format!("Не удалось включить Bluetooth: {e}")
+                                    }));
+                                }
+                            }
                             continue;
                         }
 
@@ -1045,6 +1076,7 @@ async fn main() -> Result<()> {
             let alarm_for_mic = alarm_runner.as_ref().map(|runner| runner.player.clone());
             let soloist_for_mic = soloist_client.clone();
             let soloist_playing_for_mic = is_soloist_playing.clone();
+            let ducker_for_mic = music_ducker.clone();
             let voice_active_for_mic = voice_active.clone();
             tokio::spawn(async move {
                 use std::sync::atomic::Ordering;
@@ -1064,7 +1096,7 @@ async fn main() -> Result<()> {
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|v| (1..=60).contains(v))
                     .unwrap_or(5);
-                let mut echo_until = Instant::now() + Duration::from_secs(1);
+                let mut tts_echo_until = Instant::now() + Duration::from_secs(1);
                 let mut utterance_started = Instant::now();
                 let mut last_turn_seen: Option<u64> = None;
                 let mut led_is_on = false;
@@ -1149,21 +1181,23 @@ async fn main() -> Result<()> {
                     }
 
                     // Speaker state and follow-up window tracking
-                    let is_speaker_playing = playback_for_mic.is_playing()
-                        || alarm_for_mic
-                            .as_ref()
-                            .is_some_and(|alarm| alarm.is_ringing())
-                        || soloist_playing_for_mic.load(Ordering::Relaxed);
+                    let is_tts_playing = playback_for_mic.is_playing();
+                    let is_alarm_ringing = alarm_for_mic
+                        .as_ref()
+                        .is_some_and(|alarm| alarm.is_ringing());
+                    let is_music_playing = soloist_playing_for_mic.load(Ordering::Relaxed);
 
                     let current_auth_turn = mic_authorization.current_turn();
                     if let Some(turn_id) = current_auth_turn {
                         last_turn_seen = Some(turn_id);
                     } else if let Some(finished_id) = last_turn_seen.take() {
-                        if !is_speaker_playing {
-                            if suppress_followup_for_mic.swap(false, Ordering::SeqCst) {
+                        if !is_tts_playing {
+                            if suppress_followup_for_mic.swap(false, Ordering::SeqCst)
+                                || is_music_playing
+                            {
                                 info!(
                                     finished_turn = finished_id,
-                                    "Dialogue ended explicitly: follow-up suppressed"
+                                    "Dialogue ended: follow-up suppressed"
                                 );
                                 followup_until = now;
                                 gate.set_manual_armed(false);
@@ -1176,32 +1210,35 @@ async fn main() -> Result<()> {
                                 );
                             }
                         } else {
-                            // Hold finished_id until speaker audio finishes playing
+                            // Hold finished_id until assistant's own voice finishes playing
                             last_turn_seen = Some(finished_id);
                         }
                     }
 
-                    if is_speaker_playing {
-                        echo_until = now + Duration::from_millis(800);
+                    if is_tts_playing {
+                        tts_echo_until = now + Duration::from_millis(800);
                     }
-                    let speaker_active = is_speaker_playing || now < echo_until;
+                    let tts_active = is_tts_playing || now < tts_echo_until;
 
-                    if speaker_active {
-                        // During speaker output or echo decay:
-                        // Never allow VAD / energy barge-in (prevents self-interruption on echo).
+                    if tts_active || is_alarm_ringing || is_music_playing {
+                        // During assistant speech, alarm, or music:
+                        // Never allow raw VAD / energy barge-in (prevents self-interruption on echo or music).
                         // ONLY allow the keyword engine (Rustpotter «Штучка») to detect acoustic barge-in!
                         gate.set_manual_armed(false);
                     } else {
-                        // When speaker is silent:
+                        // When completely silent:
                         // Manual arming enables VAD speech detection (if manual_arm was triggered or in follow-up window)
                         let in_followup = now < followup_until;
                         let is_manually_armed = now < arm_until || in_followup;
                         gate.set_manual_armed(is_manually_armed);
                     }
 
-                    // Unified visual LED state: active during input, thinking, playback, or follow-up window
-                    let is_turn_in_progress =
-                        current_auth_turn.is_some() || active_turn.is_some() || is_speaker_playing;
+                    // Unified visual LED state: active during input, thinking, TTS playback, alarm, or follow-up window.
+                    // Background music playback does NOT keep the blue dialogue LED on!
+                    let is_turn_in_progress = current_auth_turn.is_some()
+                        || active_turn.is_some()
+                        || is_tts_playing
+                        || is_alarm_ringing;
                     let should_led_be_on = is_turn_in_progress || now < followup_until;
                     voice_active_for_mic.store(should_led_be_on, Ordering::SeqCst);
                     if should_led_be_on != led_is_on {
@@ -1213,10 +1250,10 @@ async fn main() -> Result<()> {
                     let frames = gate.process_frame(chunk);
                     let mut now_active = gate.is_active();
                     if !was_active && now_active {
-                        // Prevent acoustic self-interruption: if the assistant's own voice
-                        // is currently playing or within echo decay, discard the acoustic trigger.
-                        if playback_for_mic.is_playing() || now < echo_until {
-                            debug!("Discarded acoustic activation during assistant speech/echo tail");
+                        // Prevent acoustic self-interruption: ONLY discard if the assistant's OWN TTS VOICE
+                        // is currently playing or within echo decay. Music or alarms must NOT discard the wake-word!
+                        if is_tts_playing || now < tts_echo_until {
+                            debug!("Discarded acoustic activation during assistant TTS speech/echo tail");
                             gate.reset_gate();
                             continue;
                         }
@@ -1229,25 +1266,32 @@ async fn main() -> Result<()> {
                                 alarm.stop();
                             }
                         }
-                        let soloist = soloist_for_mic.clone();
-                        let soloist_playing = soloist_playing_for_mic.clone();
-                        tokio::spawn(async move {
-                            soloist_playing.store(false, Ordering::Relaxed);
-                            if let Err(e) = soloist.pause().await {
-                                debug!("Soloist barge-in pause skipped or error: {e}");
-                            }
-                        });
+
+                        // Acoustic Music Ducking: if Soloist is playing, lower volume to 20%
+                        // so user command is heard cleanly without killing music!
+                        if is_music_playing {
+                            let soloist = soloist_for_mic.clone();
+                            let ducker = ducker_for_mic.clone();
+                            tokio::spawn(async move {
+                                ducker.duck(&soloist).await;
+                            });
+                        }
+
                         let id = mic_authorization.begin_explicit_turn();
                         active_turn = Some(id);
                         last_turn_seen = Some(id);
                         let expected_epoch = playback_for_mic.cancellation_epoch();
                         let lease = mic_authorization.clone();
                         let speaker = playback_for_mic.clone();
+                        let ducker_task = ducker_for_mic.clone();
+                        let soloist_task = soloist_for_mic.clone();
                         tokio::spawn(async move {
                             while lease.is_current(id) {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                             speaker.interrupt_if_epoch(expected_epoch);
+                            // When user turn ends, restore music volume if it was ducked
+                            ducker_task.restore_if_ducked(&soloist_task).await;
                         });
                         utterance_started = now;
                         arm_until = now;
@@ -1321,6 +1365,7 @@ async fn main() -> Result<()> {
                         has_alarm_tools: alarm_tools_enabled,
                         has_spotify_tools: spotify_tools_enabled,
                         has_volume_tools: volume_tools_enabled,
+                        has_bluetooth_tools: true,
                         has_stop_dialogue: any_tools_enabled,
                         endpoint: None,
                         cancellation_epoch: Some(cancellation_epoch),

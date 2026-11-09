@@ -123,6 +123,7 @@ pub struct LiveClientConfig {
     pub has_alarm_tools: bool,
     pub has_spotify_tools: bool,
     pub has_volume_tools: bool,
+    pub has_bluetooth_tools: bool,
     pub has_stop_dialogue: bool,
     pub endpoint: Option<String>,
     /// A shared renderer epoch is advanced only by its interruption callback.
@@ -865,6 +866,17 @@ async fn run_single_session(
         ]);
     }
 
+    if cfg.has_bluetooth_tools {
+        function_declarations.push(json!({
+            "name": "enable_bluetooth",
+            "description": "Включить Bluetooth для поиска и подключения телефона или ноутбука к колонке (режим сопряжения/обнаружения). Вызывай при фразах «включи блютуз», «включи bluetooth», «режим блютуз», «подключи по bluetooth».",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {}
+            }
+        }));
+    }
+
     if cfg.has_stop_dialogue {
         function_declarations.push(json!({
             "name": "stop_dialogue",
@@ -924,8 +936,8 @@ async fn run_single_session(
         .await
         .context("Failed to send setup message to Gemini Live")?;
     info!(
-        "Sent setup configuration to Gemini Live (voice: {}, ha_tools: {}, weather_tools: {}, alarm_tools: {}, spotify_tools: {}, volume_tools: {})",
-        cfg.voice_name, cfg.has_ha_tools, cfg.has_weather_tools, cfg.has_alarm_tools, cfg.has_spotify_tools, cfg.has_volume_tools
+        "Sent setup configuration to Gemini Live (voice: {}, ha_tools: {}, weather_tools: {}, alarm_tools: {}, spotify_tools: {}, volume_tools: {}, bluetooth_tools: {})",
+        cfg.voice_name, cfg.has_ha_tools, cfg.has_weather_tools, cfg.has_alarm_tools, cfg.has_spotify_tools, cfg.has_volume_tools, cfg.has_bluetooth_tools
     );
 
     // Wait for setupComplete confirmation from server before starting audio stream
@@ -1156,6 +1168,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1214,6 +1227,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             // Point to a non-listening port on loopback
             endpoint: Some("ws://127.0.0.1:1".to_string()),
@@ -1271,6 +1285,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1321,6 +1336,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1380,6 +1396,7 @@ mod tests {
             has_alarm_tools: true,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1444,6 +1461,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: true,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1509,6 +1527,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: true,
             endpoint: Some(ws_url),
             cancellation_epoch: None,
@@ -1535,6 +1554,67 @@ mod tests {
 
         client.stop().await;
     }
+
+    #[tokio::test]
+    async fn test_bluetooth_tool_declarations_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ws_url = format!("ws://127.0.0.1:{}/ws", port);
+
+        let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<Value>();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    if let Some(Ok(Message::Text(setup_text))) = ws.next().await {
+                        let val: Value = serde_json::from_str(&setup_text).unwrap();
+                        let _ = setup_tx.send(val);
+                    }
+                    let resp = json!({ "setupComplete": {} });
+                    let _ = ws.send(Message::Text(resp.to_string())).await;
+                    while ws.next().await.is_some() {}
+                }
+            }
+        });
+
+        let cfg = LiveClientConfig {
+            api_key: "dummy".to_string(),
+            model: "models/gemini-2.0-flash-exp".to_string(),
+            voice_name: "Aoede".to_string(),
+            system_instruction: "test".to_string(),
+            has_ha_tools: false,
+            has_weather_tools: false,
+            has_alarm_tools: false,
+            has_spotify_tools: false,
+            has_volume_tools: false,
+            has_bluetooth_tools: true,
+            has_stop_dialogue: false,
+            endpoint: Some(ws_url),
+            cancellation_epoch: None,
+            authorization: None,
+            suppress_followup: None,
+        };
+
+        let (_tx_user, rx_user) = mpsc::channel(10);
+        let (tx_model, _rx_model) = mpsc::channel(10);
+        let on_interrupted = Arc::new(|| {});
+
+        let mut client = GeminiLiveClient::connect(cfg, rx_user, tx_model, None, on_interrupted)
+            .await
+            .unwrap();
+
+        let setup_val = setup_rx.await.unwrap();
+        let tools = setup_val["setup"]["tools"]
+            .as_array()
+            .expect("tools must be present");
+        assert_eq!(tools.len(), 1);
+        let decls = tools[0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["name"], "enable_bluetooth");
+
+        client.stop().await;
+    }
+
     fn model_pcm(value: u8) -> Value {
         json!({"serverContent":{"modelTurn":{"parts":[{"inlineData":{
             "mimeType":"audio/pcm;rate=24000","data":BASE64.encode([value, 0])
@@ -2115,6 +2195,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(endpoint),
             cancellation_epoch: Some(Arc::new(AtomicU64::new(0))),
@@ -2297,6 +2378,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(endpoint),
             cancellation_epoch: Some(playback.cancellation_epoch_handle()),

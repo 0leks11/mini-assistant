@@ -1312,6 +1312,7 @@ mod tests {
             has_alarm_tools: false,
             has_spotify_tools: false,
             has_volume_tools: false,
+            has_bluetooth_tools: false,
             has_stop_dialogue: false,
             endpoint: Some(format!("ws://{addr}/ws")),
             cancellation_epoch: Some(playback.cancellation_epoch_handle()),
