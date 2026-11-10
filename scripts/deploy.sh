@@ -282,7 +282,8 @@ fi
 INIT_SRC="$PROJECT_DIR/scripts/device/S99mini_assistant"
 if [ -f "$INIT_SRC" ]; then
     echo "📦 Installing init script..."
-    cat "$INIT_SRC" | ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "cat > /etc/init.d/S99mini_assistant.new && mv -f /etc/init.d/S99mini_assistant.new /etc/init.d/S99mini_assistant && chmod 755 /etc/init.d/S99mini_assistant"
+    upload_file "$INIT_SRC" "/etc/init.d/S99mini_assistant"
+    ssh "${SSH_OPTS[@]}" "root@$MINI_HOST" "chmod 755 /etc/init.d/S99mini_assistant"
 fi
 
 # Record provenance on the device: commit -> build -> sha256 -> deploy.
