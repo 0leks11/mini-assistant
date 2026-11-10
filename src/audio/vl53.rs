@@ -63,6 +63,7 @@ pub fn enable_hardware_sensor() {
 /// Spawn the background gesture-volume reader task.
 pub fn spawn_vl53_volume_task(
     soloist_client: Option<crate::spotify::SoloistClient>,
+    ducker: Option<std::sync::Arc<crate::spotify::MusicDucker>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         enable_hardware_sensor();
@@ -124,6 +125,9 @@ pub fn spawn_vl53_volume_task(
                                     if stable_count >= 2 && new_level != last_reported_level {
                                         last_reported_level = new_level;
                                         crate::audio::volume::set_volume_level(new_level);
+                                        if let Some(ref d) = ducker {
+                                            d.cancel();
+                                        }
                                         info!(
                                             new_level,
                                             dist_mm = last_event_dist,

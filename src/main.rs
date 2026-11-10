@@ -507,7 +507,10 @@ async fn main() -> Result<()> {
             });
 
             // 4d2. Start VL53L0 proximity gesture volume reader task
-            let _vl53_task = audio::vl53::spawn_vl53_volume_task(Some((*soloist_client).clone()));
+            let _vl53_task = audio::vl53::spawn_vl53_volume_task(
+                Some((*soloist_client).clone()),
+                Some(music_ducker.clone()),
+            );
 
             // 4e. Initialize Wi-Fi Setup and Mute Button Watcher
             let wifi_cfg = config.wifi.clone().unwrap_or_default();
