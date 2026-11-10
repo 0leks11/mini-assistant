@@ -102,9 +102,9 @@ count_of() { printf '%s\n' "$PROCS" | grep -c "$1"; }
 
 # 4. Spotify Soloist session
 STATUS="$(REMOTE "$MINI_DEPLOY_DIR/soloist-ctl status 2>&1")"
-printf '%s' "$STATUS" | grep -q "reachable"; check "soloist reachable" $?
-printf '%s' "$STATUS" | grep -q "logged in: yes"; check "soloist logged in" $?
-printf '%s' "$STATUS" | grep -qE "active device: (yes|no)"; check "soloist device ready" $?
+grep -q "reachable" <<< "$STATUS"; check "soloist reachable" $?
+grep -q "logged in: yes" <<< "$STATUS"; check "soloist logged in" $?
+grep -qE "active device: (yes|no)" <<< "$STATUS"; check "soloist device ready" $?
 
 # 5. Hardware sensor + audio device
 REMOTE "test \"\$(cat /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null)\" = 1"
@@ -113,11 +113,11 @@ REMOTE "grep -q . /proc/asound/card0/pcm0p/sub0/status"; check "ALSA playback PC
 
 # 6. Runtime log markers
 LOG_TAIL="$(REMOTE "tail -n 400 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null")"
-printf '%s' "$LOG_TAIL" | grep -q "setupComplete confirmed"; check "Gemini Live setupComplete" $?
-printf '%s' "$LOG_TAIL" | grep -q "spotify_tools: true"; check "spotify tools registered" $?
-printf '%s' "$LOG_TAIL" | grep -q "volume_tools: true"; check "volume tools registered" $?
-printf '%s' "$LOG_TAIL" | grep -q "VL53L0 proximity gesture volume reader active"; check "VL53 reader active" $?
-printf '%s' "$LOG_TAIL" | grep -q "voice: Callirrhoe"; check "voice Callirrhoe" $?
+grep -q "setupComplete confirmed" <<< "$LOG_TAIL"; check "Gemini Live setupComplete" $?
+grep -q "spotify_tools: true" <<< "$LOG_TAIL"; check "spotify tools registered" $?
+grep -q "volume_tools: true" <<< "$LOG_TAIL"; check "volume tools registered" $?
+grep -q "VL53L0 proximity gesture volume reader active" <<< "$LOG_TAIL"; check "VL53 reader active" $?
+grep -q "voice: Callirrhoe" <<< "$LOG_TAIL"; check "voice Callirrhoe" $?
 
 # 7. No crash loop (filter out intentional SIGTERM exit 143 during service restarts)
 CRASHES="$(REMOTE "tail -n 500 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null" | grep -v 'code 143' | grep -v 'code 0' | grep -c 'Daemon exited with code')"
