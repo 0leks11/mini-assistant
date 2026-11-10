@@ -9,6 +9,7 @@ pub mod interaction;
 pub mod spotify;
 pub mod wakeword;
 pub mod weather;
+pub mod web;
 pub mod wifi;
 
 pub async fn wait_for_shutdown() -> anyhow::Result<()> {

@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>GPT Mini — Центр управления</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: rgba(22, 27, 34, 0.85);
+      --card-border: rgba(48, 54, 61, 0.8);
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-glow: rgba(88, 166, 255, 0.2);
+      --success: #2ea043;
+      --danger: #da3633;
+      --warning: #d29922;
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 16px;
+      line-height: 1.5;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 500px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 4px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #1f6feb, #8957e5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3);
+    }
+    .brand-icon svg { width: 22px; height: 22px; fill: white; }
+    .brand-info h1 { font-size: 19px; font-weight: 700; color: #fff; letter-spacing: -0.3px; }
+    .brand-info p { font-size: 12px; color: var(--text-muted); }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border-radius: 20px;
+      background: rgba(46, 160, 67, 0.15);
+      color: #3fb950;
+      border: 1px solid rgba(46, 160, 67, 0.3);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #3fb950;
+      box-shadow: 0 0 8px #3fb950;
+    }
+    .status-badge.offline {
+      background: rgba(218, 54, 51, 0.15);
+      color: #f85149;
+      border-color: rgba(218, 54, 51, 0.3);
+    }
+    .status-badge.offline .status-dot { background: #f85149; box-shadow: 0 0 8px #f85149; }
+
+    /* Card */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 18px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* Metrics Grid */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .metric-item {
+      background: rgba(13, 17, 23, 0.7);
+      border: 1px solid rgba(48, 54, 61, 0.5);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .metric-label { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+    .metric-value { font-size: 15px; font-weight: 600; color: #fff; }
+    .progress-bar {
+      height: 4px;
+      background: #21262d;
+      border-radius: 2px;
+      margin-top: 6px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #1f6feb, #58a6ff);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    /* Volume Slider */
+    .volume-box { display: flex; flex-direction: column; gap: 12px; }
+    .volume-header { display: flex; justify-content: space-between; align-items: center; }
+    .volume-level { font-size: 22px; font-weight: 700; color: #fff; }
+    .volume-level span { font-size: 13px; color: var(--text-muted); font-weight: normal; margin-left: 4px; }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 10px;
+      border-radius: 5px;
+      background: #21262d;
+      outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: #58a6ff;
+      cursor: pointer;
+      box-shadow: 0 0 12px rgba(88, 166, 255, 0.6);
+      border: 2px solid #fff;
+    }
+    .volume-actions {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .btn-icon {
+      flex: 1;
+      padding: 8px;
+      background: #21262d;
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+    .btn-icon:active { transform: scale(0.96); background: #30363d; }
+
+    /* Voice Grid */
+    .voice-select-wrap { display: flex; flex-direction: column; gap: 10px; }
+    .voice-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .voice-chip {
+      background: #161b22;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      transition: all 0.2s;
+    }
+    .voice-chip:hover { border-color: #58a6ff; }
+    .voice-chip.active {
+      background: rgba(88, 166, 255, 0.12);
+      border-color: #58a6ff;
+      box-shadow: 0 0 10px rgba(88, 166, 255, 0.25);
+    }
+    .voice-name { font-size: 14px; font-weight: 600; color: #fff; }
+    .voice-desc { font-size: 11px; color: var(--text-muted); }
+    .btn-apply-voice {
+      width: 100%;
+      padding: 11px;
+      background: #1f6feb;
+      border: none;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 6px;
+    }
+    .btn-apply-voice:active { background: #388bfd; }
+
+    /* LED Palette */
+    .led-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .led-btn {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      padding: 6px 0;
+    }
+    .led-circle {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 2px solid transparent;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .led-btn:active .led-circle { transform: scale(0.9); }
+    .led-btn.active .led-circle { border-color: #fff; transform: scale(1.1); }
+    .led-label { font-size: 11px; color: var(--text-muted); }
+
+    .led-azure { background: #38bdf8; box-shadow: 0 0 12px rgba(56, 189, 248, 0.5); }
+    .led-purple { background: #c084fc; box-shadow: 0 0 12px rgba(192, 132, 252, 0.5); }
+    .led-emerald { background: #34d399; box-shadow: 0 0 12px rgba(52, 211, 153, 0.5); }
+    .led-amber { background: #fbbf24; box-shadow: 0 0 12px rgba(251, 191, 36, 0.5); }
+    .led-white { background: #f8fafc; box-shadow: 0 0 12px rgba(248, 250, 252, 0.5); }
+    .led-off { background: #21262d; border: 2px dashed #484f58; box-shadow: none; }
+
+    /* Spotify Playback */
+    .spotify-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .track-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: rgba(13, 17, 23, 0.7);
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(48, 54, 61, 0.5);
+    }
+    .track-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 6px;
+      background: #1db954;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .track-icon svg { width: 20px; height: 20px; fill: #000; }
+    .track-details { overflow: hidden; }
+    .track-name { font-size: 14px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .track-artist { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .spotify-controls {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+    }
+    .sp-btn {
+      padding: 8px 18px;
+      background: #21262d;
+      border: 1px solid var(--card-border);
+      color: #fff;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .sp-btn:active { background: #30363d; }
+    .sp-btn-play { background: #1db954; color: #000; font-weight: 700; border: none; }
+    .sp-btn-play:active { background: #1aa34a; }
+
+    /* System Action Buttons */
+    .sys-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .btn-sys {
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: background 0.2s;
+    }
+    .btn-restart {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: var(--accent);
+    }
+    .btn-restart:hover { background: #30363d; }
+    .btn-reboot {
+      background: rgba(218, 54, 51, 0.15);
+      border: 1px solid rgba(218, 54, 51, 0.4);
+      color: #f85149;
+    }
+    .btn-reboot:hover { background: rgba(218, 54, 51, 0.25); }
+
+    /* Toast Notification */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: #1f6feb;
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      transition: transform 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+      z-index: 9999;
+      pointer-events: none;
+    }
+    #toast.show { transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"/></svg>
+      </div>
+      <div class="brand-info">
+        <h1 id="app-name">GPT Mini</h1>
+        <p id="app-desc">Станция управления</p>
+      </div>
+    </div>
+    <div id="status-pill" class="status-badge">
+      <div class="status-dot"></div>
+      <span id="status-text">В сети</span>
+    </div>
+  </div>
+
+  <!-- Hardware Metrics -->
+  <div class="card">
+    <div class="card-title">
+      <span>Состояние устройства</span>
+      <span id="device-ip" style="font-weight: normal; font-size: 12px; color: var(--accent);">--</span>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric-item">
+        <div class="metric-label">Свободная RAM</div>
+        <div class="metric-value" id="ram-val">-- МБ</div>
+        <div class="progress-bar"><div class="progress-fill" id="ram-bar"></div></div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-label">Время работы (Uptime)</div>
+        <div class="metric-value" id="uptime-val">--</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-label">Загрузка CPU</div>
+        <div class="metric-value" id="cpu-val">--</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-label">Часы (NTP)</div>
+        <div class="metric-value" id="clock-val">Синхронизированы</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Master Volume -->
+  <div class="card">
+    <div class="card-title">
+      <span>Громкость колонки</span>
+      <span style="font-weight: normal; font-size: 11px; color: var(--text-muted);">Шкала 0–10</span>
+    </div>
+    <div class="volume-box">
+      <div class="volume-header">
+        <div class="volume-level"><span id="vol-display">7</span><span>/ 10</span></div>
+      </div>
+      <input type="range" id="vol-slider" min="0" max="10" step="1" value="7">
+      <div class="volume-actions">
+        <button class="btn-icon" onclick="setVolume(0)">🔇 0</button>
+        <button class="btn-icon" onclick="stepVolume(-1)">🔉 -1</button>
+        <button class="btn-icon" onclick="stepVolume(1)">🔊 +1</button>
+        <button class="btn-icon" onclick="setVolume(10)">📢 10</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Voice Selector -->
+  <div class="card">
+    <div class="card-title">
+      <span>Голос ассистента</span>
+      <span id="current-voice-badge" style="color: var(--accent); font-weight: normal;">Callirrhoe</span>
+    </div>
+    <div class="voice-select-wrap">
+      <div class="voice-grid">
+        <div class="voice-chip active" data-voice="Callirrhoe" onclick="selectVoice('Callirrhoe')">
+          <div class="voice-name">Callirrhoe</div>
+          <div class="voice-desc">Женский, глубокий</div>
+        </div>
+        <div class="voice-chip" data-voice="Autonoe" onclick="selectVoice('Autonoe')">
+          <div class="voice-name">Autonoe</div>
+          <div class="voice-desc">Женский, мягкий</div>
+        </div>
+        <div class="voice-chip" data-voice="Puck" onclick="selectVoice('Puck')">
+          <div class="voice-name">Puck</div>
+          <div class="voice-desc">Мужской, живой</div>
+        </div>
+        <div class="voice-chip" data-voice="Charon" onclick="selectVoice('Charon')">
+          <div class="voice-name">Charon</div>
+          <div class="voice-desc">Мужской, глубокий</div>
+        </div>
+        <div class="voice-chip" data-voice="Kore" onclick="selectVoice('Kore')">
+          <div class="voice-name">Kore</div>
+          <div class="voice-desc">Женский, ясный</div>
+        </div>
+        <div class="voice-chip" data-voice="Fenrir" onclick="selectVoice('Fenrir')">
+          <div class="voice-name">Fenrir</div>
+          <div class="voice-desc">Мужской, драйв</div>
+        </div>
+      </div>
+      <button class="btn-apply-voice" id="btn-save-voice" onclick="applyVoice()">Сохранить и применить голос</button>
+    </div>
+  </div>
+
+  <!-- LED Ring Color Control -->
+  <div class="card">
+    <div class="card-title">
+      <span>Цвет верхнего кольца (SN3236 LED)</span>
+    </div>
+    <div class="led-row">
+      <button class="led-btn active" onclick="setLed('azure', this)">
+        <div class="led-circle led-azure"></div>
+        <span class="led-label">Лазурный</span>
+      </button>
+      <button class="led-btn" onclick="setLed('purple', this)">
+        <div class="led-circle led-purple"></div>
+        <span class="led-label">Пурпур</span>
+      </button>
+      <button class="led-btn" onclick="setLed('emerald', this)">
+        <div class="led-circle led-emerald"></div>
+        <span class="led-label">Изумруд</span>
+      </button>
+      <button class="led-btn" onclick="setLed('amber', this)">
+        <div class="led-circle led-amber"></div>
+        <span class="led-label">Янтарь</span>
+      </button>
+      <button class="led-btn" onclick="setLed('white', this)">
+        <div class="led-circle led-white"></div>
+        <span class="led-label">Белый</span>
+      </button>
+      <button class="led-btn" onclick="setLed('off', this)">
+        <div class="led-circle led-off"></div>
+        <span class="led-label">Выкл</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Spotify Music Controls -->
+  <div class="card">
+    <div class="card-title">
+      <span>Музыка Spotify Connect</span>
+      <span id="spotify-login-status" style="font-weight: normal; font-size: 12px; color: #1db954;">Активен</span>
+    </div>
+    <div class="spotify-box">
+      <div class="track-info">
+        <div class="track-icon">
+          <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+        </div>
+        <div class="track-details">
+          <div class="track-name" id="sp-track-title">Трек не воспроизводится</div>
+          <div class="track-artist" id="sp-track-artist">Spotify Soloist готов к подключению</div>
+        </div>
+      </div>
+      <div class="spotify-controls">
+        <button class="sp-btn" onclick="spAction('previous')">⏮️</button>
+        <button class="sp-btn sp-btn-play" id="btn-sp-playpause" onclick="spTogglePlay()">⏯️ Плей/Пауза</button>
+        <button class="sp-btn" onclick="spAction('next')">⏭️</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- System Operations -->
+  <div class="card">
+    <div class="card-title">
+      <span>Управление системой</span>
+    </div>
+    <div class="sys-actions">
+      <button class="btn-sys btn-restart" onclick="systemAction('restart')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+        Перезапуск ПО
+      </button>
+      <button class="btn-sys btn-reboot" onclick="systemAction('reboot')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z"/></svg>
+        Перезагрузка
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="toast">Настройки сохранены</div>
+
+<script>
+  let selectedVoice = "Callirrhoe";
+  let isSpotifyPlaying = false;
+
+  // Initialize Telegram WebApp if present
+  if (window.Telegram && window.Telegram.WebApp) {
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById("toast");
+    t.innerText = msg;
+    t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 2500);
+  }
+
+  function selectVoice(name) {
+    selectedVoice = name;
+    document.querySelectorAll(".voice-chip").forEach(el => {
+      el.classList.toggle("active", el.dataset.voice === name);
+    });
+  }
+
+  async function applyVoice() {
+    const btn = document.getElementById("btn-save-voice");
+    btn.disabled = true;
+    btn.innerText = "Сохранение...";
+    try {
+      const res = await fetch("/api/v1/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice: selectedVoice })
+      });
+      const data = await res.json();
+      showToast(data.message || "Голос успешно изменен!");
+      document.getElementById("current-voice-badge").innerText = selectedVoice;
+    } catch (e) {
+      showToast("Ошибка сохранения: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerText = "Сохранить и применить голос";
+    }
+  }
+
+  const volSlider = document.getElementById("vol-slider");
+  const volDisplay = document.getElementById("vol-display");
+
+  volSlider.addEventListener("input", (e) => {
+    volDisplay.innerText = e.target.value;
+  });
+
+  volSlider.addEventListener("change", (e) => {
+    setVolume(parseInt(e.target.value));
+  });
+
+  async function setVolume(lvl) {
+    lvl = Math.max(0, Math.min(10, lvl));
+    volSlider.value = lvl;
+    volDisplay.innerText = lvl;
+    try {
+      await fetch("/api/v1/volume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level: lvl })
+      });
+      showToast("Громкость: " + lvl);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  function stepVolume(delta) {
+    const cur = parseInt(volSlider.value);
+    setVolume(cur + delta);
+  }
+
+  async function setLed(color, btn) {
+    document.querySelectorAll(".led-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    try {
+      await fetch("/api/v1/led", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ color: color })
+      });
+      showToast("LED: " + color);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function spAction(action) {
+    try {
+      await fetch("/api/spotify/" + action, { method: "POST" });
+      setTimeout(fetchStatus, 300);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function spTogglePlay() {
+    if (isSpotifyPlaying) {
+      await spAction("pause");
+    } else {
+      await spAction("play");
+    }
+  }
+
+  async function systemAction(action) {
+    const label = action === "restart" ? "перезапустить ассистента" : "перезагрузить колонку";
+    if (!confirm("Вы действительно хотите " + label + "?")) return;
+    try {
+      showToast("Команда отправлена. Ожидайте...");
+      await fetch("/api/v1/system/" + action, { method: "POST" });
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function fetchStatus() {
+    try {
+      const res = await fetch("/api/v1/status", { cache: "no-store" });
+      if (!res.ok) throw new Error("Status " + res.status);
+      const data = await res.json();
+
+      // Online status
+      document.getElementById("status-pill").className = "status-badge";
+      document.getElementById("status-text").innerText = "В сети";
+
+      // IP & Uptime
+      if (data.ip) document.getElementById("device-ip").innerText = data.ip;
+      if (data.uptime) document.getElementById("uptime-val").innerText = data.uptime;
+      if (data.cpu_load) document.getElementById("cpu-val").innerText = data.cpu_load;
+
+      // RAM
+      if (data.mem_free_mb && data.mem_total_mb) {
+        document.getElementById("ram-val").innerText = data.mem_free_mb + " МБ";
+        const pct = Math.round((data.mem_free_mb / data.mem_total_mb) * 100);
+        document.getElementById("ram-bar").style.width = pct + "%";
+      }
+
+      // Volume
+      if (data.volume !== undefined && document.activeElement !== volSlider) {
+        volSlider.value = data.volume;
+        volDisplay.innerText = data.volume;
+      }
+
+      // Voice
+      if (data.voice) {
+        document.getElementById("current-voice-badge").innerText = data.voice;
+        selectVoice(data.voice);
+      }
+
+      // Spotify
+      if (data.spotify) {
+        if (data.spotify.track) {
+          document.getElementById("sp-track-title").innerText = data.spotify.track;
+          document.getElementById("sp-track-artist").innerText = data.spotify.artist || "Spotify";
+        }
+        isSpotifyPlaying = !!data.spotify.is_playing;
+        document.getElementById("btn-sp-playpause").innerText = isSpotifyPlaying ? "⏸️ Пауза" : "▶️ Играть";
+      }
+    } catch (e) {
+      document.getElementById("status-pill").className = "status-badge offline";
+      document.getElementById("status-text").innerText = "Офлайн";
+    }
+  }
+
+  // Poll status every 3 seconds
+  fetchStatus();
+  setInterval(fetchStatus, 3000);
+</script>
+</body>
+</html>

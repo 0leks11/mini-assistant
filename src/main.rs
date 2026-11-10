@@ -17,6 +17,7 @@ mod interaction;
 mod spotify;
 mod wakeword;
 pub mod weather;
+pub mod web;
 pub mod wifi;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -446,38 +447,6 @@ async fn main() -> Result<()> {
 
             let spotify_tools_enabled = tools_allowed && spotify_cfg.enabled;
 
-            // Start local web management server (e.g. port 8080)
-            if spotify_cfg.enabled {
-                let srv_client_id = spotify_client_id.clone();
-                let srv_redirect_uri = format!(
-                    "http://192.168.1.110:{}/spotify/callback",
-                    spotify_cfg.web_port
-                );
-                let web_server = Arc::new(
-                    spotify::SpotifyWebServer::new(
-                        srv_client_id,
-                        srv_redirect_uri,
-                        spotify_client_holder.clone(),
-                    )
-                    .with_token_path(spotify_cfg.token_file.clone()),
-                );
-                let web_port = spotify_cfg.web_port;
-                tokio::spawn(async move {
-                    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], web_port));
-                    match tokio::net::TcpListener::bind(bind_addr).await {
-                        Ok(listener) => {
-                            let (_tx, rx) = tokio::sync::watch::channel(false);
-                            if let Err(e) = web_server.run(listener, rx).await {
-                                warn!(error = %e, "Spotify web server stopped with error");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(port = web_port, error = %e, "Could not bind Spotify web server");
-                        }
-                    }
-                });
-            }
-
             // 4d. Initialize Spotify Soloist Controller & Music Ducker
             let soloist_client = Arc::new(spotify::SoloistClient::new(
                 spotify_cfg.soloist_ctl.clone(),
@@ -511,6 +480,36 @@ async fn main() -> Result<()> {
                 Some((*soloist_client).clone()),
                 Some(music_ducker.clone()),
             );
+
+            // 4d3. Start Control Center Web Dashboard (:8080)
+            let web_port = spotify_cfg.web_port;
+            let srv_client_id = spotify_client_id.clone();
+            let srv_redirect_uri = format!("http://10.77.0.111:{}/spotify/callback", web_port);
+            let cfg_path_buf = config_path.as_deref().map(std::path::PathBuf::from);
+            let web_server = web::ControlCenterServer::new(
+                cfg_path_buf,
+                srv_client_id,
+                srv_redirect_uri,
+                spotify_client_holder.clone(),
+                Some(soloist_client.clone()),
+                music_ducker.clone(),
+            )
+            .with_token_path(spotify_cfg.token_file.clone());
+            let web_server = Arc::new(web_server);
+            tokio::spawn(async move {
+                let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], web_port));
+                match tokio::net::TcpListener::bind(bind_addr).await {
+                    Ok(listener) => {
+                        let (_tx, rx) = tokio::sync::watch::channel(false);
+                        if let Err(e) = web_server.run(listener, rx).await {
+                            warn!(error = %e, "Control Center web server stopped with error");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(port = web_port, error = %e, "Could not bind Control Center web server");
+                    }
+                }
+            });
 
             // 4e. Initialize Wi-Fi Setup and Mute Button Watcher
             let wifi_cfg = config.wifi.clone().unwrap_or_default();

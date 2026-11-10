@@ -7,6 +7,7 @@ pub mod soloist;
 pub mod web_api;
 
 pub use ducking::MusicDucker;
+#[allow(unused_imports)]
 pub use local_server::{load_persisted_token, SpotifyWebServer};
 #[allow(unused_imports)]
 pub use soloist::{CurrentTrackInfo, PlaybackState, SoloistClient, SoloistStatus};
