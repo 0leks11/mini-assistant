@@ -250,7 +250,8 @@ impl ControlCenterServer {
 
             // Wake-Word Custom Enrollment REST API
             ("POST", "/api/v1/wakeword/session/start") => {
-                self.handle_api_wakeword_session_start(&mut stream, body).await?;
+                self.handle_api_wakeword_session_start(&mut stream, body)
+                    .await?;
             }
             ("GET", "/api/v1/wakeword/session/status") => {
                 self.handle_api_wakeword_session_status(&mut stream).await?;
@@ -259,10 +260,12 @@ impl ControlCenterServer {
                 self.handle_api_wakeword_record_hw(&mut stream).await?;
             }
             ("POST", "/api/v1/wakeword/sample/upload") => {
-                self.handle_api_wakeword_upload_sample(&mut stream, body).await?;
+                self.handle_api_wakeword_upload_sample(&mut stream, body)
+                    .await?;
             }
             ("POST", "/api/v1/wakeword/sample/remove") => {
-                self.handle_api_wakeword_remove_sample(&mut stream, body).await?;
+                self.handle_api_wakeword_remove_sample(&mut stream, body)
+                    .await?;
             }
             ("POST", "/api/v1/wakeword/compile") => {
                 self.handle_api_wakeword_compile(&mut stream).await?;
@@ -804,7 +807,9 @@ impl ControlCenterServer {
                     "status": "error",
                     "message": "Микрофон колонки недоступен (аппаратный рекордер не инициализирован)."
                 });
-                return self.send_json_status(stream, "500 Internal Error", &err).await;
+                return self
+                    .send_json_status(stream, "500 Internal Error", &err)
+                    .await;
             }
         };
 
@@ -825,7 +830,9 @@ impl ControlCenterServer {
                     "status": "error",
                     "message": format!("Ошибка записи микрофона: {e}")
                 });
-                return self.send_json_status(stream, "500 Internal Error", &err).await;
+                return self
+                    .send_json_status(stream, "500 Internal Error", &err)
+                    .await;
             }
         };
 
@@ -849,7 +856,8 @@ impl ControlCenterServer {
                     "status": "error",
                     "message": format!("{e}")
                 });
-                self.send_json_status(stream, "422 Unprocessable Entity", &err).await
+                self.send_json_status(stream, "422 Unprocessable Entity", &err)
+                    .await
             }
         }
     }
@@ -897,7 +905,9 @@ impl ControlCenterServer {
                 Ok(p) => p,
                 Err(e) => {
                     let err = serde_json::json!({ "status": "error", "message": format!("WAV decode error: {e}") });
-                    return self.send_json_status(stream, "422 Unprocessable Entity", &err).await;
+                    return self
+                        .send_json_status(stream, "422 Unprocessable Entity", &err)
+                        .await;
                 }
             }
         } else if let Some(pcm_b64) = req.pcm_base64 {
@@ -932,7 +942,8 @@ impl ControlCenterServer {
             }
             Err(e) => {
                 let err = serde_json::json!({ "status": "error", "message": format!("{e}") });
-                self.send_json_status(stream, "422 Unprocessable Entity", &err).await
+                self.send_json_status(stream, "422 Unprocessable Entity", &err)
+                    .await
             }
         }
     }
@@ -1011,7 +1022,8 @@ impl ControlCenterServer {
                     "status": "error",
                     "message": format!("Ошибка компиляции модели: {e}")
                 });
-                self.send_json_status(stream, "500 Internal Error", &err).await
+                self.send_json_status(stream, "500 Internal Error", &err)
+                    .await
             }
         }
     }

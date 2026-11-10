@@ -958,8 +958,269 @@
     }
   }
 
+  // Wake-Word Custom Enrollment Logic
+  function showRecordingPulse(active) {
+    const p = document.getElementById("ww-pulse-indicator");
+    if (p) p.classList.toggle("animating", active);
+  }
+
+  async function startWakewordWizard() {
+    const nameInput = document.getElementById("ww-name-input");
+    const kwName = nameInput.value.trim() || "Штучка";
+    try {
+      const res = await fetch("/api/v1/wakeword/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: kwName })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById("ww-view-idle").style.display = "none";
+        document.getElementById("ww-view-wizard").style.display = "flex";
+        updateWakewordUI(data);
+        showToast("Сессия обучения начата! Запишите сэмплы.");
+      } else {
+        showToast(data.message || "Ошибка запуска сессии");
+      }
+    } catch (e) {
+      showToast("Ошибка связи: " + e.message);
+    }
+  }
+
+  function closeWakewordWizard() {
+    document.getElementById("ww-view-wizard").style.display = "none";
+    document.getElementById("ww-view-idle").style.display = "block";
+    showRecordingPulse(false);
+  }
+
+  async function resetWakewordSession() {
+    if (!confirm("Сбросить текущие сэмплы и начать заново?")) return;
+    startWakewordWizard();
+  }
+
+  function updateWakewordUI(data) {
+    if (data.phase_name) document.getElementById("ww-phase-title").innerText = data.phase_name;
+    if (data.current_step && data.target_steps) {
+      document.getElementById("ww-step-counter").innerText = `Шаг ${data.current_step} из ${data.target_steps}`;
+      const pct = Math.min(100, Math.round((data.current_step / data.target_steps) * 100));
+      document.getElementById("ww-pulse-indicator").style.width = pct + "%";
+    }
+
+    const step = data.current_step || 1;
+    let desc = "Отойдите на 0.5–1 метр. Произнесите слово спокойным ровным голосом.";
+    if (step >= 9 && step <= 16) {
+      desc = "Отойдите на 2–3 метра (в центр комнаты). Произнесите слово обычным разговорным голосом.";
+    } else if (step >= 17 && step <= 21) {
+      desc = "Отойдите на 3–4 метра. Позовите колонку громко, четко и эмоционально!";
+    } else if (step >= 22) {
+      desc = "Тихий вечерний голос или полушёпот. Проверьте отклик в тишине.";
+    }
+    document.getElementById("ww-phase-desc").innerText = desc;
+
+    const count = data.samples_count || (data.samples ? data.samples.length : 0);
+    document.getElementById("ww-samples-count").innerText = count;
+    const container = document.getElementById("ww-samples-container");
+    container.style.display = count > 0 ? "block" : "none";
+
+    const compileBtn = document.getElementById("btn-ww-compile");
+    compileBtn.disabled = !data.can_compile;
+
+    const hint = document.getElementById("ww-compile-hint");
+    if (count < 3) {
+      hint.innerText = "Нужно еще " + (3 - count) + " сэмпла";
+      hint.style.color = "var(--warning)";
+    } else if (count < 15) {
+      hint.innerText = "Готово к компиляции (рекомендуется 15+)";
+      hint.style.color = "var(--accent)";
+    } else {
+      hint.innerText = "Отличная база! Готово к сохранению";
+      hint.style.color = "var(--success)";
+    }
+
+    if (data.samples && Array.isArray(data.samples)) {
+      const listEl = document.getElementById("ww-samples-list");
+      listEl.innerHTML = "";
+      data.samples.forEach(s => {
+        const chip = document.createElement("div");
+        chip.className = "ww-chip";
+        chip.innerHTML = `<span>#${s.id} (${(s.duration_ms / 1000).toFixed(2)}с, Ф${s.phase})</span><span class="ww-chip-del" onclick="deleteWakewordSample(${s.id})">✕</span>`;
+        listEl.appendChild(chip);
+      });
+    }
+  }
+
+  async function recordWakewordHardware() {
+    const btn = document.getElementById("btn-rec-hw");
+    btn.disabled = true;
+    btn.innerHTML = `<span>⏳ Слушаю... Говорите в колонку!</span>`;
+    showRecordingPulse(true);
+
+    try {
+      const res = await fetch("/api/v1/wakeword/sample/record_hw", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        showToast("Сэмпл #" + data.sample.id + " успешно принят!");
+        updateWakewordUI(data);
+        fetchWakewordStatus();
+      } else {
+        showToast(data.message || "Ошибка записи с микрофона");
+      }
+    } catch (e) {
+      showToast("Ошибка связи: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg><span>Записать через микрофон колонки</span>`;
+      showRecordingPulse(false);
+    }
+  }
+
+  async function recordWakewordPhone() {
+    const btn = document.getElementById("btn-rec-phone");
+    btn.disabled = true;
+    btn.innerText = "Говорите в телефон...";
+    showRecordingPulse(true);
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = audioContext.createMediaStreamSource(stream);
+      const bufferSize = 4096;
+      const recorder = audioContext.createScriptProcessor(bufferSize, 1, 1);
+      const collectedSamples = [];
+      let samplesCount = 0;
+      const targetSamples = 16000 * 2.5;
+
+      recorder.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < input.length; i++) {
+          collectedSamples.push(input[i]);
+          samplesCount++;
+        }
+        if (samplesCount >= targetSamples) {
+          recorder.disconnect();
+          source.disconnect();
+          stream.getTracks().forEach(t => t.stop());
+          finishPhoneRecording(collectedSamples);
+        }
+      };
+
+      source.connect(recorder);
+      recorder.connect(audioContext.destination);
+
+      setTimeout(() => {
+        if (samplesCount < targetSamples) {
+          recorder.disconnect();
+          source.disconnect();
+          stream.getTracks().forEach(t => t.stop());
+          finishPhoneRecording(collectedSamples);
+        }
+      }, 2800);
+
+    } catch (err) {
+      showToast("Ошибка микрофона телефона: " + err.message);
+      btn.disabled = false;
+      btn.innerText = "📱 Записать через микрофон телефона";
+      showRecordingPulse(false);
+    }
+  }
+
+  async function finishPhoneRecording(floatSamples) {
+    const pcm16 = new Int16Array(floatSamples.length);
+    for (let i = 0; i < floatSamples.length; i++) {
+      const s = Math.max(-1, Math.min(1, floatSamples[i]));
+      pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    const bytes = new Uint8Array(pcm16.buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const b64 = btoa(binary);
+
+    const btn = document.getElementById("btn-rec-phone");
+    btn.innerText = "Анализ сэмпла...";
+
+    try {
+      const res = await fetch("/api/v1/wakeword/sample/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pcm_base64: b64 })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast("Сэмпл #" + data.sample.id + " успешно принят!");
+        updateWakewordUI(data);
+        fetchWakewordStatus();
+      } else {
+        showToast(data.message || "Ошибка сэмпла");
+      }
+    } catch (err) {
+      showToast("Ошибка отправки: " + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M17 1.01L7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM17 19H7V5h10v14z"/></svg><span>Записать через микрофон телефона</span>`;
+      showRecordingPulse(false);
+    }
+  }
+
+  async function deleteWakewordSample(id) {
+    try {
+      const res = await fetch("/api/v1/wakeword/sample/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id })
+      });
+      if (res.ok) {
+        fetchWakewordStatus();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function fetchWakewordStatus() {
+    try {
+      const res = await fetch("/api/v1/wakeword/session/status", { cache: "no-store" });
+      const data = await res.json();
+      if (data.active) {
+        document.getElementById("ww-view-idle").style.display = "none";
+        document.getElementById("ww-view-wizard").style.display = "flex";
+        updateWakewordUI(data);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function compileWakewordModel() {
+    const btn = document.getElementById("btn-ww-compile");
+    btn.disabled = true;
+    btn.innerText = "Компиляция и загрузка в память...";
+
+    try {
+      const res = await fetch("/api/v1/wakeword/compile", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || "Модель активирована!");
+        if (data.details && data.details.keyword_name) {
+          document.getElementById("current-ww-badge").innerText = data.details.keyword_name;
+        }
+        closeWakewordWizard();
+      } else {
+        showToast(data.message || "Ошибка компиляции");
+        btn.disabled = false;
+        btn.innerText = "🚀 Скомпилировать и активировать";
+      }
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+      btn.disabled = false;
+      btn.innerText = "🚀 Скомпилировать и активировать";
+    }
+  }
+
   // Poll status every 3 seconds
   fetchStatus();
+  fetchWakewordStatus();
   setInterval(fetchStatus, 3000);
 </script>
 </body>

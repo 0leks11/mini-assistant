@@ -312,10 +312,7 @@ pub fn process_sample(
     phase: u8,
     phase_name: &str,
 ) -> Result<EnrollmentSample> {
-    ensure!(
-        raw_pcm.len() >= 1600,
-        "Запись слишком короткая для анализа"
-    );
+    ensure!(raw_pcm.len() >= 1600, "Запись слишком короткая для анализа");
 
     // Calculate overall peak and noise floor
     let mut sum_sq = 0.0f64;
@@ -507,6 +504,7 @@ pub fn compile_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustpotter::WakewordLoad;
 
     fn generate_synthetic_keyword(freq_hz: f32, duration_secs: f32) -> Vec<i16> {
         let total_samples = (SAMPLE_RATE as f32 * duration_secs) as usize;
@@ -555,19 +553,26 @@ mod tests {
     #[test]
     fn test_session_lifecycle_and_template_downselection() {
         let mut session = EnrollmentSession::new("testword".to_string());
-        assert_eq!(session.can_compile, false);
+        assert!(!session.can_compile);
 
         // Add 12 synthetic samples across different phases
         for step in 1..=12 {
             let mut audio = vec![0i16; 2000];
-            audio.extend(generate_synthetic_keyword(300.0 + (step as f32 * 50.0), 0.5));
+            audio.extend(generate_synthetic_keyword(
+                300.0 + (step as f32 * 50.0),
+                0.5,
+            ));
             audio.extend(vec![0i16; 2000]);
             let res = session.add_pcm_sample(&audio);
-            assert!(res.is_ok(), "Sample {step} should be accepted: {:?}", res.err());
+            assert!(
+                res.is_ok(),
+                "Sample {step} should be accepted: {:?}",
+                res.err()
+            );
         }
 
         assert_eq!(session.samples.len(), 12);
-        assert_eq!(session.can_compile, true);
+        assert!(session.can_compile);
 
         // Template down-selection must select at most 8 templates
         let selected = select_best_templates(&session.samples);
