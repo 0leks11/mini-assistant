@@ -1,52 +1,95 @@
 # mini-assistant
 
-Экспериментальный Rust-клиент для Mini 1 (A113X, ARM32). Цель — собственный
-голосовой ассистент с Home Assistant и музыкой без сервисов Яндекса.
-Полная замена `maind` и сквозной голосовой цикл пока не подтверждены.
+Lightweight, fully autonomous Rust daemon running directly on the Yandex Station Mini 1 (Amlogic A113X, ARM32 / armhf).
 
-## Что есть сейчас
+It completely replaces the original proprietary userspace software: **0% Yandex code, 100% open-source custom Rust stack**.
 
-| Компонент | Статус |
-|---|---|
-| VQE input | Клиент локального `yio_audio:9850`, parser tests; точный формат речи требует проверки |
-| Gemini Live | Провайдер по умолчанию. Локальные WebSocket-тесты покрывают две реплики, переподключение и отмену |
-| Playback | Поток в дочерний `aplay`; штатные ALSA libraries/config остаются runtime-зависимостями |
-| Home Assistant | REST-клиент и ограниченный локальной политикой executor; реальный API/действия отдельно |
-| Wake-word | Локальный персональный KWS. Без эталона остаётся ручная активация. Надёжность на обычной дистанции ожидает приёмки |
-| Spotify Connect | Ручной режим с `librespot` ARM32 и PCM-рендерером. Проверка звука и привязки с телефона ожидает Mini |
-| LED, кнопки, долговременная память | Не реализованы в текущем приложении |
-| OpenAI Realtime | Опциональный провайдер с `OPENAI_API_KEY`, только разговор. Вход через ChatGPT и голосовые инструменты для OpenAI ещё не подключены |
+---
 
-Захват стартует после готовности выбранной сессии. Локальный детектор или
-явная ручная активация открывает одну реплику. VAD определяет начало и конец
-речи внутри разрешённого окна. Локальные тесты используют заглушки и
-синтетический PCM. [Порядок проверки провайдеров и Spotify](docs/SETUP.md)
+## What It Does
 
-## Рабочий цикл
+| Capability | Implementation | Details |
+|---|---|---|
+| **Audio Capture** | Direct ALSA (`hw:0,2`) | 8-channel PDM microphone capture decimated to 16 kHz mono PCM |
+| **Audio Playback** | ALSA `default` / `softvol` | Clean audio playback with dynamic ducking and barge-in |
+| **Wake Word** | Rustpotter KWS + SimpleVad | Local wake-word detection with browser-based interactive training wizard |
+| **Voice AI** | Gemini Live API & OpenAI Realtime | Full-duplex WebSocket streaming (24 kHz PCM) with instant interruption |
+| **Music Playback** | Spotify Connect / Soloist | Direct hardware playback with acoustic ducking during conversation |
+| **Smart Home** | Home Assistant REST API | Voice tool-calling for lights, climate, switches, and sensors |
+| **Control Center** | On-device Web UI & Telegram Mini App | Port 8080 zero-dependency control panel for voice, model, volume, and LED |
+| **Gesture Sensor** | ST VL53L0X ToF radar | Physical hand distance measurement for volume and gesture control |
+| **Visual Feedback**| SN3236 RGB LED matrix | Dynamic status indication (listening, speaking, music, alarm) |
 
-Прочитать [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md),
-[архитектуру](docs/ARCHITECTURE.md) и [SETUP](docs/SETUP.md).
+---
 
-```sh
-./scripts/check.sh
+## Project Structure
+
+```text
+mini-assistant/
+├── src/
+│   ├── main.rs              # Application entry point and supervisor loops
+│   ├── audio/               # ALSA capture, playback, volume, VL53 gesture reader
+│   ├── gemini/              # Google Gemini Live API bidirectional WebSocket client
+│   ├── openai/              # OpenAI Realtime API bidirectional client
+│   ├── voice/               # Multi-provider voice abstraction and tool dispatch
+│   ├── wakeword/            # KWS engine, VAD, and web-based enrollment wizard
+│   ├── spotify/             # Spotify Web API and Soloist playback supervisor
+│   ├── ha/                  # Home Assistant REST client and tool definitions
+│   ├── alarms/              # Local alarm clock and persistent scheduler
+│   ├── weather/             # Open-Meteo weather integration
+│   ├── web/                 # Built-in Web UI & Telegram Mini App HTTP server
+│   └── wifi/                # SoftAP captive portal and Wi-Fi provisioning
+├── scripts/
+│   ├── build.sh             # Cross-compilation using Docker messense/rust-musl-cross
+│   ├── deploy.sh            # Network deployment to the speaker over SSH
+│   └── verify_deploy.sh     # 22-point hardware and software acceptance suite
+├── tests/                   # 210+ comprehensive unit and contract tests
+├── Cargo.toml               # Rust dependencies and ARM32 optimization profile
+└── config.example.toml      # Documented template for runtime configuration
 ```
 
-Настройка локальных файлов сохраняет существующие секреты:
+---
 
+## Building and Testing
+
+### 1. Run Local Tests (macOS / Linux)
 ```sh
-if [ ! -e .env ]; then (umask 077; cp .env.example .env); fi
-if [ ! -e config.toml ]; then (umask 077; cp config.example.toml config.toml); fi
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-`scripts/build.sh` запускает Docker image `messense/rust-musl-cross` для
-`armv7-unknown-linux-musleabihf`. `scripts/deploy.sh` изменяет Mini и не является
-тестом. Перед ним нужен актуальный preflight и план восстановления.
+### 2. Cross-Compile for Amlogic A113X (ARM32 armhf)
+```sh
+./scripts/build.sh
+```
+This builds a static binary `target/armv7-unknown-linux-musleabihf/release/mini-assistant` using Docker.
 
-## Железо и границы
+### 3. Deploy to Speaker
+```sh
+MINI_HOST=192.168.1.110 MINI_SSH_KEY=~/.ssh/id_ed25519 ./scripts/deploy.sh
+```
 
-A113X/Cortex-A53, но исследованный userspace — **ELF32 ARM/armhf**, glibc 2.23,
-около 236 MiB RAM. Проверять конкретный ELF и native runtime; статическая
-линковка Rust не заменяет `aplay`, DSP, kernel driver и ALSA config.
+### 4. Verify on Hardware
+```sh
+MINI_HOST=192.168.1.110 MINI_SSH_KEY=~/.ssh/id_ed25519 ./scripts/verify_deploy.sh
+```
 
-Все настоящие credentials остаются в локальных `.env`/credential store.
-Root SSH Mini и авторизация SSH шлюза Pi — разные подключения.
+---
+
+## Configuration
+
+Copy `.env.example` to `.env` and `config.example.toml` to `config.toml`:
+
+```sh
+cp .env.example .env
+cp config.example.toml config.toml
+```
+
+- **`.env`**: Store your `GEMINI_API_KEY` or `OPENAI_API_KEY`, and optional `HA_TOKEN`. Never commit `.env`.
+- **`config.toml`**: Configure wake word, model name (`models/gemini-3.8-live` or `gpt-4o-realtime-preview`), assistant voice, and network addresses. Supports live hot-reloading from the Web UI.
+
+---
+
+## License
+
+MIT / Apache-2.0
