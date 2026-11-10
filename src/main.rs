@@ -275,6 +275,15 @@ async fn main() -> Result<()> {
                 info!("Dry-run mode active: hardware audio capture/playback disabled");
             }
 
+            // 2b. Validate system clock validity (year >= 2026) to prevent TLS failures after cold boot
+            if !dry_run {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                validate_system_clock(now_secs)?;
+            }
+
             // 3. Load config
             let config = config::Config::load_from(config_path.as_deref())
                 .context("Failed to load configuration")?;
@@ -498,8 +507,7 @@ async fn main() -> Result<()> {
             });
 
             // 4d2. Start VL53L0 proximity gesture volume reader task
-            let _vl53_task =
-                audio::vl53::spawn_vl53_volume_task(Some((*soloist_client).clone()));
+            let _vl53_task = audio::vl53::spawn_vl53_volume_task(Some((*soloist_client).clone()));
 
             // 4e. Initialize Wi-Fi Setup and Mute Button Watcher
             let wifi_cfg = config.wifi.clone().unwrap_or_default();
@@ -1622,6 +1630,18 @@ where
 }
 
 /// Turn off the solid light blue boot LED (SI-EN SN3236 at I2C address 0x3c)
+const MIN_VALID_TIMESTAMP_SECS: u64 = 1_767_225_600; // 2026-01-01 00:00:00 UTC
+
+fn validate_system_clock(now_secs: u64) -> Result<()> {
+    if now_secs < MIN_VALID_TIMESTAMP_SECS {
+        anyhow::bail!(
+            "System clock not synchronized: unix timestamp {} is before 2026-01-01 (NTP sync required for TLS)",
+            now_secs
+        );
+    }
+    Ok(())
+}
+
 fn turn_off_boot_led() {
     let res = std::process::Command::new("i2cset")
         .args(["-y", "0", "0x3c", "0x00", "0x00"])
@@ -1762,5 +1782,17 @@ mod tests {
                 conversation_only: true
             }
         );
+    }
+
+    #[test]
+    fn test_system_clock_validation() {
+        // Unix timestamp 1420070400 = 2015-01-01 (default hardware RTC on A113X boot)
+        assert!(validate_system_clock(1420070400).is_err());
+        // Unix timestamp 1767225599 = 2025-12-31 23:59:59 UTC (prior to 2026)
+        assert!(validate_system_clock(1767225599).is_err());
+        // Unix timestamp 1767225600 = 2026-01-01 00:00:00 UTC (valid 2026)
+        assert!(validate_system_clock(1767225600).is_ok());
+        // Future timestamp in late 2026
+        assert!(validate_system_clock(1794225600).is_ok());
     }
 }

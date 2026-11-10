@@ -91,17 +91,23 @@ pub async fn handle_spotify_tool_call(
         "spotify_pause" => {
             if let Ok(()) = soloist.pause().await {
                 info!("Soloist pause executed successfully");
-                return Some(serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }));
+                return Some(
+                    serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }),
+                );
             }
             // Fallback to Web API
             let mut web_guard = web_client_lock.write().await;
             if let Some(client) = web_guard.as_mut() {
                 if let Ok(()) = client.pause(None).await {
                     info!("Spotify Web API pause executed successfully");
-                    return Some(serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }));
+                    return Some(
+                        serde_json::json!({ "status": "ok", "message": "Музыка поставлена на паузу" }),
+                    );
                 }
             }
-            Some(serde_json::json!({ "status": "error", "message": "Не удалось поставить музыку на паузу" }))
+            Some(
+                serde_json::json!({ "status": "error", "message": "Не удалось поставить музыку на паузу" }),
+            )
         }
         "spotify_play" => {
             let query = req.args.get("query").and_then(|v| v.as_str());
@@ -128,25 +134,35 @@ pub async fn handle_spotify_tool_call(
                         Ok(results) => {
                             if let Some(track) = results.tracks.first() {
                                 if let Ok(()) = soloist.play_uri(&track.uri).await {
-                                    let artist = track.artists.first().map(|a| a.name.as_str()).unwrap_or("");
+                                    let artist = track
+                                        .artists
+                                        .first()
+                                        .map(|a| a.name.as_str())
+                                        .unwrap_or("");
                                     let msg = if artist.is_empty() {
                                         format!("Включаю {}", track.name)
                                     } else {
                                         format!("Включаю {} — {}", track.name, artist)
                                     };
                                     info!("Played track via local Soloist: {msg}");
-                                    return Some(serde_json::json!({ "status": "ok", "message": msg }));
+                                    return Some(
+                                        serde_json::json!({ "status": "ok", "message": msg }),
+                                    );
                                 }
                             } else if let Some(playlist) = results.playlists.first() {
                                 if let Ok(()) = soloist.play_uri(&playlist.uri).await {
                                     let msg = format!("Включаю плейлист {}", playlist.name);
                                     info!("Played playlist via local Soloist: {msg}");
-                                    return Some(serde_json::json!({ "status": "ok", "message": msg }));
+                                    return Some(
+                                        serde_json::json!({ "status": "ok", "message": msg }),
+                                    );
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("Spotify Web API search failed: {e}; falling back to local resume");
+                            warn!(
+                                "Spotify Web API search failed: {e}; falling back to local resume"
+                            );
                         }
                     }
                 }
@@ -180,7 +196,10 @@ pub async fn handle_spotify_tool_call(
             }
 
             // If ended or resume didn't work (nothing queued / at EOF), play default top hits playlist
-            if let Ok(()) = soloist.play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").await {
+            if let Ok(()) = soloist
+                .play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M")
+                .await
+            {
                 info!("Soloist started default top hits playlist");
                 return Some(
                     serde_json::json!({ "status": "ok", "message": "Включаю популярные треки" }),
@@ -204,23 +223,34 @@ pub async fn handle_spotify_tool_call(
                 }
             }
 
-            Some(serde_json::json!({ "status": "error", "message": "Не удалось запустить музыку. Убедитесь, что Spotify Connect подключен к колонке." }))
+            Some(
+                serde_json::json!({ "status": "error", "message": "Не удалось запустить музыку. Убедитесь, что Spotify Connect подключен к колонке." }),
+            )
         }
         "spotify_next" => {
             if let Ok(()) = soloist.next().await {
                 info!("Soloist next executed successfully");
-                return Some(serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }));
+                return Some(
+                    serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }),
+                );
             }
             // Fallback: if Soloist had no queue (e.g. played single track to EOF), start top hits
-            if let Ok(()) = soloist.play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M").await {
+            if let Ok(()) = soloist
+                .play_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M")
+                .await
+            {
                 info!("Soloist next started default playlist fallback");
-                return Some(serde_json::json!({ "status": "ok", "message": "Включаю следующий трек" }));
+                return Some(
+                    serde_json::json!({ "status": "ok", "message": "Включаю следующий трек" }),
+                );
             }
             let mut web_guard = web_client_lock.write().await;
             if let Some(client) = web_guard.as_mut() {
                 if let Ok(()) = client.next(None).await {
                     info!("Spotify Web API next executed successfully");
-                    return Some(serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }));
+                    return Some(
+                        serde_json::json!({ "status": "ok", "message": "Включен следующий трек" }),
+                    );
                 }
             }
             Some(serde_json::json!({ "status": "error", "message": "Не удалось переключить трек" }))
@@ -228,16 +258,22 @@ pub async fn handle_spotify_tool_call(
         "spotify_previous" => {
             if let Ok(()) = soloist.previous().await {
                 info!("Soloist previous executed successfully");
-                return Some(serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }));
+                return Some(
+                    serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }),
+                );
             }
             let mut web_guard = web_client_lock.write().await;
             if let Some(client) = web_guard.as_mut() {
                 if let Ok(()) = client.previous(None).await {
                     info!("Spotify Web API previous executed successfully");
-                    return Some(serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }));
+                    return Some(
+                        serde_json::json!({ "status": "ok", "message": "Включен предыдущий трек" }),
+                    );
                 }
             }
-            Some(serde_json::json!({ "status": "error", "message": "Не удалось переключить трек назад" }))
+            Some(
+                serde_json::json!({ "status": "error", "message": "Не удалось переключить трек назад" }),
+            )
         }
         "spotify_volume" => {
             let pct = req
@@ -280,7 +316,8 @@ pub async fn handle_spotify_tool_call(
             if let Some(client) = web_guard.as_mut() {
                 if let Ok(Some(state)) = client.get_playback_state().await {
                     if let Some(item) = state.item {
-                        let artist_names: Vec<String> = item.artists.into_iter().map(|a| a.name).collect();
+                        let artist_names: Vec<String> =
+                            item.artists.into_iter().map(|a| a.name).collect();
                         let artist_str = artist_names.join(", ");
                         let msg = format!("Сейчас играет: {} — {}", artist_str, item.name);
                         return Some(serde_json::json!({

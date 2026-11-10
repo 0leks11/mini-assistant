@@ -120,7 +120,7 @@ pub mod linux_bt {
             eir_pkt[0] = 0x01; // HCI_COMMAND_PKT
             eir_pkt[1] = 0x52; // OCF 0x0052
             eir_pkt[2] = 0x0C; // OGF 0x03
-            eir_pkt[3] = 241;  // param len: 1 (fec) + 240 (eir data)
+            eir_pkt[3] = 241; // param len: 1 (fec) + 240 (eir data)
             eir_pkt[4] = 0x00; // FEC required: 0
 
             // EIR Data:
@@ -155,7 +155,11 @@ pub mod linux_bt {
 
             // Also write direct HCI_Write_Scan_Enable for controllers requiring explicit packet
             let scan_pkt = [0x01, 0x1A, 0x0C, 0x01, 0x03];
-            let _ = libc::write(sock, scan_pkt.as_ptr() as *const libc::c_void, scan_pkt.len());
+            let _ = libc::write(
+                sock,
+                scan_pkt.as_ptr() as *const libc::c_void,
+                scan_pkt.len(),
+            );
 
             // Allow UART transmission to complete before closing socket
             std::thread::sleep(std::time::Duration::from_millis(100));

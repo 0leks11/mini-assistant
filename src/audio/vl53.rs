@@ -106,7 +106,8 @@ pub fn spawn_vl53_volume_task(
                             let ev = unsafe {
                                 std::ptr::read_unaligned(buf.as_ptr() as *const InputEvent)
                             };
-                            if ev.ev_type == EV_ABS && ev.code == CODE_DISTANCE_UM && ev.value >= 0 {
+                            if ev.ev_type == EV_ABS && ev.code == CODE_DISTANCE_UM && ev.value >= 0
+                            {
                                 // Distance reported in micrometers: convert to mm
                                 last_event_dist = (ev.value / 1000) as u32;
                             } else if ev.ev_type == EV_SYN {

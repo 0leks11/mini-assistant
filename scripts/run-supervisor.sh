@@ -22,14 +22,40 @@ if [ -x "$DIR/bcm-attach" ] && ! ps | grep -v grep | grep -q "$DIR/bcm-attach"; 
 fi
 
 # 4. Wait for valid system time (year >= 2026) so TLS certificates validate cleanly
-for i in $(seq 1 30); do
-    YEAR=$(date +%Y 2>/dev/null || echo 2015)
-    if [ "$YEAR" -ge 2026 ]; then
-        break
-    fi
-    echo "[$(date -Iseconds 2>/dev/null || date)] Waiting for NTP clock sync (current year: $YEAR)..." >> "$LOGFILE"
-    sleep 1
-done
+wait_for_ntp() {
+    echo "[$(date -Iseconds 2>/dev/null || date)] Waiting for NTP clock sync (year >= 2026)..." >> "$LOGFILE"
+    local count=0
+    while true; do
+        YEAR=$(date +%Y 2>/dev/null || echo 2015)
+        if [ "$YEAR" -ge 2026 ]; then
+            echo "[$(date -Iseconds 2>/dev/null || date)] NTP clock synchronized cleanly: year $YEAR" >> "$LOGFILE"
+            # Ensure waiting LED blink is off
+            i2cset -y 0 0x3c 0x00 0x00 2>/dev/null || true
+            break
+        fi
+
+        # Visual signal: blink upper LED (0.5s on, 0.5s off) to indicate waiting for NTP/network
+        i2cset -y 0 0x3c 0x00 0x01 2>/dev/null || true
+        sleep 0.5
+        i2cset -y 0 0x3c 0x00 0x00 2>/dev/null || true
+        sleep 0.5
+
+        count=$((count + 1))
+        # Every 5 seconds, attempt to force chrony stepping
+        if [ $((count % 5)) -eq 0 ]; then
+            echo "[$(date -Iseconds 2>/dev/null || date)] NTP wait tick $count (current year: $YEAR); kicking chrony..." >> "$LOGFILE"
+            chronyc -a 'burst 4/4' 2>/dev/null || true
+            chronyc makestep 2>/dev/null || true
+        fi
+
+        # Every 15 seconds, attempt one-shot pool sync if chronyd has stalled
+        if [ $((count % 15)) -eq 0 ]; then
+            chronyd -q 'server time.google.com iburst' 2>/dev/null || chronyd -q 'server pool.ntp.org iburst' 2>/dev/null || true
+        fi
+    done
+}
+
+wait_for_ntp
 
 # 5. Continuous background watchdog for dependent daemons & hardware settings
 # Runs concurrently with the main voice daemon, checking health every 4 seconds.
@@ -40,6 +66,13 @@ watchdog_loop() {
         echo 2 > /proc/sys/abi/cp15_barrier 2>/dev/null || true
         # Proximity sensor active
         echo 1 > /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null || true
+
+        # Watchdog: ensure system year has not slipped backward
+        YEAR=$(date +%Y 2>/dev/null || echo 2015)
+        if [ "$YEAR" -lt 2026 ]; then
+            echo "[$(date -Iseconds 2>/dev/null || date)] Watchdog: System time is invalid ($YEAR < 2026); stopping assistant..." >> "$LOGFILE"
+            killall -TERM mini-assistant 2>/dev/null || true
+        fi
 
         # Watchdog: Spotify Soloist engine
         if [ -x "$DIR/soloist-env/soloist-run.sh" ] && ! ps | grep -v grep | grep -q "soloist-env/soloist"; then
@@ -63,6 +96,12 @@ trap 'kill $WATCHDOG_PID 2>/dev/null' EXIT HUP INT TERM
 while true; do
     if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)" -gt 2097152 ]; then
         mv -f "$LOGFILE" "$LOGFILE.old" 2>/dev/null || true
+    fi
+
+    # Before launching or respawning, guarantee clock is synchronized
+    YEAR=$(date +%Y 2>/dev/null || echo 2015)
+    if [ "$YEAR" -lt 2026 ]; then
+        wait_for_ntp
     fi
 
     "$DAEMON" >> "$LOGFILE" 2>&1

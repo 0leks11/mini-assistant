@@ -19,6 +19,9 @@ if name == "scp" and Path(sys.argv[-2]).name == os.environ.get("DEPLOY_TEST_FAIL
     raise SystemExit(23)
 if name == "ssh" and sys.argv[-1].startswith("chmod 600") and os.environ.get("DEPLOY_TEST_FAIL_CHMOD"):
     raise SystemExit(24)
+if name == "ssh" and "[ -f" in sys.argv[-1]:
+    print("0")
+    sys.exit(0)
 if name == "ssh" and "sha256sum" in sys.argv[-1]:
     if os.environ.get("DEPLOY_TEST_EMPTY_HASH"):
         sys.exit(0)

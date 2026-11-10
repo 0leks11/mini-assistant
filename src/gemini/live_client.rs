@@ -196,9 +196,22 @@ impl GeminiLiveClient {
             None => format!("{}?key={}", GEMINI_LIVE_URL, cfg.api_key),
         };
 
-        let (ws_stream, _) = connect_async(&url)
-            .await
-            .context("Failed to connect to Gemini Live WebSocket")?;
+        let (ws_stream, _) = match connect_async(&url).await {
+            Ok(res) => res,
+            Err(e) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if now < 1_767_225_600 {
+                    warn!(
+                        unix_timestamp = now,
+                        "Gemini Live WebSocket connect failed and system clock appears out of sync (< 2026)"
+                    );
+                }
+                return Err(e).context("Failed to connect to Gemini Live WebSocket");
+            }
+        };
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -763,9 +776,22 @@ async fn run_single_session(
         }
     );
 
-    let (ws_stream, _) = connect_async(&url)
-        .await
-        .context("Failed to connect to Gemini Live WebSocket")?;
+    let (ws_stream, _) = match connect_async(&url).await {
+        Ok(res) => res,
+        Err(e) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now < 1_767_225_600 {
+                warn!(
+                    unix_timestamp = now,
+                    "Gemini Live WebSocket connect failed and system clock appears out of sync (< 2026)"
+                );
+            }
+            return Err(e).context("Failed to connect to Gemini Live WebSocket");
+        }
+    };
     info!("Connected to Gemini Live API WebSocket successfully");
 
     let (mut write, mut read) = ws_stream.split();
