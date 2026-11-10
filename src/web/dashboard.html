@@ -188,6 +188,24 @@
     .btn-icon:active { transform: scale(0.96); background: #30363d; }
 
     /* Voice Grid */
+    .provider-tab {
+      flex: 1;
+      padding: 9px;
+      background: #161b22;
+      border: 1px solid var(--card-border);
+      color: var(--text-muted);
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .provider-tab:hover { border-color: #58a6ff; }
+    .provider-tab.active {
+      background: rgba(88, 166, 255, 0.15);
+      border-color: #58a6ff;
+      color: #58a6ff;
+    }
     .voice-select-wrap { display: flex; flex-direction: column; gap: 10px; }
     .voice-grid {
       display: grid;
@@ -603,14 +621,22 @@
     </div>
   </div>
 
-  <!-- Voice Selector -->
+  <!-- Voice & Provider Selector -->
   <div class="card">
     <div class="card-title">
-      <span>Голос ассистента</span>
-      <span id="current-voice-badge" style="color: var(--accent); font-weight: normal;">Callirrhoe</span>
+      <span>Голосовая модель & провайдер</span>
+      <span id="current-voice-badge" style="color: var(--accent); font-weight: normal;">Gemini (Callirrhoe)</span>
     </div>
+
+    <!-- Provider Tabs -->
+    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+      <button class="provider-tab active" id="tab-gemini" onclick="switchProvider('gemini')">✨ Google Gemini Live</button>
+      <button class="provider-tab" id="tab-openai" onclick="switchProvider('openai')">⚡ OpenAI ChatGPT Voice</button>
+    </div>
+
     <div class="voice-select-wrap">
-      <div class="voice-grid">
+      <!-- Gemini Voices Grid -->
+      <div class="voice-grid" id="grid-gemini">
         <div class="voice-chip active" data-voice="Callirrhoe" onclick="selectVoice('Callirrhoe')">
           <div class="voice-name">Callirrhoe</div>
           <div class="voice-desc">Женский, глубокий</div>
@@ -635,8 +661,49 @@
           <div class="voice-name">Fenrir</div>
           <div class="voice-desc">Мужской, драйв</div>
         </div>
+        <div class="voice-chip" data-voice="Aoede" onclick="selectVoice('Aoede')">
+          <div class="voice-name">Aoede</div>
+          <div class="voice-desc">Женский, гармоничный</div>
+        </div>
       </div>
-      <button class="btn-apply-voice" id="btn-save-voice" onclick="applyVoice()">Сохранить и применить голос</button>
+
+      <!-- OpenAI Voices Grid -->
+      <div class="voice-grid" id="grid-openai" style="display: none;">
+        <div class="voice-chip" data-voice="alloy" onclick="selectVoice('alloy')">
+          <div class="voice-name">alloy</div>
+          <div class="voice-desc">Универсальный, ясный</div>
+        </div>
+        <div class="voice-chip" data-voice="echo" onclick="selectVoice('echo')">
+          <div class="voice-name">echo</div>
+          <div class="voice-desc">Мужской, уверенный</div>
+        </div>
+        <div class="voice-chip" data-voice="coral" onclick="selectVoice('coral')">
+          <div class="voice-name">coral</div>
+          <div class="voice-desc">Женский, теплый</div>
+        </div>
+        <div class="voice-chip" data-voice="sage" onclick="selectVoice('sage')">
+          <div class="voice-name">sage</div>
+          <div class="voice-desc">Спокойный, мягкий</div>
+        </div>
+        <div class="voice-chip" data-voice="ash" onclick="selectVoice('ash')">
+          <div class="voice-name">ash</div>
+          <div class="voice-desc">Мужской, мягкий</div>
+        </div>
+        <div class="voice-chip" data-voice="shimmer" onclick="selectVoice('shimmer')">
+          <div class="voice-name">shimmer</div>
+          <div class="voice-desc">Женский, выразительный</div>
+        </div>
+        <div class="voice-chip" data-voice="ballad" onclick="selectVoice('ballad')">
+          <div class="voice-name">ballad</div>
+          <div class="voice-desc">Мелодичный, рассказ</div>
+        </div>
+        <div class="voice-chip" data-voice="verse" onclick="selectVoice('verse')">
+          <div class="voice-name">verse</div>
+          <div class="voice-desc">Динамичный, современный</div>
+        </div>
+      </div>
+
+      <button class="btn-apply-voice" id="btn-save-voice" onclick="applyVoice()">Сохранить модель и голос</button>
     </div>
   </div>
 
@@ -784,6 +851,7 @@
 <div id="toast">Настройки сохранены</div>
 
 <script>
+  let selectedProvider = "gemini";
   let selectedVoice = "Callirrhoe";
   let isSpotifyPlaying = false;
 
@@ -801,11 +869,31 @@
     setTimeout(() => t.classList.remove("show"), 2500);
   }
 
+  function switchProvider(prov) {
+    selectedProvider = prov;
+    const isGemini = prov === "gemini";
+    document.getElementById("tab-gemini").classList.toggle("active", isGemini);
+    document.getElementById("tab-openai").classList.toggle("active", !isGemini);
+    document.getElementById("grid-gemini").style.display = isGemini ? "grid" : "none";
+    document.getElementById("grid-openai").style.display = isGemini ? "none" : "grid";
+
+    const geminiVoices = ["Callirrhoe", "Autonoe", "Puck", "Charon", "Kore", "Fenrir", "Aoede"];
+    const openaiVoices = ["alloy", "echo", "coral", "sage", "ash", "shimmer", "ballad", "verse"];
+    if (isGemini && !geminiVoices.some(v => v.toLowerCase() === selectedVoice.toLowerCase())) {
+      selectedVoice = "Callirrhoe";
+    } else if (!isGemini && !openaiVoices.some(v => v.toLowerCase() === selectedVoice.toLowerCase())) {
+      selectedVoice = "alloy";
+    }
+    selectVoice(selectedVoice);
+  }
+
   function selectVoice(name) {
     selectedVoice = name;
     document.querySelectorAll(".voice-chip").forEach(el => {
-      el.classList.toggle("active", el.dataset.voice === name);
+      el.classList.toggle("active", el.dataset.voice.toLowerCase() === name.toLowerCase());
     });
+    const provLabel = selectedProvider === "openai" ? "OpenAI" : "Gemini";
+    document.getElementById("current-voice-badge").innerText = `${provLabel} (${selectedVoice})`;
   }
 
   async function applyVoice() {
@@ -816,16 +904,17 @@
       const res = await fetch("/api/v1/voice", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ voice: selectedVoice })
+        body: JSON.stringify({ provider: selectedProvider, voice: selectedVoice })
       });
       const data = await res.json();
-      showToast(data.message || "Голос успешно изменен!");
-      document.getElementById("current-voice-badge").innerText = selectedVoice;
+      showToast(data.message || "Голосовая модель успешно обновлена!");
+      const provLabel = selectedProvider === "openai" ? "OpenAI" : "Gemini";
+      document.getElementById("current-voice-badge").innerText = `${provLabel} (${selectedVoice})`;
     } catch (e) {
       showToast("Ошибка сохранения: " + e.message);
     } finally {
       btn.disabled = false;
-      btn.innerText = "Сохранить и применить голос";
+      btn.innerText = "Сохранить модель и голос";
     }
   }
 
@@ -932,9 +1021,16 @@
         volDisplay.innerText = data.volume;
       }
 
-      // Voice
+      // Voice & Provider
+      if (data.provider) {
+        selectedProvider = data.provider.toLowerCase();
+        const isGemini = selectedProvider === "gemini";
+        document.getElementById("tab-gemini").classList.toggle("active", isGemini);
+        document.getElementById("tab-openai").classList.toggle("active", !isGemini);
+        document.getElementById("grid-gemini").style.display = isGemini ? "grid" : "none";
+        document.getElementById("grid-openai").style.display = isGemini ? "none" : "grid";
+      }
       if (data.voice) {
-        document.getElementById("current-voice-badge").innerText = data.voice;
         selectVoice(data.voice);
       }
 

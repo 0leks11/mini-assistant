@@ -14,7 +14,9 @@ mod config;
 mod gemini;
 mod ha;
 mod interaction;
+pub mod openai;
 mod spotify;
+pub mod voice;
 mod wakeword;
 pub mod weather;
 pub mod web;
@@ -38,18 +40,21 @@ enum CliAction {
 
 enum VoiceClient {
     Gemini(gemini::GeminiLiveClient),
+    Openai(openai::OpenAiRealtimeClient),
 }
 
 impl VoiceClient {
     fn status_handle(&self) -> Arc<std::sync::atomic::AtomicU8> {
         match self {
             Self::Gemini(client) => client.status_handle(),
+            Self::Openai(client) => client.status_handle(),
         }
     }
 
     async fn stop(&mut self) {
         match self {
             Self::Gemini(client) => client.stop().await,
+            Self::Openai(client) => client.stop().await,
         }
     }
 }
@@ -185,6 +190,26 @@ async fn run_preflight_check(
     match provider {
         VoiceProvider::Gemini => {
             gemini::GeminiLiveClient::verify_handshake(&gemini::LiveClientConfig {
+                api_key,
+                model: voice.model.to_owned(),
+                voice_name: voice.voice.to_owned(),
+                system_instruction,
+                has_ha_tools: false,
+                has_weather_tools: false,
+                has_alarm_tools: false,
+                has_spotify_tools: false,
+                has_volume_tools: false,
+                has_bluetooth_tools: false,
+                has_stop_dialogue: false,
+                endpoint: None,
+                cancellation_epoch: None,
+                authorization: None,
+                suppress_followup: None,
+            })
+            .await
+        }
+        VoiceProvider::Openai => {
+            openai::OpenAiRealtimeClient::verify_handshake(&gemini::LiveClientConfig {
                 api_key,
                 model: voice.model.to_owned(),
                 voice_name: voice.voice.to_owned(),
@@ -1425,6 +1450,31 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .map(VoiceClient::Gemini),
+                VoiceProvider::Openai => openai::OpenAiRealtimeClient::connect(
+                    gemini::LiveClientConfig {
+                        api_key,
+                        model,
+                        voice_name,
+                        system_instruction,
+                        has_ha_tools: ha_tools_enabled,
+                        has_weather_tools: weather_tools_enabled,
+                        has_alarm_tools: alarm_tools_enabled,
+                        has_spotify_tools: spotify_tools_enabled,
+                        has_volume_tools: volume_tools_enabled,
+                        has_bluetooth_tools: true,
+                        has_stop_dialogue: any_tools_enabled,
+                        endpoint: None,
+                        cancellation_epoch: Some(cancellation_epoch),
+                        authorization: Some(authorization.clone()),
+                        suppress_followup: Some(suppress_followup.clone()),
+                    },
+                    rx_cloud_mic,
+                    tx_speaker,
+                    any_tools_enabled.then_some(tool_call_tx),
+                    on_interrupted,
+                )
+                .await
+                .map(VoiceClient::Openai),
             };
             let mut voice_client = match connection {
                 Ok(client) => client,

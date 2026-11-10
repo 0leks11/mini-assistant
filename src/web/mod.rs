@@ -339,7 +339,7 @@ impl ControlCenterServer {
     async fn handle_api_status(&self, stream: &mut TcpStream) -> Result<()> {
         let metrics = read_system_metrics(self.start_time);
         let cur_vol = volume::current_level();
-        let cur_voice = self.read_current_voice();
+        let (cur_provider, cur_voice) = self.read_current_voice_and_provider();
         let cur_led = self.current_led_color.read().await.clone();
 
         // Query Spotify Soloist track
@@ -372,6 +372,7 @@ impl ControlCenterServer {
             "status": "ok",
             "name": "GPT Mini",
             "version": "0.1.0",
+            "provider": cur_provider,
             "voice": cur_voice,
             "volume": cur_vol,
             "led_color": cur_led,
@@ -424,10 +425,19 @@ impl ControlCenterServer {
     async fn handle_api_voice(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
         #[derive(serde::Deserialize)]
         struct VoiceReq {
-            voice: String,
+            provider: Option<String>,
+            voice: Option<String>,
         }
         let req: VoiceReq = serde_json::from_str(body).context("Invalid JSON body")?;
-        let valid_voices = [
+
+        let (cur_provider, _cur_voice) = self.read_current_voice_and_provider();
+        let target_provider = req
+            .provider
+            .as_deref()
+            .map(|p| p.to_lowercase())
+            .unwrap_or(cur_provider);
+
+        let valid_gemini_voices = [
             "Callirrhoe",
             "Puck",
             "Autonoe",
@@ -436,27 +446,59 @@ impl ControlCenterServer {
             "Fenrir",
             "Aoede",
         ];
-        if !valid_voices
-            .iter()
-            .any(|v| v.eq_ignore_ascii_case(&req.voice))
-        {
-            anyhow::bail!("Unsupported voice name: {}", req.voice);
-        }
+        let valid_openai_voices = [
+            "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
+        ];
 
-        let matched_voice = valid_voices
-            .iter()
-            .find(|v| v.eq_ignore_ascii_case(&req.voice))
-            .unwrap()
-            .to_string();
+        let target_voice = if let Some(ref v) = req.voice {
+            v.trim().to_string()
+        } else if target_provider == "openai" {
+            "alloy".to_string()
+        } else {
+            "Callirrhoe".to_string()
+        };
+
+        let matched_voice = match target_provider.as_str() {
+            "openai" => {
+                if !valid_openai_voices
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case(&target_voice))
+                {
+                    anyhow::bail!("Unsupported OpenAI voice: {}", target_voice);
+                }
+                valid_openai_voices
+                    .iter()
+                    .find(|v| v.eq_ignore_ascii_case(&target_voice))
+                    .unwrap()
+                    .to_string()
+            }
+            _ => {
+                if !valid_gemini_voices
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case(&target_voice))
+                {
+                    anyhow::bail!("Unsupported Gemini voice: {}", target_voice);
+                }
+                valid_gemini_voices
+                    .iter()
+                    .find(|v| v.eq_ignore_ascii_case(&target_voice))
+                    .unwrap()
+                    .to_string()
+            }
+        };
 
         if let Some(ref path) = self.config_path {
-            update_config_voice(path, &matched_voice)?;
-            info!(voice = %matched_voice, "Voice setting updated in config.toml");
+            update_config_voice_and_provider(path, Some(&target_provider), Some(&matched_voice))?;
+            info!(
+                provider = %target_provider,
+                voice = %matched_voice,
+                "Voice & provider setting updated in config.toml"
+            );
 
             // Respawn assistant cleanly in 500ms via supervisor
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                info!("Restarting assistant process to apply new voice...");
+                info!("Restarting assistant process to apply new voice & provider...");
                 std::process::exit(0);
             });
         }
@@ -465,8 +507,9 @@ impl ControlCenterServer {
             stream,
             &serde_json::json!({
                 "status": "ok",
+                "provider": target_provider,
                 "voice": matched_voice,
-                "message": format!("Голос изменен на {matched_voice}. Ассистент перезапускается...")
+                "message": format!("Модель {} ({}) применена. Ассистент перезапускается...", target_provider, matched_voice)
             }),
         )
         .await
@@ -528,14 +571,22 @@ impl ControlCenterServer {
         Ok(())
     }
 
-    fn read_current_voice(&self) -> String {
+    fn read_current_voice_and_provider(&self) -> (String, String) {
         if let Some(ref path) = self.config_path {
             if let Ok(content) = std::fs::read_to_string(path) {
+                let mut provider = "gemini".to_string();
+                let mut voice = String::new();
+                let mut in_assistant = false;
                 for line in content.lines() {
                     let trimmed = line.trim();
-                    if trimmed.starts_with("voice") && trimmed.contains('=') {
-                        if let Some((_, val)) = trimmed.split_once('=') {
-                            let clean = val
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                        in_assistant = trimmed == "[assistant]";
+                        continue;
+                    }
+                    if in_assistant {
+                        if let Some((k, v)) = trimmed.split_once('=') {
+                            let k = k.trim();
+                            let clean = v
                                 .trim()
                                 .trim_matches('"')
                                 .trim_matches('\'')
@@ -543,15 +594,30 @@ impl ControlCenterServer {
                                 .next()
                                 .unwrap_or("")
                                 .trim();
-                            if !clean.is_empty() {
-                                return clean.to_string();
+                            if k == "provider" && !clean.is_empty() {
+                                provider = clean.to_lowercase();
+                            } else if k == "voice" && !clean.is_empty() {
+                                voice = clean.to_string();
                             }
                         }
                     }
                 }
+                if voice.is_empty() {
+                    voice = if provider == "openai" {
+                        "alloy".to_string()
+                    } else {
+                        "Callirrhoe".to_string()
+                    };
+                }
+                return (provider, voice);
             }
         }
-        "Callirrhoe".to_string()
+        ("gemini".to_string(), "Callirrhoe".to_string())
+    }
+
+    #[allow(dead_code)]
+    fn read_current_voice(&self) -> String {
+        self.read_current_voice_and_provider().1
     }
 
     async fn create_authorization_url(&self, redirect_uri: &str) -> (String, String) {
@@ -1074,12 +1140,17 @@ pub fn set_led_hardware(color: &str) {
         .status();
 }
 
-pub fn update_config_voice(config_path: &Path, new_voice: &str) -> Result<()> {
+pub fn update_config_voice_and_provider(
+    config_path: &Path,
+    new_provider: Option<&str>,
+    new_voice: Option<&str>,
+) -> Result<()> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
     let mut updated = Vec::new();
     let mut in_assistant_section = false;
-    let mut replaced = false;
+    let mut replaced_voice = false;
+    let mut replaced_provider = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1089,39 +1160,68 @@ pub fn update_config_voice(config_path: &Path, new_voice: &str) -> Result<()> {
             continue;
         }
 
-        if in_assistant_section
-            && trimmed.starts_with("voice")
-            && trimmed.contains('=')
-            && !replaced
-        {
-            let indent = line
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .collect::<String>();
-            updated.push(format!("{}voice = \"{}\"", indent, new_voice));
-            replaced = true;
-            continue;
+        if in_assistant_section {
+            if let Some(np) = new_provider {
+                if trimmed.starts_with("provider") && trimmed.contains('=') && !replaced_provider {
+                    let indent = line
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect::<String>();
+                    updated.push(format!("{}provider = \"{}\"", indent, np));
+                    replaced_provider = true;
+                    continue;
+                }
+            }
+            if let Some(nv) = new_voice {
+                if trimmed.starts_with("voice") && trimmed.contains('=') && !replaced_voice {
+                    let indent = line
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect::<String>();
+                    updated.push(format!("{}voice = \"{}\"", indent, nv));
+                    replaced_voice = true;
+                    continue;
+                }
+            }
         }
 
         updated.push(line.to_string());
     }
 
-    if !replaced {
-        let mut final_lines = Vec::new();
-        for line in updated {
-            if line.trim().starts_with("voice = ") && !replaced {
-                final_lines.push(format!("voice = \"{}\"", new_voice));
-                replaced = true;
-            } else {
+    if let Some(np) = new_provider {
+        if !replaced_provider {
+            let mut final_lines = Vec::new();
+            for line in updated.drain(..) {
+                let is_assistant = line.trim() == "[assistant]";
                 final_lines.push(line);
+                if is_assistant {
+                    final_lines.push(format!("provider = \"{}\"", np));
+                }
             }
+            updated = final_lines;
         }
-        std::fs::write(config_path, final_lines.join("\n") + "\n")?;
-    } else {
-        std::fs::write(config_path, updated.join("\n") + "\n")?;
     }
 
+    if let Some(nv) = new_voice {
+        if !replaced_voice {
+            let mut final_lines = Vec::new();
+            for line in updated.drain(..) {
+                let is_assistant = line.trim() == "[assistant]";
+                final_lines.push(line);
+                if is_assistant {
+                    final_lines.push(format!("voice = \"{}\"", nv));
+                }
+            }
+            updated = final_lines;
+        }
+    }
+
+    std::fs::write(config_path, updated.join("\n") + "\n")?;
     Ok(())
+}
+
+pub fn update_config_voice(config_path: &Path, new_voice: &str) -> Result<()> {
+    update_config_voice_and_provider(config_path, None, Some(new_voice))
 }
 
 pub struct SystemMetrics {
@@ -1287,6 +1387,31 @@ capture_device = "hw:0,2"
         assert!(updated.contains("voice = \"Puck\""));
         assert!(!updated.contains("voice = \"Callirrhoe\""));
         assert!(updated.contains("capture_device = \"hw:0,2\""));
+
+        std::fs::remove_file(&cfg_file).unwrap();
+    }
+
+    #[test]
+    fn test_update_config_voice_and_provider() {
+        let temp_dir = std::env::temp_dir();
+        let cfg_file = temp_dir.join(format!("test_config_prov_{}.toml", uuid::Uuid::new_v4()));
+        let initial_toml = r#"
+[assistant]
+name = "Штучка"
+provider = "gemini"
+voice = "Callirrhoe"
+
+[audio]
+capture_device = "hw:0,2"
+"#;
+        std::fs::write(&cfg_file, initial_toml).unwrap();
+
+        update_config_voice_and_provider(&cfg_file, Some("openai"), Some("alloy")).unwrap();
+        let updated = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(updated.contains("provider = \"openai\""));
+        assert!(updated.contains("voice = \"alloy\""));
+        assert!(!updated.contains("provider = \"gemini\""));
+        assert!(!updated.contains("voice = \"Callirrhoe\""));
 
         std::fs::remove_file(&cfg_file).unwrap();
     }

@@ -15,10 +15,9 @@ languages = ["ru-RU", "en-US"]
 model = "models/gemini-3.8-live"
 # api_key — set via GEMINI_API_KEY env var, not here
 
-# Used only with assistant.provider = "openai". Set OPENAI_API_KEY locally.
+# Used only with assistant.provider = "openai". Set OPENAI_API_KEY in .env
 # [openai]
-# model = "gpt-realtime"
-# voice = "marin"
+# model = "gpt-4o-realtime-preview"
 
 [audio]
 capture_device = "hw:0,2"               # Mini microphone hardware capture (hw:0,2 8ch S32_LE)

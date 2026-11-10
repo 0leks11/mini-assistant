@@ -8,6 +8,8 @@ use std::path::PathBuf;
 pub struct Config {
     pub assistant: AssistantConfig,
     pub gemini: Option<GeminiConfig>,
+    #[serde(default)]
+    pub openai: Option<OpenAiConfig>,
     pub audio: AudioConfig,
     pub ha: Option<HomeAssistantConfig>,
     #[serde(default)]
@@ -47,26 +49,42 @@ pub struct AssistantConfig {
 pub enum VoiceProvider {
     #[default]
     Gemini,
+    Openai,
 }
 
 impl VoiceProvider {
     pub fn name(self) -> &'static str {
         match self {
             Self::Gemini => "Gemini Live",
+            Self::Openai => "OpenAI Realtime",
         }
     }
 
     pub fn host(self) -> &'static str {
         match self {
             Self::Gemini => "generativelanguage.googleapis.com:443",
+            Self::Openai => "api.openai.com:443",
         }
     }
 
     pub fn key_env(self) -> &'static str {
         match self {
             Self::Gemini => "GEMINI_API_KEY",
+            Self::Openai => "OPENAI_API_KEY",
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiConfig {
+    #[serde(default = "default_openai_model")]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_openai_model() -> String {
+    "gpt-4o-realtime-preview".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,10 +315,24 @@ impl Config {
             VoiceProvider::Gemini => {
                 let config = self.gemini.as_ref().context("Missing [gemini] section")?;
                 (
-                    &config.model,
-                    &self.assistant.voice,
+                    config.model.as_str(),
+                    self.assistant.voice.as_str(),
                     config.api_key.as_deref(),
                 )
+            }
+            VoiceProvider::Openai => {
+                let model = self
+                    .openai
+                    .as_ref()
+                    .map(|o| o.model.as_str())
+                    .unwrap_or("gpt-4o-realtime-preview");
+                let voice = if self.assistant.voice.trim().is_empty() {
+                    "alloy"
+                } else {
+                    self.assistant.voice.as_str()
+                };
+                let key = self.openai.as_ref().and_then(|o| o.api_key.as_deref());
+                (model, voice, key)
             }
         };
         anyhow::ensure!(
