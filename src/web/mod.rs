@@ -12,14 +12,16 @@ use crate::audio::volume;
 use crate::spotify::crypto::pkce_code_challenge;
 use crate::spotify::web_api::SpotifyApiClient;
 use crate::spotify::{MusicDucker, PlaybackState, SoloistClient};
+use crate::wakeword::enrollment::{decode_wav_pcm16, EnrollmentSession, HardwareRecorder};
 use anyhow::{Context, Result};
+use rustpotter::{WakewordLoad, WakewordRef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info, warn};
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
@@ -44,6 +46,10 @@ pub struct ControlCenterServer {
     pending_auths: Arc<RwLock<HashMap<String, PendingAuth>>>,
     start_time: Instant,
     current_led_color: Arc<RwLock<String>>,
+    wakeword_session: Arc<RwLock<Option<EnrollmentSession>>>,
+    hardware_recorder: Option<HardwareRecorder>,
+    wakeword_reload_tx: Option<mpsc::UnboundedSender<PathBuf>>,
+    wakeword_model_path: PathBuf,
 }
 
 impl ControlCenterServer {
@@ -66,11 +72,27 @@ impl ControlCenterServer {
             pending_auths: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
             current_led_color: Arc::new(RwLock::new("azure".to_string())),
+            wakeword_session: Arc::new(RwLock::new(None)),
+            hardware_recorder: None,
+            wakeword_reload_tx: None,
+            wakeword_model_path: PathBuf::from("/data/opt/mini-assistant/keyword.rpw"),
         }
     }
 
     pub fn with_token_path(mut self, path: PathBuf) -> Self {
         self.token_path = Some(path);
+        self
+    }
+
+    pub fn with_wakeword_support(
+        mut self,
+        recorder: Option<HardwareRecorder>,
+        reload_tx: Option<mpsc::UnboundedSender<PathBuf>>,
+        model_path: PathBuf,
+    ) -> Self {
+        self.hardware_recorder = recorder;
+        self.wakeword_reload_tx = reload_tx;
+        self.wakeword_model_path = model_path;
         self
     }
 
@@ -135,24 +157,59 @@ impl ControlCenterServer {
             None => (full_path, None),
         };
 
-        // Extract body if present
-        let body = if let Some(pos) = req_str.find("\r\n\r\n") {
-            &req_str[pos + 4..]
-        } else if let Some(pos) = req_str.find("\n\n") {
-            &req_str[pos + 2..]
-        } else {
-            ""
-        };
+        // Extract body if present (with multi-chunk reading for uploads up to 512KB)
+        let header_end = req_str
+            .find("\r\n\r\n")
+            .map(|p| (p, 4))
+            .or_else(|| req_str.find("\n\n").map(|p| (p, 2)));
 
+        let mut content_length = 0usize;
         let mut host = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("host") {
+                let k_trim = k.trim();
+                if k_trim.eq_ignore_ascii_case("content-length") {
+                    if let Ok(len) = v.trim().parse::<usize>() {
+                        content_length = len.min(512 * 1024);
+                    }
+                } else if k_trim.eq_ignore_ascii_case("host") {
                     host = Some(v.trim().to_string());
-                    break;
                 }
             }
         }
+
+        let body_owned: String;
+        let body: &str = if let Some((pos, delim_len)) = header_end {
+            let body_start = pos + delim_len;
+            let already_read = n.saturating_sub(body_start);
+            if content_length > already_read && content_length <= 512 * 1024 {
+                let mut full_body = Vec::with_capacity(content_length);
+                full_body.extend_from_slice(&buf[body_start..n]);
+                let mut remaining = content_length - already_read;
+                let mut chunk_buf = [0u8; 8192];
+                while remaining > 0 {
+                    let to_read = remaining.min(chunk_buf.len());
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        stream.read(&mut chunk_buf[..to_read]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(read_bytes)) if read_bytes > 0 => {
+                            full_body.extend_from_slice(&chunk_buf[..read_bytes]);
+                            remaining -= read_bytes;
+                        }
+                        _ => break,
+                    }
+                }
+                body_owned = String::from_utf8_lossy(&full_body).to_string();
+                &body_owned
+            } else {
+                &req_str[body_start..n]
+            }
+        } else {
+            ""
+        };
 
         let active_redirect_uri = match &host {
             Some(h) if !h.is_empty() => format!("http://{h}/spotify/callback"),
@@ -189,6 +246,26 @@ impl ControlCenterServer {
             }
             ("POST", "/api/v1/system/reboot") => {
                 self.handle_api_system_reboot(&mut stream).await?;
+            }
+
+            // Wake-Word Custom Enrollment REST API
+            ("POST", "/api/v1/wakeword/session/start") => {
+                self.handle_api_wakeword_session_start(&mut stream, body).await?;
+            }
+            ("GET", "/api/v1/wakeword/session/status") => {
+                self.handle_api_wakeword_session_status(&mut stream).await?;
+            }
+            ("POST", "/api/v1/wakeword/sample/record_hw") => {
+                self.handle_api_wakeword_record_hw(&mut stream).await?;
+            }
+            ("POST", "/api/v1/wakeword/sample/upload") => {
+                self.handle_api_wakeword_upload_sample(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/wakeword/sample/remove") => {
+                self.handle_api_wakeword_remove_sample(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/wakeword/compile") => {
+                self.handle_api_wakeword_compile(&mut stream).await?;
             }
 
             // Spotify OAuth PKCE Flow
@@ -285,6 +362,9 @@ impl ControlCenterServer {
             }
         }
 
+        let cur_wakeword = self.read_active_wakeword_name();
+        let wakeword_session_active = self.wakeword_session.read().await.is_some();
+
         let resp = serde_json::json!({
             "status": "ok",
             "name": "GPT Mini",
@@ -292,6 +372,10 @@ impl ControlCenterServer {
             "voice": cur_voice,
             "volume": cur_vol,
             "led_color": cur_led,
+            "wakeword": {
+                "name": cur_wakeword,
+                "session_active": wakeword_session_active,
+            },
             "ip": metrics.ip,
             "uptime": metrics.uptime_formatted,
             "mem_total_mb": metrics.mem_total_mb,
@@ -613,6 +697,323 @@ impl ControlCenterServer {
         let bytes = serde_json::to_vec(val)?;
         self.send_response(stream, "200 OK", "application/json", &bytes)
             .await
+    }
+
+    async fn send_json_status(
+        &self,
+        stream: &mut TcpStream,
+        status: &str,
+        val: &serde_json::Value,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(val)?;
+        self.send_response(stream, status, "application/json", &bytes)
+            .await
+    }
+
+    fn read_active_wakeword_name(&self) -> String {
+        if self.wakeword_model_path.exists() {
+            if let Some(path_str) = self.wakeword_model_path.to_str() {
+                if let Ok(ref_model) = WakewordRef::load_from_file(path_str) {
+                    if !ref_model.name.is_empty() {
+                        return ref_model.name;
+                    }
+                }
+            }
+        }
+        "Штучка".to_string()
+    }
+
+    async fn handle_api_wakeword_session_start(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct StartReq {
+            name: Option<String>,
+        }
+        let req: StartReq = serde_json::from_str(body).unwrap_or(StartReq { name: None });
+        let kw_name = req
+            .name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Штучка".to_string());
+
+        let session = EnrollmentSession::new(kw_name.clone());
+        let (phase, phase_name) = EnrollmentSession::phase_for_step(1);
+        *self.wakeword_session.write().await = Some(session);
+
+        info!(keyword = %kw_name, "Started interactive wake-word enrollment session");
+
+        let resp = serde_json::json!({
+            "status": "ok",
+            "keyword_name": kw_name,
+            "current_step": 1,
+            "target_steps": 25,
+            "min_steps": 3,
+            "phase": phase,
+            "phase_name": phase_name,
+        });
+        self.send_json(stream, &resp).await
+    }
+
+    async fn handle_api_wakeword_session_status(&self, stream: &mut TcpStream) -> Result<()> {
+        let lock = self.wakeword_session.read().await;
+        let resp = if let Some(ref sess) = *lock {
+            let (phase, phase_name) = EnrollmentSession::phase_for_step(sess.current_step);
+            serde_json::json!({
+                "status": "ok",
+                "active": true,
+                "keyword_name": sess.keyword_name,
+                "current_step": sess.current_step,
+                "target_steps": sess.target_steps,
+                "min_steps": sess.min_steps,
+                "can_compile": sess.can_compile,
+                "samples_count": sess.samples.len(),
+                "phase": phase,
+                "phase_name": phase_name,
+                "samples": sess.samples,
+            })
+        } else {
+            serde_json::json!({
+                "status": "ok",
+                "active": false,
+                "current_keyword": self.read_active_wakeword_name(),
+            })
+        };
+        self.send_json(stream, &resp).await
+    }
+
+    async fn handle_api_wakeword_record_hw(&self, stream: &mut TcpStream) -> Result<()> {
+        let mut session_guard = self.wakeword_session.write().await;
+        let sess = match session_guard.as_mut() {
+            Some(s) => s,
+            None => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": "Сессия обучения не активна. Нажмите «Начать обучение»."
+                });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        let recorder = match &self.hardware_recorder {
+            Some(r) => r.clone(),
+            None => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": "Микрофон колонки недоступен (аппаратный рекордер не инициализирован)."
+                });
+                return self.send_json_status(stream, "500 Internal Error", &err).await;
+            }
+        };
+
+        // Visual indicator: pulse amber LED
+        let prev_color = self.current_led_color.read().await.clone();
+        set_led_hardware("amber");
+
+        // Record 2.5 seconds of audio from Mini's hardware microphone
+        let record_res = recorder.record(Duration::from_millis(2500)).await;
+
+        // Restore LED
+        set_led_hardware(&prev_color);
+
+        let pcm = match record_res {
+            Ok(p) => p,
+            Err(e) => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": format!("Ошибка записи микрофона: {e}")
+                });
+                return self.send_json_status(stream, "500 Internal Error", &err).await;
+            }
+        };
+
+        match sess.add_pcm_sample(&pcm) {
+            Ok(sample) => {
+                let (phase, phase_name) = EnrollmentSession::phase_for_step(sess.current_step);
+                let resp = serde_json::json!({
+                    "status": "ok",
+                    "sample": sample,
+                    "current_step": sess.current_step,
+                    "target_steps": sess.target_steps,
+                    "samples_count": sess.samples.len(),
+                    "can_compile": sess.can_compile,
+                    "phase": phase,
+                    "phase_name": phase_name,
+                });
+                self.send_json(stream, &resp).await
+            }
+            Err(e) => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": format!("{e}")
+                });
+                self.send_json_status(stream, "422 Unprocessable Entity", &err).await
+            }
+        }
+    }
+
+    async fn handle_api_wakeword_upload_sample(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        let mut session_guard = self.wakeword_session.write().await;
+        let sess = match session_guard.as_mut() {
+            Some(s) => s,
+            None => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": "Сессия обучения не активна. Нажмите «Начать обучение»."
+                });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        #[derive(serde::Deserialize)]
+        struct UploadReq {
+            wav_base64: Option<String>,
+            pcm_base64: Option<String>,
+        }
+        let req: UploadReq = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = serde_json::json!({ "status": "error", "message": format!("Неверный JSON: {e}") });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        use base64::Engine;
+        let raw_pcm = if let Some(wav_b64) = req.wav_base64 {
+            let wav_bytes = match base64::engine::general_purpose::STANDARD.decode(wav_b64.trim()) {
+                Ok(b) => b,
+                Err(e) => {
+                    let err = serde_json::json!({ "status": "error", "message": format!("Base64 decode error: {e}") });
+                    return self.send_json_status(stream, "400 Bad Request", &err).await;
+                }
+            };
+            match decode_wav_pcm16(&wav_bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    let err = serde_json::json!({ "status": "error", "message": format!("WAV decode error: {e}") });
+                    return self.send_json_status(stream, "422 Unprocessable Entity", &err).await;
+                }
+            }
+        } else if let Some(pcm_b64) = req.pcm_base64 {
+            let pcm_bytes = match base64::engine::general_purpose::STANDARD.decode(pcm_b64.trim()) {
+                Ok(b) => b,
+                Err(e) => {
+                    let err = serde_json::json!({ "status": "error", "message": format!("Base64 decode error: {e}") });
+                    return self.send_json_status(stream, "400 Bad Request", &err).await;
+                }
+            };
+            let (chunks, _) = pcm_bytes.as_chunks::<2>();
+            chunks.iter().map(|c| i16::from_le_bytes(*c)).collect()
+        } else {
+            let err = serde_json::json!({ "status": "error", "message": "Ожидалось wav_base64 или pcm_base64" });
+            return self.send_json_status(stream, "400 Bad Request", &err).await;
+        };
+
+        match sess.add_pcm_sample(&raw_pcm) {
+            Ok(sample) => {
+                let (phase, phase_name) = EnrollmentSession::phase_for_step(sess.current_step);
+                let resp = serde_json::json!({
+                    "status": "ok",
+                    "sample": sample,
+                    "current_step": sess.current_step,
+                    "target_steps": sess.target_steps,
+                    "samples_count": sess.samples.len(),
+                    "can_compile": sess.can_compile,
+                    "phase": phase,
+                    "phase_name": phase_name,
+                });
+                self.send_json(stream, &resp).await
+            }
+            Err(e) => {
+                let err = serde_json::json!({ "status": "error", "message": format!("{e}") });
+                self.send_json_status(stream, "422 Unprocessable Entity", &err).await
+            }
+        }
+    }
+
+    async fn handle_api_wakeword_remove_sample(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        let mut session_guard = self.wakeword_session.write().await;
+        let sess = match session_guard.as_mut() {
+            Some(s) => s,
+            None => {
+                let err = serde_json::json!({ "status": "error", "message": "Сессия не активна" });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        #[derive(serde::Deserialize)]
+        struct RemoveReq {
+            id: usize,
+        }
+        let req: RemoveReq = serde_json::from_str(body).unwrap_or(RemoveReq { id: 0 });
+        let removed = sess.remove_sample(req.id);
+        let resp = serde_json::json!({
+            "status": "ok",
+            "removed": removed,
+            "samples_count": sess.samples.len(),
+            "current_step": sess.current_step,
+            "can_compile": sess.can_compile,
+        });
+        self.send_json(stream, &resp).await
+    }
+
+    async fn handle_api_wakeword_compile(&self, stream: &mut TcpStream) -> Result<()> {
+        let mut session_guard = self.wakeword_session.write().await;
+        let sess = match session_guard.take() {
+            Some(s) => s,
+            None => {
+                let err = serde_json::json!({ "status": "error", "message": "Сессия не активна" });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        if !sess.can_compile {
+            *session_guard = Some(sess);
+            let err = serde_json::json!({
+                "status": "error",
+                "message": "Недостаточно сэмплов для компиляции (требуется минимум 3)."
+            });
+            return self.send_json_status(stream, "400 Bad Request", &err).await;
+        }
+
+        match sess.compile_model(&self.wakeword_model_path) {
+            Ok(compile_res) => {
+                // Signal hot-reload to InputGate
+                if let Some(ref tx) = self.wakeword_reload_tx {
+                    let _ = tx.send(self.wakeword_model_path.clone());
+                    info!(path = ?self.wakeword_model_path, "Triggered hot-reload of new wake-word model");
+                }
+
+                // Visual flash: green / emerald
+                set_led_hardware("emerald");
+
+                let resp = serde_json::json!({
+                    "status": "ok",
+                    "message": format!("Слово «{}» успешно обучено и активировано!", compile_res.keyword_name),
+                    "details": compile_res,
+                });
+                self.send_json(stream, &resp).await
+            }
+            Err(e) => {
+                // Restore session on error so user doesn't lose work
+                *session_guard = Some(sess);
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": format!("Ошибка компиляции модели: {e}")
+                });
+                self.send_json_status(stream, "500 Internal Error", &err).await
+            }
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod enrollment;
 pub mod keyword;
 use tracing::debug;
 
@@ -254,6 +255,12 @@ impl InputGate {
             self.buffered_bytes = 0;
             self.silence_bytes = 0;
         }
+    }
+
+    /// Hot-reloads the wake-word engine without interrupting audio loop.
+    pub fn reload_engine(&mut self, new_engine: Box<dyn WakeWordEngine>) {
+        self.engine = new_engine;
+        self.reset_gate();
     }
 }
 

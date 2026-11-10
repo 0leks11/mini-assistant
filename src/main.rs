@@ -481,7 +481,16 @@ async fn main() -> Result<()> {
                 Some(music_ducker.clone()),
             );
 
-            // 4d3. Start Control Center Web Dashboard (:8080)
+            // 4d3. Prepare Wake-Word support and Start Control Center Web Dashboard (:8080)
+            let model_path: std::path::PathBuf = std::env::var_os("MINI_WAKEWORD_MODEL")
+                .map(std::path::PathBuf::from)
+                .or(config.assistant.wakeword_model.clone())
+                .unwrap_or_else(|| "/bkupgrade/data/opt/mini-assistant/keyword.rpw".into());
+
+            let hardware_recorder = wakeword::enrollment::HardwareRecorder::new();
+            let (tx_reload_wakeword, mut rx_reload_wakeword) =
+                tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
             let srv_redirect_uri = format!("http://10.77.0.111:{}/spotify/callback", web_port);
@@ -494,7 +503,12 @@ async fn main() -> Result<()> {
                 Some(soloist_client.clone()),
                 music_ducker.clone(),
             )
-            .with_token_path(spotify_cfg.token_file.clone());
+            .with_token_path(spotify_cfg.token_file.clone())
+            .with_wakeword_support(
+                Some(hardware_recorder.clone()),
+                Some(tx_reload_wakeword),
+                model_path.clone(),
+            );
             let web_server = Arc::new(web_server);
             tokio::spawn(async move {
                 let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], web_port));
@@ -1088,6 +1102,7 @@ async fn main() -> Result<()> {
             let soloist_playing_for_mic = is_soloist_playing.clone();
             let ducker_for_mic = music_ducker.clone();
             let voice_active_for_mic = voice_active.clone();
+            let recorder_for_mic = hardware_recorder.clone();
             tokio::spawn(async move {
                 use std::sync::atomic::Ordering;
                 use std::time::{Duration, Instant};
@@ -1119,6 +1134,27 @@ async fn main() -> Result<()> {
                 let mut diagnostic_chunks = 0u64;
                 let mut diagnostic_peak = 0.0_f64;
                 while let Some(chunk) = rx_raw_mic.recv().await {
+                    if let Ok(new_path) = rx_reload_wakeword.try_recv() {
+                        match wakeword::keyword::KeywordEngine::load(&new_path) {
+                            Ok(engine) => {
+                                info!(
+                                    path = ?new_path,
+                                    "Hot-reloaded personal wake-word engine into InputGate"
+                                );
+                                gate.reload_engine(Box::new(engine));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    path = ?new_path,
+                                    error = %e,
+                                    "Failed to load new wake-word engine for hot-reload"
+                                );
+                            }
+                        }
+                    }
+
+                    recorder_for_mic.feed_pcm(&chunk);
+
                     let now = Instant::now();
                     if diagnostics {
                         diagnostic_chunks += 1;

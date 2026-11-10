@@ -228,6 +228,180 @@
     }
     .btn-apply-voice:active { background: #388bfd; }
 
+    /* Wake-Word Wizard */
+    .ww-box {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .ww-intro {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .ww-badge {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+      background: rgba(88, 166, 255, 0.12);
+      padding: 4px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(88, 166, 255, 0.3);
+    }
+    .ww-wizard {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: rgba(13, 17, 23, 0.7);
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid var(--card-border);
+    }
+    .ww-input-row {
+      display: flex;
+      gap: 8px;
+    }
+    .ww-input {
+      flex: 1;
+      padding: 10px 12px;
+      background: #0d1117;
+      border: 1px solid var(--card-border);
+      color: #fff;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+    }
+    .ww-input:focus { border-color: var(--accent); }
+    .ww-phase-box {
+      background: linear-gradient(135deg, rgba(88, 166, 255, 0.08), rgba(137, 87, 229, 0.08));
+      border: 1px solid rgba(88, 166, 255, 0.25);
+      border-radius: 10px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .ww-phase-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .ww-phase-desc {
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.4;
+    }
+    .ww-pulse-bar {
+      height: 6px;
+      background: #21262d;
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    .ww-pulse-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #38bdf8, #818cf8);
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+    .ww-pulse-fill.animating {
+      width: 100% !important;
+      animation: pulseAnim 1.5s infinite ease-in-out;
+    }
+    @keyframes pulseAnim {
+      0% { opacity: 0.3; transform: scaleX(0.2); }
+      50% { opacity: 1; transform: scaleX(0.9); }
+      100% { opacity: 0.3; transform: scaleX(0.2); }
+    }
+    .ww-rec-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .btn-rec-hw {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, #1f6feb, #238636);
+      border: none;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      box-shadow: 0 4px 12px rgba(35, 134, 54, 0.3);
+      transition: opacity 0.2s, transform 0.1s;
+    }
+    .btn-rec-hw:active { transform: scale(0.98); }
+    .btn-rec-phone {
+      width: 100%;
+      padding: 10px;
+      background: #21262d;
+      border: 1px solid var(--card-border);
+      color: #e6edf3;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .btn-rec-phone:active { background: #30363d; }
+    .ww-samples-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .ww-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(33, 38, 45, 0.9);
+      border: 1px solid rgba(48, 54, 61, 0.7);
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .ww-chip-del {
+      color: #f85149;
+      cursor: pointer;
+      font-weight: bold;
+      padding: 0 2px;
+    }
+    .btn-compile {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, #8957e5, #1f6feb);
+      border: none;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: opacity 0.2s;
+    }
+    .btn-compile:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
     /* LED Palette */
     .led-row {
       display: flex;
@@ -466,6 +640,72 @@
     </div>
   </div>
 
+  <!-- Wake-Word Custom Enrollment -->
+  <div class="card" id="card-wakeword">
+    <div class="card-title">
+      <span>Слово вызова (Wake-Word)</span>
+      <span id="current-ww-badge" class="ww-badge">Штучка</span>
+    </div>
+    <div class="ww-box">
+      <!-- State 1: Idle View -->
+      <div id="ww-view-idle">
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+          Акустическая модель распознавания ключевого слова на устройстве. Вы можете обучить колонку собственному слову вызова с персональным тембром голоса и мгновенно применить его без перезагрузки.
+        </p>
+        <button class="btn-rec-hw" onclick="startWakewordWizard()">
+          <span>🎯 Обучить новое слово вызова</span>
+        </button>
+      </div>
+
+      <!-- State 2: Active Wizard -->
+      <div id="ww-view-wizard" class="ww-wizard" style="display: none;">
+        <div class="ww-input-row">
+          <input type="text" id="ww-name-input" class="ww-input" placeholder="Имя слова (например: Штучка, Джарвис)" value="Штучка">
+          <button class="btn-icon" style="flex: 0 0 auto; padding: 0 12px;" onclick="resetWakewordSession()">Сброс</button>
+        </div>
+
+        <div class="ww-phase-box">
+          <div class="ww-phase-header">
+            <span id="ww-phase-title">Фаза 1: Ближняя зона</span>
+            <span id="ww-step-counter">Шаг 1 из 25</span>
+          </div>
+          <div class="ww-phase-desc" id="ww-phase-desc">
+            Отойдите на 0.5–1 метр. Произнесите слово спокойным ровным голосом.
+          </div>
+          <div class="ww-pulse-bar">
+            <div id="ww-pulse-indicator" class="ww-pulse-fill"></div>
+          </div>
+        </div>
+
+        <div class="ww-rec-actions">
+          <button id="btn-rec-hw" class="btn-rec-hw" onclick="recordWakewordHardware()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+            <span>Записать через микрофон колонки</span>
+          </button>
+          <button id="btn-rec-phone" class="btn-rec-phone" onclick="recordWakewordPhone()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M17 1.01L7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM17 19H7V5h10v14z"/></svg>
+            <span>Записать через микрофон телефона</span>
+          </button>
+        </div>
+
+        <div id="ww-samples-container" style="display: none;">
+          <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; display: flex; justify-content: space-between;">
+            <span>Записанные сэмплы (<span id="ww-samples-count">0</span>):</span>
+            <span id="ww-compile-hint" style="color: var(--warning);">Минимум 3 для компиляции</span>
+          </div>
+          <div id="ww-samples-list" class="ww-samples-wrap"></div>
+        </div>
+
+        <div style="display: flex; gap: 8px; margin-top: 4px;">
+          <button id="btn-ww-compile" class="btn-compile" disabled onclick="compileWakewordModel()">
+            <span>🚀 Скомпилировать и активировать</span>
+          </button>
+          <button class="sp-btn" style="flex: 0 0 auto;" onclick="closeWakewordWizard()">✕</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- LED Ring Color Control -->
   <div class="card">
     <div class="card-title">
@@ -696,6 +936,11 @@
       if (data.voice) {
         document.getElementById("current-voice-badge").innerText = data.voice;
         selectVoice(data.voice);
+      }
+
+      // Wake-Word
+      if (data.wakeword && data.wakeword.name) {
+        document.getElementById("current-ww-badge").innerText = data.wakeword.name;
       }
 
       // Spotify
