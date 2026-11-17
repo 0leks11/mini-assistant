@@ -1144,8 +1144,8 @@ async fn main() -> Result<()> {
                 let followup_timeout_secs = std::env::var("MINI_FOLLOWUP_TIMEOUT_SECS")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| (1..=60).contains(v))
-                    .unwrap_or(5);
+                    .filter(|v| (0..=60).contains(v))
+                    .unwrap_or(0);
                 let mut tts_echo_until = Instant::now() + Duration::from_secs(1);
                 let mut utterance_started = Instant::now();
                 let mut last_turn_seen: Option<u64> = None;
@@ -1272,13 +1272,16 @@ async fn main() -> Result<()> {
                                 );
                                 followup_until = now;
                                 gate.set_manual_armed(false);
-                            } else {
+                            } else if followup_timeout_secs > 0 {
                                 followup_until = now + Duration::from_secs(followup_timeout_secs);
                                 info!(
                                     finished_turn = finished_id,
                                     timeout_secs = followup_timeout_secs,
                                     "Conversational follow-up window opened: listening for continuation without wakeword"
                                 );
+                            } else {
+                                followup_until = now;
+                                gate.set_manual_armed(false);
                             }
                         } else {
                             // Hold finished_id until assistant's own voice finishes playing

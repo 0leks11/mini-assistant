@@ -869,7 +869,10 @@
     setTimeout(() => t.classList.remove("show"), 2500);
   }
 
+  let voiceDirty = false;
+
   function switchProvider(prov) {
+    voiceDirty = true;
     selectedProvider = prov;
     const isGemini = prov === "gemini";
     document.getElementById("tab-gemini").classList.toggle("active", isGemini);
@@ -884,10 +887,11 @@
     } else if (!isGemini && !openaiVoices.some(v => v.toLowerCase() === selectedVoice.toLowerCase())) {
       selectedVoice = "alloy";
     }
-    selectVoice(selectedVoice);
+    selectVoice(selectedVoice, true);
   }
 
-  function selectVoice(name) {
+  function selectVoice(name, fromServer = false) {
+    if (!fromServer) voiceDirty = true;
     selectedVoice = name;
     document.querySelectorAll(".voice-chip").forEach(el => {
       el.classList.toggle("active", el.dataset.voice.toLowerCase() === name.toLowerCase());
@@ -907,6 +911,11 @@
         body: JSON.stringify({ provider: selectedProvider, voice: selectedVoice })
       });
       const data = await res.json();
+      if (!res.ok || data.status === "error") {
+        showToast("Ошибка: " + (data.message || "Не удалось сохранить"));
+        return;
+      }
+      voiceDirty = false;
       showToast(data.message || "Голосовая модель успешно обновлена!");
       const provLabel = selectedProvider === "openai" ? "OpenAI" : "Gemini";
       document.getElementById("current-voice-badge").innerText = `${provLabel} (${selectedVoice})`;
@@ -1022,16 +1031,18 @@
       }
 
       // Voice & Provider
-      if (data.provider) {
-        selectedProvider = data.provider.toLowerCase();
-        const isGemini = selectedProvider === "gemini";
-        document.getElementById("tab-gemini").classList.toggle("active", isGemini);
-        document.getElementById("tab-openai").classList.toggle("active", !isGemini);
-        document.getElementById("grid-gemini").style.display = isGemini ? "grid" : "none";
-        document.getElementById("grid-openai").style.display = isGemini ? "none" : "grid";
-      }
-      if (data.voice) {
-        selectVoice(data.voice);
+      if (!voiceDirty) {
+        if (data.provider) {
+          selectedProvider = data.provider.toLowerCase();
+          const isGemini = selectedProvider === "gemini";
+          document.getElementById("tab-gemini").classList.toggle("active", isGemini);
+          document.getElementById("tab-openai").classList.toggle("active", !isGemini);
+          document.getElementById("grid-gemini").style.display = isGemini ? "grid" : "none";
+          document.getElementById("grid-openai").style.display = isGemini ? "none" : "grid";
+        }
+        if (data.voice) {
+          selectVoice(data.voice, true);
+        }
       }
 
       // Wake-Word

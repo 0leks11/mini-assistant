@@ -460,6 +460,16 @@ impl ControlCenterServer {
 
         let matched_voice = match target_provider.as_str() {
             "openai" => {
+                let has_openai_key = std::env::var("OPENAI_API_KEY")
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
+                if !has_openai_key {
+                    let err = serde_json::json!({
+                        "status": "error",
+                        "message": "Для использования OpenAI необходимо указать OPENAI_API_KEY в файле .env на устройстве"
+                    });
+                    return self.send_json_status(stream, "400 Bad Request", &err).await;
+                }
                 if !valid_openai_voices
                     .iter()
                     .any(|v| v.eq_ignore_ascii_case(&target_voice))
@@ -1095,8 +1105,25 @@ impl ControlCenterServer {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn set_led_hardware(color: &str) {
-    let (r, g, b) = match color {
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct I2cMessage {
+        address: u16,
+        flags: u16,
+        length: u16,
+        buffer: *mut u8,
+    }
+
+    #[repr(C)]
+    struct I2cRequest {
+        messages: *mut I2cMessage,
+        count: u32,
+    }
+
+    let (r, g, b) = match color.to_ascii_lowercase().as_str() {
         "azure" | "blue" => (0x00, 0xa0, 0xff),
         "purple" => (0x80, 0x00, 0xff),
         "emerald" | "green" => (0x00, 0xff, 0x60),
@@ -1106,39 +1133,98 @@ pub fn set_led_hardware(color: &str) {
         _ => (0x00, 0xa0, 0xff),
     };
 
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/i2c-0")
+    else {
+        fallback_i2cset_led(r, g, b);
+        return;
+    };
+
+    let fd = file.as_raw_fd();
+    let write_reg = |reg: u8, data: &[u8]| -> bool {
+        let mut bytes = Vec::with_capacity(data.len() + 1);
+        bytes.push(reg);
+        bytes.extend_from_slice(data);
+        let mut msg = I2cMessage {
+            address: 0x3c,
+            flags: 0,
+            length: bytes.len() as u16,
+            buffer: bytes.as_mut_ptr(),
+        };
+        let mut req = I2cRequest {
+            messages: &mut msg,
+            count: 1,
+        };
+        unsafe { libc::ioctl(fd, 0x0707 /* I2C_RDWR */, &mut req) >= 0 }
+    };
+
     if r == 0 && g == 0 && b == 0 {
-        let _ = std::process::Command::new("i2cset")
+        write_reg(0x00, &[0x00]);
+        return;
+    }
+
+    // 1. Enable chip
+    write_reg(0x00, &[0x01]);
+    // 2. Enable channels (0x26..=0x37 -> 0x03)
+    write_reg(0x26, &[0x03; 18]);
+    // 3. Set PWM for 6 RGB LEDs (18 channels, BGR order on Station Mini 1)
+    let mut frame = [0u8; 18];
+    for i in 0..6 {
+        frame[i * 3] = b;     // Blue
+        frame[i * 3 + 1] = g; // Green
+        frame[i * 3 + 2] = r; // Red
+    }
+    write_reg(0x01, &frame);
+    // 4. Latch update register (0x25 -> 0xaa)
+    write_reg(0x25, &[0xaa]);
+}
+
+#[cfg(target_os = "linux")]
+fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
+    let bin = if std::path::Path::new("/usr/sbin/i2cset").exists() {
+        "/usr/sbin/i2cset"
+    } else {
+        "i2cset"
+    };
+
+    if r == 0 && g == 0 && b == 0 {
+        let _ = std::process::Command::new(bin)
             .args(["-y", "0", "0x3c", "0x00", "0x00"])
             .status();
         return;
     }
 
-    let _ = std::process::Command::new("i2cset")
+    let _ = std::process::Command::new(bin)
         .args(["-y", "0", "0x3c", "0x00", "0x01"])
         .status();
-    for reg in ["0x13", "0x14", "0x15"] {
-        let _ = std::process::Command::new("i2cset")
-            .args(["-y", "0", "0x3c", reg, "0xff"])
+
+    for reg in 0x26..=0x37 {
+        let _ = std::process::Command::new(bin)
+            .args(["-y", "0", "0x3c", &format!("0x{:02x}", reg), "0x03"])
             .status();
     }
-    for i in 0..12 {
-        let r_reg = format!("0x{:02x}", 1 + i * 3);
-        let g_reg = format!("0x{:02x}", 2 + i * 3);
-        let b_reg = format!("0x{:02x}", 3 + i * 3);
-        let _ = std::process::Command::new("i2cset")
-            .args(["-y", "0", "0x3c", &r_reg, &format!("0x{:02x}", r)])
+
+    for i in 0..6 {
+        let _ = std::process::Command::new(bin)
+            .args(["-y", "0", "0x3c", &format!("0x{:02x}", 1 + i * 3), &format!("0x{:02x}", b)])
             .status();
-        let _ = std::process::Command::new("i2cset")
-            .args(["-y", "0", "0x3c", &g_reg, &format!("0x{:02x}", g)])
+        let _ = std::process::Command::new(bin)
+            .args(["-y", "0", "0x3c", &format!("0x{:02x}", 2 + i * 3), &format!("0x{:02x}", g)])
             .status();
-        let _ = std::process::Command::new("i2cset")
-            .args(["-y", "0", "0x3c", &b_reg, &format!("0x{:02x}", b)])
+        let _ = std::process::Command::new(bin)
+            .args(["-y", "0", "0x3c", &format!("0x{:02x}", 3 + i * 3), &format!("0x{:02x}", r)])
             .status();
     }
-    let _ = std::process::Command::new("i2cset")
-        .args(["-y", "0", "0x3c", "0x16", "0x00"])
+
+    let _ = std::process::Command::new(bin)
+        .args(["-y", "0", "0x3c", "0x25", "0xaa"])
         .status();
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_led_hardware(_color: &str) {}
 
 pub fn update_config_voice_and_provider(
     config_path: &Path,
