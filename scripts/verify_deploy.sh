@@ -117,7 +117,9 @@ grep -q "setupComplete confirmed" <<< "$LOG_TAIL"; check "Gemini Live setupCompl
 grep -q "spotify_tools: true" <<< "$LOG_TAIL"; check "spotify tools registered" $?
 grep -q "volume_tools: true" <<< "$LOG_TAIL"; check "volume tools registered" $?
 grep -q "VL53L0 proximity gesture volume reader active" <<< "$LOG_TAIL"; check "VL53 reader active" $?
-grep -q "voice: Callirrhoe" <<< "$LOG_TAIL"; check "voice Callirrhoe" $?
+EXPECTED_VOICE="$(REMOTE "grep -E '^\s*voice\s*=' $MINI_DEPLOY_DIR/config.toml 2>/dev/null | cut -d'\"' -f2 | tr -d ' ' || echo Callirrhoe")"
+[ -z "$EXPECTED_VOICE" ] && EXPECTED_VOICE="Callirrhoe"
+grep -q "voice: $EXPECTED_VOICE" <<< "$LOG_TAIL"; check "voice $EXPECTED_VOICE" $?
 
 # 7. No crash loop (filter out intentional SIGTERM exit 143 during service restarts)
 CRASHES="$(REMOTE "tail -n 500 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null" | grep -v 'code 143' | grep -v 'code 0' | grep -c 'Daemon exited with code')"
