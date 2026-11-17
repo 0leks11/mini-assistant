@@ -497,11 +497,13 @@ impl ControlCenterServer {
             }
         };
 
-        if let Some(ref path) = self.config_path {
+        let config_path = self.resolve_config_path();
+        if let Some(ref path) = config_path {
             update_config_voice_and_provider(path, Some(&target_provider), Some(&matched_voice))?;
             info!(
                 provider = %target_provider,
                 voice = %matched_voice,
+                path = %path.display(),
                 "Voice & provider setting updated in config.toml"
             );
 
@@ -581,9 +583,22 @@ impl ControlCenterServer {
         Ok(())
     }
 
-    fn read_current_voice_and_provider(&self) -> (String, String) {
+    fn resolve_config_path(&self) -> Option<std::path::PathBuf> {
         if let Some(ref path) = self.config_path {
-            if let Ok(content) = std::fs::read_to_string(path) {
+            return Some(path.clone());
+        }
+        if std::path::Path::new("config.toml").exists() {
+            Some(std::path::PathBuf::from("config.toml"))
+        } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists() {
+            Some(std::path::PathBuf::from("/data/opt/mini-assistant/config.toml"))
+        } else {
+            None
+        }
+    }
+
+    fn read_current_voice_and_provider(&self) -> (String, String) {
+        if let Some(path) = self.resolve_config_path() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
                 let mut provider = "gemini".to_string();
                 let mut voice = String::new();
                 let mut in_assistant = false;
@@ -1165,19 +1180,32 @@ pub fn set_led_hardware(color: &str) {
         return;
     }
 
-    // 1. Enable chip
+    // 1. Enable chip (0x00 -> 0x01)
     write_reg(0x00, &[0x01]);
-    // 2. Enable channels (0x26..=0x37 -> 0x03)
-    write_reg(0x26, &[0x03; 18]);
-    // 3. Set PWM for 6 RGB LEDs (18 channels, BGR order on Station Mini 1)
-    let mut frame = [0u8; 18];
-    for i in 0..6 {
+    // 2. Global Current Control (0x4a -> 0xff: full current)
+    write_reg(0x4a, &[0xff]);
+    // 3. PWM frequency (0x4b -> 0x01: 22 kHz high-frequency clock)
+    write_reg(0x4b, &[0x01]);
+    // 4. Enable all 36 channels (0x26..=0x49 -> 0x01: enable with I_max)
+    let mode_block = [0x01u8; 36];
+    write_reg(0x26, &mode_block);
+    for reg in 0x26..=0x49 {
+        write_reg(reg, &[0x01]);
+    }
+    // 5. Set PWM for 12 RGB LEDs (36 channels, BGR order on Station Mini 1)
+    let mut frame = [0u8; 36];
+    for i in 0..12 {
         frame[i * 3] = b;     // Blue
         frame[i * 3 + 1] = g; // Green
         frame[i * 3 + 2] = r; // Red
     }
     write_reg(0x01, &frame);
-    // 4. Latch update register (0x25 -> 0xaa)
+    for i in 0..12 {
+        write_reg(1 + i * 3, &[b]);
+        write_reg(2 + i * 3, &[g]);
+        write_reg(3 + i * 3, &[r]);
+    }
+    // 6. Latch update register (0x25 -> 0xaa)
     write_reg(0x25, &[0xaa]);
 }
 
@@ -1199,14 +1227,20 @@ fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
     let _ = std::process::Command::new(bin)
         .args(["-y", "0", "0x3c", "0x00", "0x01"])
         .status();
+    let _ = std::process::Command::new(bin)
+        .args(["-y", "0", "0x3c", "0x4a", "0xff"])
+        .status();
+    let _ = std::process::Command::new(bin)
+        .args(["-y", "0", "0x3c", "0x4b", "0x01"])
+        .status();
 
-    for reg in 0x26..=0x37 {
+    for reg in 0x26..=0x49 {
         let _ = std::process::Command::new(bin)
-            .args(["-y", "0", "0x3c", &format!("0x{:02x}", reg), "0x03"])
+            .args(["-y", "0", "0x3c", &format!("0x{:02x}", reg), "0x01"])
             .status();
     }
 
-    for i in 0..6 {
+    for i in 0..12 {
         let _ = std::process::Command::new(bin)
             .args(["-y", "0", "0x3c", &format!("0x{:02x}", 1 + i * 3), &format!("0x{:02x}", b)])
             .status();

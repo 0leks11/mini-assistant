@@ -519,7 +519,18 @@ async fn main() -> Result<()> {
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
             let srv_redirect_uri = format!("http://10.77.0.111:{}/spotify/callback", web_port);
-            let cfg_path_buf = config_path.as_deref().map(std::path::PathBuf::from);
+            let cfg_path_buf = config_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    if std::path::Path::new("config.toml").exists() {
+                        Some(std::path::PathBuf::from("config.toml"))
+                    } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists() {
+                        Some(std::path::PathBuf::from("/data/opt/mini-assistant/config.toml"))
+                    } else {
+                        None
+                    }
+                });
             let web_server = web::ControlCenterServer::new(
                 cfg_path_buf,
                 srv_client_id,
@@ -1752,10 +1763,11 @@ fn turn_off_boot_led() {
 
 /// Set hardware LED activity indicator (sn3236 @ 0x3c)
 fn set_led_active(active: bool) {
-    let val = if active { "0x01" } else { "0x00" };
-    let _ = std::process::Command::new("i2cset")
-        .args(["-y", "0", "0x3c", "0x00", val])
-        .status();
+    if active {
+        web::set_led_hardware("azure");
+    } else {
+        web::set_led_hardware("off");
+    }
 }
 
 #[cfg(test)]

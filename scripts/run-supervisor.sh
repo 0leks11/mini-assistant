@@ -104,7 +104,11 @@ while true; do
         wait_for_ntp
     fi
 
-    "$DAEMON" >> "$LOGFILE" 2>&1
+    if [ -f "$DIR/config.toml" ]; then
+        "$DAEMON" -c "$DIR/config.toml" >> "$LOGFILE" 2>&1
+    else
+        "$DAEMON" >> "$LOGFILE" 2>&1
+    fi
     EXIT_CODE=$?
     echo "[$(date -Iseconds 2>/dev/null || date)] Daemon exited with code $EXIT_CODE; restarting in 2s..." >> "$LOGFILE"
     sleep 2
