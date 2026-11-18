@@ -643,7 +643,13 @@ async fn main() -> Result<()> {
 
             // 5. Build dynamic system instruction with HA device list and weather capabilities
             let mut system_instruction = format!(
-        "Ты — персональный голосовой ассистент устройства Мини по имени «{name}» (также откликаешься на «Штучка» или «Штучка-Интеллект»).\n\n\
+        "Ты — персональный голосовой ассистент устройства GPT Mini по имени «{name}» (также откликаешься на «Штучка» или «Штучка-Интеллект»).\n\n\
+        СТРОЖАЙШИЙ ЯЗЫКОВОЙ РЕЖИМ (КАТЕГОРИЧЕСКИЙ ПРИОРИТЕТ №1):\n\
+        Твой единственный рабочий язык — РУССКИЙ. Всегда и при любых обстоятельствах отвечай ТОЛЬКО И ИСКЛЮЧИТЕЛЬНО НА РУССКОМ ЯЗЫКЕ!\n\
+        КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать на испанском, английском или любых других языках, кроме русского.\n\
+        Никогда не произноси иностранные фразы (например «Revisaré qué está pasando», «¿En qué puedo ayudarte?», «I will check»). Только чистый русский язык!\n\n\
+        ПОВЕДЕНИЕ В ТИШИНЕ И ЗАЩИТА ОТ ШУМА:\n\
+        Если во входящем звуке слышна только тишина, комнатный шум, шорох, вздох, щелчок или неразборчивый фон без связной человеческой речи — КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО что-либо отвечать или генерировать речь! Ты ОБЯЗАНА ПОЛНОСТЬЮ МОЛЧАТЬ (выдавать пустой ответ без единого звука).\n\n\
         ХАРАКТЕР И ГОЛОС:\n\
         Твой характер — предельно спокойный, невозмутимый, расслабленный, лаконичный и точный в фактах. \
         Говори размеренно, неторопливо, без лишней суеты, без восклицаний и наигранного энтузиазма. \
@@ -1078,8 +1084,8 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(30.0)
-                .clamp(15.0, 38.0);
+                .unwrap_or(55.0)
+                .clamp(20.0, 100.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1088,8 +1094,8 @@ async fn main() -> Result<()> {
             let initial_silence_timeout_ms = std::env::var("MINI_INITIAL_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| (1000..=15000).contains(v))
-                .unwrap_or(5000);
+                .filter(|v| (500..=15000).contains(v))
+                .unwrap_or(1800);
             let mic_gain = std::env::var("MINI_MIC_GAIN")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -1483,8 +1489,12 @@ async fn main() -> Result<()> {
                                     .await;
                             } else {
                                 // If gate closed without speech (initial silence timeout expired)
-                                // or cloud is not ready, release authorization so ducker restores immediately!
-                                mic_authorization.finish(id);
+                                // cancel authorization immediately so any hallucinated response from Gemini is discarded!
+                                mic_authorization.cancel();
+                                info!(
+                                    turn_id = id,
+                                    "Turn closed without detected speech: canceled cloud authorization"
+                                );
                             }
                             active_turn = None;
                         }

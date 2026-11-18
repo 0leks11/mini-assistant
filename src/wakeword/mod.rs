@@ -212,7 +212,7 @@ impl InputGate {
             if triggered {
                 self.is_active = true;
                 self.has_spoken = false;
-                self.had_spoken_last_turn = true;
+                self.had_spoken_last_turn = false;
                 self.silence_bytes = 0;
                 let outgoing: Vec<Vec<u8>> = self.pre_roll_buffer.drain(..).collect();
                 self.buffered_bytes = 0;
@@ -576,6 +576,50 @@ mod tests {
         assert!(
             gate.has_spoken(),
             "Gate must retain has_spoken=true after utterance ends"
+        );
+    }
+
+    #[test]
+    fn test_input_gate_initial_silence_without_speech_has_spoken_is_false() {
+        struct TriggerOnce(bool);
+        impl WakeWordEngine for TriggerOnce {
+            fn process(&mut self, _: &[u8]) -> bool {
+                let val = self.0;
+                self.0 = false;
+                val
+            }
+            fn reset(&mut self) {
+                self.0 = false;
+            }
+        }
+
+        let mut gate = InputGate::with_activation_and_initial_timeout(
+            Box::new(TriggerOnce(true)),
+            10.0,
+            100,
+            300,
+            200,
+            16000,
+        );
+
+        let silence_chunk = vec![0u8; 320];
+
+        let out = gate.process_frame(silence_chunk.clone());
+        assert!(!out.is_empty());
+        assert!(gate.is_active());
+        assert!(!gate.has_spoken());
+
+        for _ in 0..30 {
+            let _ = gate.process_frame(silence_chunk.clone());
+        }
+
+        assert!(
+            !gate.is_active(),
+            "Gate must close after initial silence timeout"
+        );
+        assert!(
+            !gate.has_spoken(),
+            "Gate must NOT report has_spoken if user never uttered speech"
         );
     }
 
