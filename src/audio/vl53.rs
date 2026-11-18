@@ -197,6 +197,8 @@ pub fn spawn_vl53_volume_task_with_indicators(
         let mut session = GestureSession::new(crate::audio::volume::current_level());
         let mut last_event_dist: u32 = 0;
         let mut was_in_gesture = false;
+        let mut last_gesture_activity = std::time::Instant::now();
+        let mut active_interaction = false;
 
         loop {
             // Wait up to 400ms for new proximity event; if timed out while in gesture, exit gesture cleanly
@@ -225,6 +227,8 @@ pub fn spawn_vl53_volume_task_with_indicators(
                                     // Step change detected! Update volume and trigger acoustic "клац"
                                     crate::audio::volume::set_volume_level(new_level);
                                     crate::audio::volume::trigger_volume_click();
+                                    active_interaction = true;
+                                    last_gesture_activity = std::time::Instant::now();
                                     info!(
                                         new_level,
                                         dist_mm = last_event_dist,
@@ -242,18 +246,28 @@ pub fn spawn_vl53_volume_task_with_indicators(
                                     }
                                 }
 
-                                // Update visual indicator state
-                                if session.in_gesture != was_in_gesture {
-                                    was_in_gesture = session.in_gesture;
-                                    gesture_active.store(session.in_gesture, std::sync::atomic::Ordering::SeqCst);
-                                    if session.in_gesture {
+                                // Update visual indicator state: active only during real volume gesture interaction
+                                if active_interaction {
+                                    if last_gesture_activity.elapsed() >= std::time::Duration::from_millis(1000)
+                                        || last_event_dist > IDLE_THRESHOLD_MM
+                                    {
+                                        active_interaction = false;
+                                        session.in_gesture = false;
+                                        session.anchor_mm = last_event_dist;
+                                        if was_in_gesture {
+                                            was_in_gesture = false;
+                                            gesture_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                                            crate::web::set_led_hardware("off");
+                                            debug!("VL53L0 gesture volume interaction finished; LED turned off");
+                                        }
+                                    } else if !was_in_gesture {
+                                        was_in_gesture = true;
+                                        gesture_active.store(true, std::sync::atomic::Ordering::SeqCst);
                                         let cur_color = led_color
                                             .try_read()
                                             .map(|c| c.clone())
                                             .unwrap_or_else(|_| "azure".to_string());
                                         crate::web::set_led_hardware(&cur_color);
-                                    } else {
-                                        crate::web::set_led_hardware("off");
                                     }
                                 }
                             }
@@ -275,7 +289,8 @@ pub fn spawn_vl53_volume_task_with_indicators(
                 }
                 Err(_) => {
                     // 400ms timeout expired with no events: hand was swiftly removed
-                    if was_in_gesture {
+                    if was_in_gesture || active_interaction {
+                        active_interaction = false;
                         session.in_gesture = false;
                         session.anchor_mm = 0;
                         was_in_gesture = false;
