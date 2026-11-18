@@ -1084,7 +1084,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(55.0)
+                .unwrap_or(45.0)
                 .clamp(20.0, 100.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()

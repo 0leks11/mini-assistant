@@ -212,7 +212,7 @@ impl InputGate {
             if triggered {
                 self.is_active = true;
                 self.has_spoken = false;
-                self.had_spoken_last_turn = false;
+                self.had_spoken_last_turn = true;
                 self.silence_bytes = 0;
                 let outgoing: Vec<Vec<u8>> = self.pre_roll_buffer.drain(..).collect();
                 self.buffered_bytes = 0;
@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_input_gate_initial_silence_without_speech_has_spoken_is_false() {
+    fn test_input_gate_initial_silence_after_wakeword_retains_has_spoken() {
         struct TriggerOnce(bool);
         impl WakeWordEngine for TriggerOnce {
             fn process(&mut self, _: &[u8]) -> bool {
@@ -607,7 +607,7 @@ mod tests {
         let out = gate.process_frame(silence_chunk.clone());
         assert!(!out.is_empty());
         assert!(gate.is_active());
-        assert!(!gate.has_spoken());
+        assert!(gate.has_spoken());
 
         for _ in 0..30 {
             let _ = gate.process_frame(silence_chunk.clone());
@@ -618,8 +618,8 @@ mod tests {
             "Gate must close after initial silence timeout"
         );
         assert!(
-            !gate.has_spoken(),
-            "Gate must NOT report has_spoken if user never uttered speech"
+            gate.has_spoken(),
+            "Gate must report has_spoken=true so wake-word greeting is processed by cloud"
         );
     }
 
