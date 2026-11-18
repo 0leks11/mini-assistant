@@ -368,6 +368,7 @@ impl GeminiLiveClient {
 
                 match session_res {
                     Ok(()) => {
+                        backoff_secs = 1;
                         info!("Gemini Live session closed normally, reconnecting in {backoff_secs}s...");
                     }
                     Err(e) => {

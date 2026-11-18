@@ -64,7 +64,7 @@ impl WakeWordEngine for SimpleVadEngine {
         }
 
         // Dynamic threshold must clear acoustic noise floor while sensitive to far-field voice (~2.4m)
-        let dynamic_threshold = (self.noise_floor_rms * 1.15 + 12.0).max(self.base_threshold_rms);
+        let dynamic_threshold = (self.noise_floor_rms * 1.15 + 10.0).max(self.base_threshold_rms);
 
         if rms > dynamic_threshold {
             if self.is_speaking {
@@ -212,7 +212,7 @@ impl InputGate {
             if triggered {
                 self.is_active = true;
                 self.has_spoken = false;
-                self.had_spoken_last_turn = false;
+                self.had_spoken_last_turn = true;
                 self.silence_bytes = 0;
                 let outgoing: Vec<Vec<u8>> = self.pre_roll_buffer.drain(..).collect();
                 self.buffered_bytes = 0;

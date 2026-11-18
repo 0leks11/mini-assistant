@@ -1168,7 +1168,7 @@ pub fn set_led_hardware(color: &str) {
 
     let (r, g, b) = match color.to_ascii_lowercase().as_str() {
         "azure" | "blue" => (0x00, 0xa0, 0xff),
-        "purple" => (0x80, 0x00, 0xff),
+        "purple" => (0xff, 0x00, 0x80),
         "emerald" | "green" => (0x00, 0xff, 0x60),
         "amber" | "yellow" => (0xff, 0xa0, 0x00),
         "white" => (0xff, 0xff, 0xff),
@@ -1201,9 +1201,14 @@ pub fn set_led_hardware(color: &str) {
     };
 
     if r == 0 && g == 0 && b == 0 {
-        if !write_reg(0x00, 0x00) {
-            fallback_i2cset_led(r, g, b);
+        for reg in 0x01..=0x24 {
+            let _ = write_reg(reg, 0x00);
         }
+        let _ = write_reg(0x25, 0xaa);
+        if !write_reg(0x00, 0x00) {
+            fallback_i2cset_led(0, 0, 0);
+        }
+        debug!("Hardware LED ring turned OFF (PWM zeroed, latched, shutdown)");
         return;
     }
 
@@ -1241,6 +1246,14 @@ fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
     };
 
     if r == 0 && g == 0 && b == 0 {
+        for reg in 0x01..=0x24 {
+            let _ = std::process::Command::new(bin)
+                .args(["-y", "0", "0x3c", &format!("0x{:02x}", reg), "0x00"])
+                .status();
+        }
+        let _ = std::process::Command::new(bin)
+            .args(["-y", "0", "0x3c", "0x25", "0xaa"])
+            .status();
         let _ = std::process::Command::new(bin)
             .args(["-y", "0", "0x3c", "0x00", "0x00"])
             .status();

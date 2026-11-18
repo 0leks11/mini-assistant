@@ -316,6 +316,11 @@ async fn main() -> Result<()> {
             info!("Assistant Name: {}", config.assistant.name);
             info!("Audio Playback: {}", config.audio.playback_device);
 
+            if !dry_run {
+                turn_off_boot_led();
+                set_led_active(false, &config.assistant.led_color);
+            }
+
             let alarm_cfg = config.alarms.clone().unwrap_or_default();
             let alarms_enabled = alarm_cfg.enabled && !conversation_only;
             let alarm_tz = alarm_cfg.timezone.clone();
@@ -1073,7 +1078,8 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(35.0);
+                .unwrap_or(30.0)
+                .clamp(15.0, 38.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1400,9 +1406,35 @@ async fn main() -> Result<()> {
                         let ducker_task = ducker_for_mic.clone();
                         let soloist_task = soloist_for_mic.clone();
                         tokio::spawn(async move {
+                            let start = Instant::now();
+                            let response_wait_limit = Duration::from_secs(8);
+                            let mut tts_started = false;
+
                             while lease.is_current(id) {
+                                if speaker.is_playing() {
+                                    tts_started = true;
+                                    break;
+                                }
+                                if start.elapsed() >= response_wait_limit {
+                                    tracing::warn!(
+                                        turn_id = id,
+                                        "Response timeout (8s without cloud speech): releasing ducking & turn lease"
+                                    );
+                                    lease.finish(id);
+                                    break;
+                                }
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
+
+                            if tts_started {
+                                while lease.is_current(id) && speaker.is_playing() {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                // Grace period after speech playback ends
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                lease.finish(id);
+                            }
+
                             speaker.interrupt_if_epoch(expected_epoch);
                             // When user turn ends, restore music volume if it was ducked
                             ducker_task.restore_if_ducked(&soloist_task).await;
@@ -1589,11 +1621,6 @@ async fn main() -> Result<()> {
             if let Err(error) = capture_result {
                 voice_client.stop().await;
                 return Err(error);
-            }
-
-            if !dry_run {
-                turn_off_boot_led();
-                set_led_active(false, &config.assistant.led_color);
             }
 
             // Accepted model packets retain their cancellation epoch through actual drain.
@@ -1785,20 +1812,8 @@ fn validate_system_clock(now_secs: u64) -> Result<()> {
 }
 
 fn turn_off_boot_led() {
-    let res = std::process::Command::new("i2cset")
-        .args(["-y", "0", "0x3c", "0x00", "0x00"])
-        .status();
-    match res {
-        Ok(status) if status.success() => {
-            info!("Hardware boot LED (sn3236 @ 0x3c) turned off successfully");
-        }
-        Ok(status) => {
-            debug!("i2cset exited with non-zero status: {:?}", status);
-        }
-        Err(e) => {
-            debug!("Could not invoke i2cset (normal on non-device host): {}", e);
-        }
-    }
+    web::set_led_hardware("off");
+    info!("Hardware boot LED (sn3236 @ 0x3c) turned off successfully");
 }
 
 /// Set hardware LED activity indicator (sn3236 @ 0x3c)
