@@ -1204,7 +1204,7 @@ pub fn set_led_hardware(color: &str) {
         for reg in 0x01..=0x24 {
             let _ = write_reg(reg, 0x00);
         }
-        let _ = write_reg(0x25, 0xaa);
+        let _ = write_reg(0x25, 0x00);
         if !write_reg(0x00, 0x00) {
             fallback_i2cset_led(0, 0, 0);
         }
@@ -1212,14 +1212,14 @@ pub fn set_led_hardware(color: &str) {
         return;
     }
 
-    // 1. Enable chip (0x00 -> 0x01)
+    // 1. Enable chip (0x00 -> 0x01: normal operation)
     if !write_reg(0x00, 0x01) {
         warn!("write_reg 0x00 failed, using fallback i2cset");
         fallback_i2cset_led(r, g, b);
         return;
     }
-    // 2. Global Current Control (0x4a -> 0xff: full current)
-    write_reg(0x4a, 0xff);
+    // 2. Global Control (0x4a -> 0x00: global enable, 0 = normal operation, 1 = shutdown all)
+    write_reg(0x4a, 0x00);
     // 3. PWM frequency (0x4b -> 0x01: 22 kHz high-frequency clock)
     write_reg(0x4b, 0x01);
     // 4. Enable all 36 channels (0x26..=0x49 -> 0x01: enable with I_max)
@@ -1232,8 +1232,8 @@ pub fn set_led_hardware(color: &str) {
         write_reg(2 + i * 3, g);
         write_reg(3 + i * 3, r);
     }
-    // 6. Latch update register (0x25 -> 0xaa)
-    write_reg(0x25, 0xaa);
+    // 6. Latch update register (0x25 -> 0x00: write 0x00 to latch shadow registers into outputs)
+    write_reg(0x25, 0x00);
     debug!("Updated hardware LED ring to color '{}' (r={:02x}, g={:02x}, b={:02x})", color, r, g, b);
 }
 
@@ -1252,7 +1252,7 @@ fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
                 .status();
         }
         let _ = std::process::Command::new(bin)
-            .args(["-y", "0", "0x3c", "0x25", "0xaa"])
+            .args(["-y", "0", "0x3c", "0x25", "0x00"])
             .status();
         let _ = std::process::Command::new(bin)
             .args(["-y", "0", "0x3c", "0x00", "0x00"])
@@ -1264,7 +1264,7 @@ fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
         .args(["-y", "0", "0x3c", "0x00", "0x01"])
         .status();
     let _ = std::process::Command::new(bin)
-        .args(["-y", "0", "0x3c", "0x4a", "0xff"])
+        .args(["-y", "0", "0x3c", "0x4a", "0x00"])
         .status();
     let _ = std::process::Command::new(bin)
         .args(["-y", "0", "0x3c", "0x4b", "0x01"])
@@ -1289,7 +1289,7 @@ fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
     }
 
     let _ = std::process::Command::new(bin)
-        .args(["-y", "0", "0x3c", "0x25", "0xaa"])
+        .args(["-y", "0", "0x3c", "0x25", "0x00"])
         .status();
 }
 
