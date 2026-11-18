@@ -1118,6 +1118,14 @@
         document.getElementById("current-ww-badge").innerText = data.wakeword.name;
       }
 
+      // LED Color
+      if (data.led_color) {
+        document.querySelectorAll(".led-btn").forEach(b => {
+          const oc = b.getAttribute("onclick") || "";
+          b.classList.toggle("active", oc.includes(`'${data.led_color}'`));
+        });
+      }
+
       // Spotify
       if (data.spotify) {
         if (data.spotify.track) {

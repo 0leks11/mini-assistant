@@ -84,6 +84,17 @@ impl ControlCenterServer {
         self
     }
 
+    pub fn with_initial_led_color(self, color: String) -> Self {
+        if let Ok(mut lock) = self.current_led_color.try_write() {
+            *lock = color;
+        }
+        self
+    }
+
+    pub fn current_led_color(&self) -> Arc<RwLock<String>> {
+        self.current_led_color.clone()
+    }
+
     pub fn with_wakeword_support(
         mut self,
         recorder: Option<HardwareRecorder>,
@@ -539,6 +550,12 @@ impl ControlCenterServer {
         let req: LedReq = serde_json::from_str(body).context("Invalid JSON body")?;
         set_led_hardware(&req.color);
         *self.current_led_color.write().await = req.color.clone();
+
+        if let Some(ref path) = self.config_path {
+            if let Err(e) = update_config_led_color(path, &req.color) {
+                warn!("Failed to persist led_color to config: {}", e);
+            }
+        }
 
         self.send_json(
             stream,
@@ -1149,20 +1166,6 @@ impl ControlCenterServer {
 pub fn set_led_hardware(color: &str) {
     use std::os::fd::AsRawFd;
 
-    #[repr(C)]
-    struct I2cMessage {
-        address: u16,
-        flags: u16,
-        length: u16,
-        buffer: *mut u8,
-    }
-
-    #[repr(C)]
-    struct I2cRequest {
-        messages: *mut I2cMessage,
-        count: u32,
-    }
-
     let (r, g, b) = match color.to_ascii_lowercase().as_str() {
         "azure" | "blue" => (0x00, 0xa0, 0xff),
         "purple" => (0x80, 0x00, 0xff),
@@ -1183,55 +1186,50 @@ pub fn set_led_hardware(color: &str) {
     };
 
     let fd = file.as_raw_fd();
-    let write_reg = |reg: u8, data: &[u8]| -> bool {
-        let mut bytes = Vec::with_capacity(data.len() + 1);
-        bytes.push(reg);
-        bytes.extend_from_slice(data);
-        let mut msg = I2cMessage {
-            address: 0x3c,
-            flags: 0,
-            length: bytes.len() as u16,
-            buffer: bytes.as_mut_ptr(),
-        };
-        let mut req = I2cRequest {
-            messages: &mut msg,
-            count: 1,
-        };
-        unsafe { libc::ioctl(fd, 0x0707 /* I2C_RDWR */, &mut req) >= 0 }
+    unsafe {
+        if libc::ioctl(fd, 0x0703 /* I2C_SLAVE */, 0x3c as libc::c_ulong) < 0 {
+            warn!("ioctl I2C_SLAVE 0x3c failed: {}, using fallback i2cset", std::io::Error::last_os_error());
+            fallback_i2cset_led(r, g, b);
+            return;
+        }
+    }
+
+    let write_reg = |reg: u8, val: u8| -> bool {
+        let buf = [reg, val];
+        let res = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 2) };
+        res == 2
     };
 
     if r == 0 && g == 0 && b == 0 {
-        write_reg(0x00, &[0x00]);
+        if !write_reg(0x00, 0x00) {
+            fallback_i2cset_led(r, g, b);
+        }
         return;
     }
 
     // 1. Enable chip (0x00 -> 0x01)
-    write_reg(0x00, &[0x01]);
+    if !write_reg(0x00, 0x01) {
+        warn!("write_reg 0x00 failed, using fallback i2cset");
+        fallback_i2cset_led(r, g, b);
+        return;
+    }
     // 2. Global Current Control (0x4a -> 0xff: full current)
-    write_reg(0x4a, &[0xff]);
+    write_reg(0x4a, 0xff);
     // 3. PWM frequency (0x4b -> 0x01: 22 kHz high-frequency clock)
-    write_reg(0x4b, &[0x01]);
+    write_reg(0x4b, 0x01);
     // 4. Enable all 36 channels (0x26..=0x49 -> 0x01: enable with I_max)
-    let mode_block = [0x01u8; 36];
-    write_reg(0x26, &mode_block);
     for reg in 0x26..=0x49 {
-        write_reg(reg, &[0x01]);
+        write_reg(reg, 0x01);
     }
     // 5. Set PWM for 12 RGB LEDs (36 channels, BGR order on Station Mini 1)
-    let mut frame = [0u8; 36];
     for i in 0..12 {
-        frame[i * 3] = b;     // Blue
-        frame[i * 3 + 1] = g; // Green
-        frame[i * 3 + 2] = r; // Red
-    }
-    write_reg(0x01, &frame);
-    for i in 0..12 {
-        write_reg(1 + i * 3, &[b]);
-        write_reg(2 + i * 3, &[g]);
-        write_reg(3 + i * 3, &[r]);
+        write_reg(1 + i * 3, b);
+        write_reg(2 + i * 3, g);
+        write_reg(3 + i * 3, r);
     }
     // 6. Latch update register (0x25 -> 0xaa)
-    write_reg(0x25, &[0xaa]);
+    write_reg(0x25, 0xaa);
+    debug!("Updated hardware LED ring to color '{}' (r={:02x}, g={:02x}, b={:02x})", color, r, g, b);
 }
 
 #[cfg(target_os = "linux")]
@@ -1367,6 +1365,54 @@ pub fn update_config_voice_and_provider(
 
 pub fn update_config_voice(config_path: &Path, new_voice: &str) -> Result<()> {
     update_config_voice_and_provider(config_path, None, Some(new_voice))
+}
+
+pub fn update_config_led_color(config_path: &Path, new_color: &str) -> Result<()> {
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let mut updated = Vec::new();
+    let mut in_assistant_section = false;
+    let mut replaced_color = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_assistant_section = trimmed == "[assistant]";
+            updated.push(line.to_string());
+            continue;
+        }
+
+        if in_assistant_section
+            && trimmed.starts_with("led_color")
+            && trimmed.contains('=')
+            && !replaced_color
+        {
+            let indent = line
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>();
+            updated.push(format!("{}led_color = \"{}\"", indent, new_color));
+            replaced_color = true;
+            continue;
+        }
+
+        updated.push(line.to_string());
+    }
+
+    if !replaced_color {
+        let mut final_lines = Vec::new();
+        for line in updated.drain(..) {
+            let is_assistant = line.trim() == "[assistant]";
+            final_lines.push(line);
+            if is_assistant {
+                final_lines.push(format!("led_color = \"{}\"", new_color));
+            }
+        }
+        updated = final_lines;
+    }
+
+    std::fs::write(config_path, updated.join("\n") + "\n")?;
+    Ok(())
 }
 
 pub struct SystemMetrics {
@@ -1557,6 +1603,29 @@ capture_device = "hw:0,2"
         assert!(updated.contains("voice = \"alloy\""));
         assert!(!updated.contains("provider = \"gemini\""));
         assert!(!updated.contains("voice = \"Callirrhoe\""));
+
+        std::fs::remove_file(&cfg_file).unwrap();
+    }
+
+    #[test]
+    fn test_update_config_led_color() {
+        let temp_dir = std::env::temp_dir();
+        let cfg_file = temp_dir.join(format!("test_config_led_{}.toml", uuid::Uuid::new_v4()));
+        let initial_toml = r#"
+[assistant]
+name = "Штучка"
+led_color = "azure"
+
+[audio]
+capture_device = "hw:0,2"
+"#;
+        std::fs::write(&cfg_file, initial_toml).unwrap();
+
+        update_config_led_color(&cfg_file, "purple").unwrap();
+        let updated = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(updated.contains("led_color = \"purple\""));
+        assert!(!updated.contains("led_color = \"azure\""));
+        assert!(updated.contains("capture_device = \"hw:0,2\""));
 
         std::fs::remove_file(&cfg_file).unwrap();
     }

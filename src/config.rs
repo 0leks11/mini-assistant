@@ -39,9 +39,16 @@ pub struct AssistantConfig {
     /// Private, locally enrolled Rustpotter reference; absent means manual activation only.
     #[serde(default)]
     pub wakeword_model: Option<PathBuf>,
+    /// Default top ring LED color ("azure", "purple", "emerald", "amber", "white", "off")
+    #[serde(default = "default_led_color")]
+    pub led_color: String,
     /// Languages to understand: ["ru-RU", "en-US"]
     #[allow(dead_code)]
     pub languages: Vec<String>,
+}
+
+fn default_led_color() -> String {
+    "azure".to_string()
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]

@@ -13,7 +13,8 @@ pub trait WakeWordEngine: Send + Sync {
 
 /// Simple energy-based Voice Activity Detector (VAD) fallback
 pub struct SimpleVadEngine {
-    threshold_rms: f32,
+    base_threshold_rms: f32,
+    noise_floor_rms: f32,
     consecutive_active: usize,
     required_consecutive: usize,
     is_speaking: bool,
@@ -22,7 +23,8 @@ pub struct SimpleVadEngine {
 impl SimpleVadEngine {
     pub fn new(threshold_rms: f32) -> Self {
         Self {
-            threshold_rms,
+            base_threshold_rms: threshold_rms,
+            noise_floor_rms: threshold_rms * 0.5,
             consecutive_active: 0,
             required_consecutive: 3, // ~50ms of audio for onset
             is_speaking: false,
@@ -48,7 +50,24 @@ impl WakeWordEngine for SimpleVadEngine {
 
         let rms = ((sum_sq / sample_count as f64).sqrt()) as f32;
 
-        if rms > self.threshold_rms {
+        // Dynamic noise floor tracking:
+        // When not speaking, rapidly track downward or steadily adapt upward.
+        // When speaking, only track downward so speech doesn't inflate the noise floor.
+        if !self.is_speaking {
+            if rms < self.noise_floor_rms {
+                self.noise_floor_rms = 0.90 * self.noise_floor_rms + 0.10 * rms;
+            } else {
+                self.noise_floor_rms = 0.98 * self.noise_floor_rms + 0.02 * rms;
+            }
+        } else if rms < self.noise_floor_rms {
+            self.noise_floor_rms = 0.90 * self.noise_floor_rms + 0.10 * rms;
+        }
+
+        // Dynamic threshold must clear the acoustic noise floor (e.g. ducked music or fan)
+        // while never falling below base_threshold_rms.
+        let dynamic_threshold = (self.noise_floor_rms * 1.35 + 25.0).max(self.base_threshold_rms);
+
+        if rms > dynamic_threshold {
             if self.is_speaking {
                 return true;
             }
@@ -56,8 +75,8 @@ impl WakeWordEngine for SimpleVadEngine {
             if self.consecutive_active >= self.required_consecutive {
                 self.is_speaking = true;
                 debug!(
-                    "VAD voice detected (RMS: {:.1} > {:.1})",
-                    rms, self.threshold_rms
+                    "VAD voice detected (RMS: {:.1} > dynamic: {:.1}, floor: {:.1})",
+                    rms, dynamic_threshold, self.noise_floor_rms
                 );
                 return true;
             }
@@ -71,6 +90,7 @@ impl WakeWordEngine for SimpleVadEngine {
     fn reset(&mut self) {
         self.consecutive_active = 0;
         self.is_speaking = false;
+        self.noise_floor_rms = self.base_threshold_rms * 0.5;
     }
 }
 
@@ -236,6 +256,11 @@ impl InputGate {
     /// Check if currently in active streaming state
     pub fn is_active(&self) -> bool {
         self.is_active
+    }
+
+    /// Check if any speech has been detected since gate opened
+    pub fn has_spoken(&self) -> bool {
+        self.has_spoken
     }
 
     /// Manually reset gate to inactive (e.g. at end of turn)

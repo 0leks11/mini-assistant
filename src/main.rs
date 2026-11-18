@@ -540,11 +540,13 @@ async fn main() -> Result<()> {
                 music_ducker.clone(),
             )
             .with_token_path(spotify_cfg.token_file.clone())
+            .with_initial_led_color(config.assistant.led_color.clone())
             .with_wakeword_support(
                 Some(hardware_recorder.clone()),
                 Some(tx_reload_wakeword),
                 model_path.clone(),
             );
+            let current_led_color_holder = web_server.current_led_color();
             let web_server = Arc::new(web_server);
             tokio::spawn(async move {
                 let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], web_port));
@@ -1071,12 +1073,12 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|v| (200..=10000).contains(v))
-                .unwrap_or(2500);
+                .unwrap_or(1200);
             let initial_silence_timeout_ms = std::env::var("MINI_INITIAL_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|v| (1000..=15000).contains(v))
-                .unwrap_or(6500);
+                .unwrap_or(5000);
             let mic_gain = std::env::var("MINI_MIC_GAIN")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -1139,6 +1141,7 @@ async fn main() -> Result<()> {
             let ducker_for_mic = music_ducker.clone();
             let voice_active_for_mic = voice_active.clone();
             let recorder_for_mic = hardware_recorder.clone();
+            let led_color_for_mic = current_led_color_holder.clone();
             tokio::spawn(async move {
                 use std::sync::atomic::Ordering;
                 use std::time::{Duration, Instant};
@@ -1157,6 +1160,11 @@ async fn main() -> Result<()> {
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|v| (0..=60).contains(v))
                     .unwrap_or(0);
+                let max_utterance_secs = std::env::var("MINI_MAX_UTTERANCE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| (3..=30).contains(v))
+                    .unwrap_or(8);
                 let mut tts_echo_until = Instant::now() + Duration::from_secs(1);
                 let mut utterance_started = Instant::now();
                 let mut last_turn_seen: Option<u64> = None;
@@ -1329,9 +1337,13 @@ async fn main() -> Result<()> {
                         || is_alarm_ringing;
                     let should_led_be_on = is_turn_in_progress || now < followup_until;
                     voice_active_for_mic.store(should_led_be_on, Ordering::SeqCst);
+                    let cur_color = led_color_for_mic
+                        .try_read()
+                        .map(|c| c.clone())
+                        .unwrap_or_else(|_| "azure".to_string());
                     if should_led_be_on != led_is_on {
                         led_is_on = should_led_be_on;
-                        set_led_active(led_is_on);
+                        set_led_active(led_is_on, &cur_color);
                     }
 
                     let was_active = gate.is_active();
@@ -1386,8 +1398,13 @@ async fn main() -> Result<()> {
                         followup_until = now;
                         info!("Explicit local activation: user turn opened");
                     }
-                    if now_active && now.duration_since(utterance_started) > Duration::from_secs(60)
+                    let max_utterance_dur = Duration::from_secs(max_utterance_secs);
+                    if now_active && now.duration_since(utterance_started) >= max_utterance_dur
                     {
+                        info!(
+                            elapsed_secs = ?now.duration_since(utterance_started).as_secs_f32(),
+                            "Max utterance duration reached, finalizing speech turn for cloud recognition"
+                        );
                         gate.reset_gate();
                         now_active = false;
                     }
@@ -1410,13 +1427,18 @@ async fn main() -> Result<()> {
                             }
                         }
                         if !now_active {
-                            if is_ready {
+                            let had_spoken = gate.has_spoken();
+                            if is_ready && had_spoken {
                                 let _ = tx_cloud_mic
                                     .send(gemini::UserAudio {
                                         turn_id: id,
                                         pcm: Vec::new(),
                                     })
                                     .await;
+                            } else {
+                                // If gate closed without speech (initial silence timeout expired)
+                                // or cloud is not ready, release authorization so ducker restores immediately!
+                                mic_authorization.finish(id);
                             }
                             active_turn = None;
                         }
@@ -1557,6 +1579,7 @@ async fn main() -> Result<()> {
 
             if !dry_run {
                 turn_off_boot_led();
+                web::set_led_hardware(&config.assistant.led_color);
             }
 
             // Accepted model packets retain their cancellation epoch through actual drain.
@@ -1765,11 +1788,19 @@ fn turn_off_boot_led() {
 }
 
 /// Set hardware LED activity indicator (sn3236 @ 0x3c)
-fn set_led_active(active: bool) {
+fn set_led_active(active: bool, color: &str) {
     if active {
-        web::set_led_hardware("azure");
+        if color == "off" {
+            web::set_led_hardware("azure");
+        } else {
+            web::set_led_hardware(color);
+        }
     } else {
-        web::set_led_hardware("off");
+        if color == "off" {
+            web::set_led_hardware("off");
+        } else {
+            web::set_led_hardware(color);
+        }
     }
 }
 
