@@ -121,8 +121,8 @@ EXPECTED_VOICE="$(REMOTE "grep -E '^\s*voice\s*=' $MINI_DEPLOY_DIR/config.toml 2
 [ -z "$EXPECTED_VOICE" ] && EXPECTED_VOICE="Callirrhoe"
 grep -q "voice: $EXPECTED_VOICE" <<< "$LOG_TAIL"; check "voice $EXPECTED_VOICE" $?
 
-# 7. No crash loop (filter out intentional SIGTERM exit 143 during service restarts)
-CRASHES="$(REMOTE "tail -n 500 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null" | grep -v 'code 143' | grep -v 'code 0' | grep -c 'Daemon exited with code')"
+# 7. No crash loop (filter out intentional SIGTERM/SIGKILL exit 143/137 during service restarts)
+CRASHES="$(REMOTE "tail -n 500 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null" | grep -v 'code 143' | grep -v 'code 137' | grep -v 'code 0' | grep -c 'Daemon exited with code')"
 [ "${CRASHES:-0}" -eq 0 ]; check "no daemon crash loop" $? "(unexpected_exits=$CRASHES)"
 
 # 8. Memory headroom (MemAvailable honours page cache)
