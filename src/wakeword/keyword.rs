@@ -23,19 +23,19 @@ impl KeywordEngine {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(0.52);
+            .unwrap_or(0.44);
 
         let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.35);
+            .unwrap_or(0.28);
 
         let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| (1..=20).contains(v))
-            .unwrap_or(4);
+            .unwrap_or(2);
 
         let score_mode = std::env::var("MINI_WAKEWORD_SCORE_MODE")
             .ok()
@@ -148,7 +148,7 @@ impl WakeWordEngine for KeywordEngine {
                 );
                 detected = true;
             } else if let Some(candidate) = detector.take_last_candidate() {
-                if candidate.score > 0.45 {
+                if candidate.score > 0.40 {
                     debug!(
                         name = %candidate.name,
                         candidate_score = candidate.score,
