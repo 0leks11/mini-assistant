@@ -270,6 +270,10 @@ impl ControlCenterServer {
             ("POST", "/api/v1/wakeword/compile") => {
                 self.handle_api_wakeword_compile(&mut stream).await?;
             }
+            ("GET", "/api/v1/wakeword/analysis")
+            | ("GET", "/api/v1/wakeword/session/analysis") => {
+                self.handle_api_wakeword_analysis(&mut stream).await?;
+            }
 
             // Spotify OAuth PKCE Flow
             ("GET", "/spotify/login") => {
@@ -843,7 +847,7 @@ impl ControlCenterServer {
             "status": "ok",
             "keyword_name": kw_name,
             "current_step": 1,
-            "target_steps": 25,
+            "target_steps": crate::wakeword::enrollment::TARGET_STEPS,
             "min_steps": 3,
             "phase": phase,
             "phase_name": phase_name,
@@ -1117,6 +1121,27 @@ impl ControlCenterServer {
                     .await
             }
         }
+    }
+
+    async fn handle_api_wakeword_analysis(&self, stream: &mut TcpStream) -> Result<()> {
+        let session_guard = self.wakeword_session.read().await;
+        let sess = match session_guard.as_ref() {
+            Some(s) => s,
+            None => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": "Сессия обучения не активна."
+                });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        let report = sess.analyze_signature();
+        let resp = serde_json::json!({
+            "status": "ok",
+            "report": report,
+        });
+        self.send_json(stream, &resp).await
     }
 }
 

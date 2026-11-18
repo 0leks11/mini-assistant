@@ -11,15 +11,15 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::info;
 
 /// Calculate proportional ducked volume level (1..=10 scale):
-/// V_duck = max(1, floor(V_orig * 0.25))
+/// V_duck = max(2, floor(V_orig * 0.25))
 ///
-/// Returns None if volume is already <= 1 (no ducking needed).
+/// Returns None if volume is already <= 2 (cannot duck lower than minimum floor 2).
 pub fn calculate_ducked_level(orig_level: u8) -> Option<u8> {
-    if orig_level <= 1 {
+    if orig_level <= 2 {
         return None;
     }
     let ducked = ((orig_level as f32) * 0.25).floor() as u8;
-    Some(ducked.max(1))
+    Some(ducked.max(2))
 }
 
 #[derive(Debug, Default)]
@@ -131,28 +131,27 @@ mod tests {
 
     #[test]
     fn test_calculate_ducked_level_formula() {
-        // Levels 0 and 1: no ducking needed
+        // Levels 0, 1, 2: cannot duck lower than floor 2
         assert_eq!(calculate_ducked_level(0), None);
         assert_eq!(calculate_ducked_level(1), None);
+        assert_eq!(calculate_ducked_level(2), None);
 
-        // Level 2 -> floor(2 * 0.25) = 0 -> max(1, 0) = 1
-        assert_eq!(calculate_ducked_level(2), Some(1));
-        // Level 3 -> floor(3 * 0.25) = 0 -> max(1, 0) = 1
-        assert_eq!(calculate_ducked_level(3), Some(1));
-        // Level 4 -> floor(4 * 0.25) = 1 -> max(1, 1) = 1
-        assert_eq!(calculate_ducked_level(4), Some(1));
-        // Level 5 -> floor(5 * 0.25) = 1 -> max(1, 1) = 1
-        assert_eq!(calculate_ducked_level(5), Some(1));
-        // Level 6 -> floor(6 * 0.25) = 1 -> max(1, 1) = 1
-        assert_eq!(calculate_ducked_level(6), Some(1));
-        // Level 7 -> floor(7 * 0.25) = 1 -> max(1, 1) = 1
-        assert_eq!(calculate_ducked_level(7), Some(1));
+        // Level 3 -> floor(3 * 0.25) = 0 -> max(2, 0) = 2
+        assert_eq!(calculate_ducked_level(3), Some(2));
+        // Level 4 -> floor(4 * 0.25) = 1 -> max(2, 1) = 2
+        assert_eq!(calculate_ducked_level(4), Some(2));
+        // Level 5 -> floor(5 * 0.25) = 1 -> max(2, 1) = 2
+        assert_eq!(calculate_ducked_level(5), Some(2));
+        // Level 6 -> floor(6 * 0.25) = 1 -> max(2, 1) = 2
+        assert_eq!(calculate_ducked_level(6), Some(2));
+        // Level 7 -> floor(7 * 0.25) = 1 -> max(2, 1) = 2
+        assert_eq!(calculate_ducked_level(7), Some(2));
 
-        // Level 8 -> floor(8 * 0.25) = 2 -> max(1, 2) = 2
+        // Level 8 -> floor(8 * 0.25) = 2 -> max(2, 2) = 2
         assert_eq!(calculate_ducked_level(8), Some(2));
-        // Level 9 -> floor(9 * 0.25) = 2 -> max(1, 2) = 2
+        // Level 9 -> floor(9 * 0.25) = 2 -> max(2, 2) = 2
         assert_eq!(calculate_ducked_level(9), Some(2));
-        // Level 10 -> floor(10 * 0.25) = 2 -> max(1, 2) = 2
+        // Level 10 -> floor(10 * 0.25) = 2 -> max(2, 2) = 2
         assert_eq!(calculate_ducked_level(10), Some(2));
     }
 
@@ -185,17 +184,20 @@ mod tests {
     fn test_music_ducker_low_volume_preservation() {
         let ducker = MusicDucker::new();
 
-        // When listening at quiet volume 2:
-        volume::set_volume_level(2);
-        let ducked = calculate_ducked_level(2).unwrap();
-        assert_eq!(ducked, 1);
+        // When listening at quiet volume 2: already at floor, no ducking
+        assert_eq!(calculate_ducked_level(2), None);
 
-        ducker.ducked_from_level.store(2, Ordering::SeqCst);
-        assert_eq!(ducker.ducked_level(), 2);
+        // When listening at volume 3: ducks to floor 2
+        volume::set_volume_level(3);
+        let ducked = calculate_ducked_level(3).unwrap();
+        assert_eq!(ducked, 2);
 
-        // User didn't touch volume, so restoring restores strictly to 2 (NOT 10)
+        ducker.ducked_from_level.store(3, Ordering::SeqCst);
+        assert_eq!(ducker.ducked_level(), 3);
+
+        // User didn't touch volume, so restoring restores strictly to 3 (NOT 10)
         let pre_level = ducker.ducked_from_level.swap(0, Ordering::SeqCst);
-        assert_eq!(pre_level, 2);
+        assert_eq!(pre_level, 3);
 
         // Reset
         volume::set_volume_level(10);

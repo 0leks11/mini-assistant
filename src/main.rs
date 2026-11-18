@@ -1100,7 +1100,7 @@ async fn main() -> Result<()> {
             let mut gate = wakeword::InputGate::with_activation_and_initial_timeout(
                 activation,
                 vad_threshold,
-                2000,
+                400,
                 initial_silence_timeout_ms,
                 silence_timeout_ms,
                 16000,
@@ -1302,6 +1302,9 @@ async fn main() -> Result<()> {
 
                     if is_tts_playing {
                         tts_echo_until = now + Duration::from_millis(800);
+                        gate.sanitize_pre_roll();
+                    } else if now < tts_echo_until {
+                        gate.sanitize_pre_roll();
                     }
                     let tts_active = is_tts_playing || now < tts_echo_until;
 

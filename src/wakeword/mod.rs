@@ -173,9 +173,7 @@ impl InputGate {
 
         if !self.is_active {
             let triggered = if self.manual_armed {
-                self.speech_engine
-                    .as_mut()
-                    .is_some_and(|v| v.process(&chunk))
+                true
             } else {
                 self.engine.process(&chunk)
             };
@@ -255,6 +253,12 @@ impl InputGate {
             self.buffered_bytes = 0;
             self.silence_bytes = 0;
         }
+    }
+
+    /// Clear pre-roll buffer to prevent acoustic echo leakage (e.g. after TTS playback or loud noises)
+    pub fn sanitize_pre_roll(&mut self) {
+        self.pre_roll_buffer.clear();
+        self.buffered_bytes = 0;
     }
 
     /// Hot-reloads the wake-word engine without interrupting audio loop.
@@ -540,5 +544,54 @@ mod tests {
             !gate.is_active(),
             "Gate must close after utterance silence limit"
         );
+    }
+
+    #[test]
+    fn test_sanitize_pre_roll_clears_buffered_audio() {
+        struct NeverTrigger;
+        impl WakeWordEngine for NeverTrigger {
+            fn process(&mut self, _: &[u8]) -> bool {
+                false
+            }
+            fn reset(&mut self) {}
+        }
+
+        let mut gate = InputGate::with_activation(Box::new(NeverTrigger), 10.0, 400, 1000, 16000);
+        let chunk = vec![0x42; 512];
+
+        // Feed some frames while inactive
+        for _ in 0..5 {
+            assert!(gate.process_frame(chunk.clone()).is_empty());
+        }
+        assert_eq!(gate.buffered_bytes, 5 * 512);
+
+        // Sanitize pre-roll (e.g. after TTS or during echo)
+        gate.sanitize_pre_roll();
+        assert_eq!(gate.buffered_bytes, 0);
+        assert!(gate.pre_roll_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_manual_armed_immediate_activation() {
+        struct NeverTrigger;
+        impl WakeWordEngine for NeverTrigger {
+            fn process(&mut self, _: &[u8]) -> bool {
+                false
+            }
+            fn reset(&mut self) {}
+        }
+
+        let mut gate = InputGate::with_activation(Box::new(NeverTrigger), 10.0, 400, 1000, 16000);
+        let chunk = vec![0x00; 512];
+
+        // Without manual arm, inactive
+        assert!(gate.process_frame(chunk.clone()).is_empty());
+        assert!(!gate.is_active());
+
+        // When manual armed (e.g. button pressed)
+        gate.set_manual_armed(true);
+        let out = gate.process_frame(chunk.clone());
+        assert!(!out.is_empty());
+        assert!(gate.is_active());
     }
 }

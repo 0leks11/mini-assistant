@@ -2,7 +2,7 @@ mod audio;
 mod config;
 mod constants;
 mod detector;
-mod mfcc;
+pub mod mfcc;
 mod wakewords;
 #[cfg(feature = "audio")]
 pub use audio::{AudioEncoder, BandPassFilter, GainNormalizerFilter};

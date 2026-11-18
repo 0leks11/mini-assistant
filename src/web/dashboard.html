@@ -393,6 +393,46 @@
       font-size: 11px;
       color: var(--text-muted);
     }
+    .ww-chip.centroid {
+      border-color: rgba(46, 160, 67, 0.8);
+      background: rgba(46, 160, 67, 0.15);
+      color: #3fb950;
+    }
+    .ww-chip.outlier {
+      border-color: rgba(248, 81, 73, 0.8);
+      background: rgba(248, 81, 73, 0.15);
+      color: #f85149;
+    }
+    .ww-analysis-box {
+      background: rgba(13, 17, 23, 0.9);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 10px;
+      margin-top: 6px;
+    }
+    .ww-metric-row {
+      display: flex;
+      gap: 8px;
+      margin: 6px 0;
+    }
+    .ww-metric-pill {
+      flex: 1;
+      padding: 6px 4px;
+      border-radius: 6px;
+      background: rgba(22, 27, 34, 0.9);
+      border: 1px solid var(--border-color);
+      text-align: center;
+    }
+    .ww-metric-val {
+      font-size: 14px;
+      font-weight: 700;
+      color: #e6edf3;
+    }
+    .ww-metric-lbl {
+      font-size: 9px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
     .ww-chip-del {
       color: #f85149;
       cursor: pointer;
@@ -734,10 +774,10 @@
         <div class="ww-phase-box">
           <div class="ww-phase-header">
             <span id="ww-phase-title">Фаза 1: Ближняя зона</span>
-            <span id="ww-step-counter">Шаг 1 из 25</span>
+            <span id="ww-step-counter">Шаг 1 из 30</span>
           </div>
           <div class="ww-phase-desc" id="ww-phase-desc">
-            Отойдите на 0.5–1 метр. Произнесите слово спокойным ровным голосом.
+            Отойдите на 0.5 метра от колонки. Произнесите слово 10 раз, варьируя интонацию и высоту голоса.
           </div>
           <div class="ww-pulse-bar">
             <div id="ww-pulse-indicator" class="ww-pulse-fill"></div>
@@ -761,6 +801,34 @@
             <span id="ww-compile-hint" style="color: var(--warning);">Минимум 3 для компиляции</span>
           </div>
           <div id="ww-samples-list" class="ww-samples-wrap"></div>
+        </div>
+
+        <div id="ww-analysis-container" class="ww-analysis-box" style="display: none;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 12px; font-weight: 700;">📊 Матрица акустической сигнатуры</span>
+            <span id="ww-analysis-score" style="font-size: 14px; font-weight: 800; color: var(--success);">--%</span>
+          </div>
+          <div class="ww-metric-row">
+            <div class="ww-metric-pill">
+              <div id="ww-metric-near" class="ww-metric-val">--%</div>
+              <div class="ww-metric-lbl">0.5 м (Ближняя)</div>
+            </div>
+            <div class="ww-metric-pill">
+              <div id="ww-metric-mid" class="ww-metric-val">--%</div>
+              <div class="ww-metric-lbl">2.0 м (Средняя)</div>
+            </div>
+            <div class="ww-metric-pill">
+              <div id="ww-metric-far" class="ww-metric-val">--%</div>
+              <div class="ww-metric-lbl">4–5 м (Дальняя)</div>
+            </div>
+          </div>
+          <div id="ww-analysis-rec" style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px; line-height: 1.4;">
+            Анализ сигнатуры...
+          </div>
+          <div style="font-size: 10px; color: var(--text-muted); display: flex; justify-content: space-between;">
+            <span>🟢 Центроиды: <b id="ww-centroids-count">0</b>/7</span>
+            <span>⚠️ Выбросы: <b id="ww-outliers-count">0</b></span>
+          </div>
         </div>
 
         <div style="display: flex; gap: 8px; margin-top: 4px;">
@@ -1114,13 +1182,11 @@
     }
 
     const step = data.current_step || 1;
-    let desc = "Отойдите на 0.5–1 метр. Произнесите слово спокойным ровным голосом.";
-    if (step >= 9 && step <= 16) {
-      desc = "Отойдите на 2–3 метра (в центр комнаты). Произнесите слово обычным разговорным голосом.";
-    } else if (step >= 17 && step <= 21) {
-      desc = "Отойдите на 3–4 метра. Позовите колонку громко, четко и эмоционально!";
-    } else if (step >= 22) {
-      desc = "Тихий вечерний голос или полушёпот. Проверьте отклик в тишине.";
+    let desc = "Отойдите на 0.5 метра от колонки. Произнесите слово 10 раз, варьируя интонацию и высоту голоса.";
+    if (step >= 11 && step <= 20) {
+      desc = "Отойдите на 2 метра (в центр комнаты). Произнесите слово 10 раз спокойным повседневным голосом.";
+    } else if (step >= 21) {
+      desc = "Отойдите на 4–5 метров (в дальний угол). Позовите колонку 10 раз громко и отчётливо!";
     }
     document.getElementById("ww-phase-desc").innerText = desc;
 
@@ -1136,21 +1202,73 @@
     if (count < 3) {
       hint.innerText = "Нужно еще " + (3 - count) + " сэмпла";
       hint.style.color = "var(--warning)";
-    } else if (count < 15) {
-      hint.innerText = "Готово к компиляции (рекомендуется 15+)";
+    } else if (count < 20) {
+      hint.innerText = "Готово к анализу (рекомендуется 30 сэмплов)";
       hint.style.color = "var(--accent)";
     } else {
-      hint.innerText = "Отличная база! Готово к сохранению";
+      hint.innerText = "Полная база (3 дистанции)! Готово к активации";
       hint.style.color = "var(--success)";
     }
 
-    if (data.samples && Array.isArray(data.samples)) {
+    if (count >= 3) {
+      runWakewordAnalysis();
+    } else if (data.samples && Array.isArray(data.samples)) {
       const listEl = document.getElementById("ww-samples-list");
       listEl.innerHTML = "";
       data.samples.forEach(s => {
         const chip = document.createElement("div");
         chip.className = "ww-chip";
         chip.innerHTML = `<span>#${s.id} (${(s.duration_ms / 1000).toFixed(2)}с, Ф${s.phase})</span><span class="ww-chip-del" onclick="deleteWakewordSample(${s.id})">✕</span>`;
+        listEl.appendChild(chip);
+      });
+    }
+  }
+
+  async function runWakewordAnalysis() {
+    try {
+      const res = await fetch("/api/v1/wakeword/analysis", { cache: "no-store" });
+      const data = await res.json();
+      if (res.ok && data.report) {
+        renderSignatureAnalysis(data.report);
+      }
+    } catch (e) {
+      console.error("Signature analysis error:", e);
+    }
+  }
+
+  function renderSignatureAnalysis(report) {
+    const box = document.getElementById("ww-analysis-container");
+    if (!box) return;
+    box.style.display = "block";
+
+    const scoreEl = document.getElementById("ww-analysis-score");
+    scoreEl.innerText = report.overall_consistency.toFixed(1) + "%";
+    if (report.overall_consistency >= 75) {
+      scoreEl.style.color = "var(--success)";
+    } else if (report.overall_consistency >= 60) {
+      scoreEl.style.color = "var(--warning)";
+    } else {
+      scoreEl.style.color = "#f85149";
+    }
+
+    document.getElementById("ww-metric-near").innerText = report.near_consistency.toFixed(1) + "%";
+    document.getElementById("ww-metric-mid").innerText = report.mid_consistency.toFixed(1) + "%";
+    document.getElementById("ww-metric-far").innerText = report.far_consistency.toFixed(1) + "%";
+    document.getElementById("ww-analysis-rec").innerText = report.recommendation;
+    document.getElementById("ww-centroids-count").innerText = (report.selected_template_ids || []).length;
+    document.getElementById("ww-outliers-count").innerText = report.outlier_count || 0;
+
+    // Render sample chips with centroid and outlier badges
+    if (report.samples && Array.isArray(report.samples)) {
+      const listEl = document.getElementById("ww-samples-list");
+      listEl.innerHTML = "";
+      report.samples.forEach(s => {
+        const chip = document.createElement("div");
+        const isCentroid = (report.selected_template_ids || []).includes(s.id);
+        chip.className = "ww-chip" + (s.is_outlier ? " outlier" : (isCentroid ? " centroid" : ""));
+        const tag = s.is_outlier ? "⚠️ " : (isCentroid ? "⭐ " : "");
+        const tooltip = s.outlier_reason ? ` title="${s.outlier_reason}"` : ` title="Схожесть: ${(s.centrality_score * 100).toFixed(1)}%"`;
+        chip.innerHTML = `<span${tooltip}>${tag}#${s.id} (${(s.duration_ms / 1000).toFixed(2)}с, Ф${s.phase}, ${(s.centrality_score * 100).toFixed(0)}%)</span><span class="ww-chip-del" onclick="deleteWakewordSample(${s.id})">✕</span>`;
         listEl.appendChild(chip);
       });
     }

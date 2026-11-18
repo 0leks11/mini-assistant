@@ -13,9 +13,9 @@ use crate::{
 
 use super::{MfccExtractor, MfccNormalizer};
 
-pub(crate) struct MfccWavFileExtractor {}
+pub struct MfccWavFileExtractor {}
 impl MfccWavFileExtractor {
-    pub(crate) fn compute_mfccs<R: std::io::Read>(
+    pub fn compute_mfccs<R: std::io::Read>(
         buffer_reader: BufReader<R>,
         out_rms_level: &mut f32,
         mfcc_size: u16,

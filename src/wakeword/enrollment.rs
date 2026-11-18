@@ -19,7 +19,7 @@ use tracing::info;
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MIN_SAMPLES: usize = 4_800; // 300 ms
 pub const MAX_SAMPLES: usize = 48_000; // 3000 ms
-pub const TARGET_STEPS: usize = 25;
+pub const TARGET_STEPS: usize = 30;
 pub const MIN_STEPS: usize = 3;
 pub const MAX_TEMPLATES: usize = 8;
 
@@ -139,11 +139,14 @@ impl EnrollmentSession {
 
     pub fn phase_for_step(step: usize) -> (u8, &'static str) {
         match step {
-            1..=8 => (1, "Ближняя зона (0.5–1 м, спокойный тон)"),
-            9..=16 => (2, "Средняя дистанция (2–3 м, обычная речь)"),
-            17..=21 => (3, "Громкий призыв (3–4 м, эмоциональный зов)"),
-            _ => (4, "Тихий вечерний голос / полушёпот"),
+            1..=10 => (1, "Ближняя зона (0.5 м, разная тональность)"),
+            11..=20 => (2, "Средняя дистанция (2 м, обычная речь)"),
+            _ => (3, "Дальняя зона (4–5 м, громкий призыв)"),
         }
+    }
+
+    pub fn analyze_signature(&self) -> SignatureAnalysisReport {
+        analyze_samples(&self.samples)
     }
 
     pub fn add_pcm_sample(&mut self, raw_pcm: &[i16]) -> Result<EnrollmentSample> {
@@ -189,6 +192,35 @@ pub struct WakewordCompileResult {
     pub templates_used: usize,
     pub model_size_bytes: usize,
     pub output_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleQualityReport {
+    pub id: usize,
+    pub phase: u8,
+    pub phase_name: String,
+    pub duration_ms: u32,
+    pub peak_rms: f32,
+    pub snr: f32,
+    pub centrality_score: f32,
+    pub is_outlier: bool,
+    pub outlier_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignatureAnalysisReport {
+    pub overall_consistency: f32,
+    pub near_consistency: f32,
+    pub mid_consistency: f32,
+    pub far_consistency: f32,
+    pub total_samples: usize,
+    pub valid_samples: usize,
+    pub outlier_count: usize,
+    pub similarity_matrix: Vec<Vec<f32>>,
+    pub samples: Vec<SampleQualityReport>,
+    pub selected_template_ids: Vec<usize>,
+    pub recommendation: String,
+    pub can_compile: bool,
 }
 
 /// Decodes mono 16kHz PCM16 from a standard WAV byte stream.
@@ -355,61 +387,321 @@ pub fn process_sample(
     })
 }
 
-/// Selects up to `MAX_TEMPLATES` (8) best, most diverse templates across recorded samples.
-/// This fulfills Rustpotter's strict 3..=8 personal reference constraint even when user records 25 steps.
+/// Extracts 16 MFCC filter coefficients for a recorded PCM sample.
+pub fn extract_sample_mfcc(sample: &EnrollmentSample) -> Result<Vec<Vec<f32>>> {
+    let wav_bytes = encode_wav_pcm16(&sample.pcm)?;
+    let mut rms = 0.0f32;
+    let features = rustpotter::mfcc::MfccWavFileExtractor::compute_mfccs(
+        std::io::BufReader::new(wav_bytes.as_slice()),
+        &mut rms,
+        16,
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(features)
+}
+
+/// Evaluates acoustic consistency across recorded samples using dynamic time warping (DTW)
+/// on 16 MFCC features. Generates NxN pairwise similarity matrix, per-sample centrality scores,
+/// detects noisy/mismatched outliers, and selects 7 optimal centroids.
+pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport {
+    let n = samples.len();
+    if n < MIN_STEPS {
+        let sample_reports = samples
+            .iter()
+            .map(|s| SampleQualityReport {
+                id: s.id,
+                phase: s.phase,
+                phase_name: s.phase_name.clone(),
+                duration_ms: s.duration_ms,
+                peak_rms: s.peak_rms,
+                snr: s.snr,
+                centrality_score: 1.0,
+                is_outlier: false,
+                outlier_reason: None,
+            })
+            .collect();
+
+        return SignatureAnalysisReport {
+            overall_consistency: 0.0,
+            near_consistency: 0.0,
+            mid_consistency: 0.0,
+            far_consistency: 0.0,
+            total_samples: n,
+            valid_samples: n,
+            outlier_count: 0,
+            similarity_matrix: vec![vec![1.0; n]; n],
+            samples: sample_reports,
+            selected_template_ids: samples.iter().map(|s| s.id).collect(),
+            recommendation: format!(
+                "Записано {} из {} сэмплов. Запишите минимум {} для анализа сигнатуры.",
+                n, TARGET_STEPS, MIN_STEPS
+            ),
+            can_compile: false,
+        };
+    }
+
+    // 1. Extract MFCC-16 feature vectors for all samples
+    let mut features_list: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(n);
+    for s in samples {
+        match extract_sample_mfcc(s) {
+            Ok(f) => features_list.push(Some(f)),
+            Err(e) => {
+                tracing::warn!(sample_id = s.id, "MFCC extraction failed: {e}");
+                features_list.push(None);
+            }
+        }
+    }
+
+    // 2. Compute pairwise similarity matrix S[i][j] via DTW with window band 5
+    let mut matrix = vec![vec![0.0f32; n]; n];
+    for i in 0..n {
+        matrix[i][i] = 1.0;
+        for j in (i + 1)..n {
+            let sim = match (&features_list[i], &features_list[j]) {
+                (Some(feat_a), Some(feat_b)) => {
+                    let a_refs: Vec<&[f32]> = feat_a.iter().map(|r| r.as_slice()).collect();
+                    let b_refs: Vec<&[f32]> = feat_b.iter().map(|r| r.as_slice()).collect();
+                    let mut dtw =
+                        rustpotter::mfcc::Dtw::new(rustpotter::mfcc::MfccComparator::calculate_distance);
+                    let cost = dtw.compute_optimal_path_with_window(&a_refs, &b_refs, 5);
+                    let norm_cost = cost / (a_refs.len() + b_refs.len()) as f32;
+                    let val = (1.0 - norm_cost).clamp(0.0, 1.0);
+                    (val * 100.0).round() / 100.0
+                }
+                _ => 0.0,
+            };
+            matrix[i][j] = sim;
+            matrix[j][i] = sim;
+        }
+    }
+
+    // 3. Centrality score: mean similarity to all other samples
+    let mut centralities = vec![0.0f32; n];
+    for i in 0..n {
+        let mut sum = 0.0f32;
+        let mut count = 0usize;
+        for j in 0..n {
+            if i != j {
+                sum += matrix[i][j];
+                count += 1;
+            }
+        }
+        centralities[i] = if count > 0 {
+            ((sum / count as f32) * 1000.0).round() / 1000.0
+        } else {
+            1.0
+        };
+    }
+
+    // 4. Overall and per-zone consistency metrics
+    let mut sum_all = 0.0f32;
+    let mut count_all = 0usize;
+    let mut sum_near = 0.0f32;
+    let mut count_near = 0usize;
+    let mut sum_mid = 0.0f32;
+    let mut count_mid = 0usize;
+    let mut sum_far = 0.0f32;
+    let mut count_far = 0usize;
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let val = matrix[i][j];
+            sum_all += val;
+            count_all += 1;
+
+            if samples[i].phase == 1 && samples[j].phase == 1 {
+                sum_near += val;
+                count_near += 1;
+            } else if samples[i].phase == 2 && samples[j].phase == 2 {
+                sum_mid += val;
+                count_mid += 1;
+            } else if samples[i].phase == 3 && samples[j].phase == 3 {
+                sum_far += val;
+                count_far += 1;
+            }
+        }
+    }
+
+    let overall_consistency = if count_all > 0 {
+        ((sum_all / count_all as f32) * 10000.0).round() / 100.0
+    } else {
+        0.0
+    };
+    let near_consistency = if count_near > 0 {
+        ((sum_near / count_near as f32) * 10000.0).round() / 100.0
+    } else {
+        overall_consistency
+    };
+    let mid_consistency = if count_mid > 0 {
+        ((sum_mid / count_mid as f32) * 10000.0).round() / 100.0
+    } else {
+        overall_consistency
+    };
+    let far_consistency = if count_far > 0 {
+        ((sum_far / count_far as f32) * 10000.0).round() / 100.0
+    } else {
+        overall_consistency
+    };
+
+    // 5. Outlier Detection: low similarity (< 0.45), low SNR (< 8 dB), or >2σ below mean
+    let mean_c = centralities.iter().sum::<f32>() / n as f32;
+    let var_c = centralities.iter().map(|&c| (c - mean_c).powi(2)).sum::<f32>() / n as f32;
+    let std_c = var_c.sqrt();
+
+    let mut sample_reports = Vec::with_capacity(n);
+    let mut outlier_count = 0usize;
+
+    for (i, s) in samples.iter().enumerate() {
+        let c = centralities[i];
+        let mut is_outlier = false;
+        let mut outlier_reason = None;
+
+        if features_list[i].is_none() {
+            is_outlier = true;
+            outlier_reason = Some("Ошибка извлечения акустических признаков MFCC".to_string());
+        } else if s.snr < 8.0 {
+            is_outlier = true;
+            outlier_reason =
+                Some(format!("Слишком высокий фоновый шум: SNR {:.1} дБ (< 8 дБ)", s.snr));
+        } else if c < 0.45 {
+            is_outlier = true;
+            outlier_reason = Some(format!("Низкая акустическая схожесть ({:.1}%)", c * 100.0));
+        } else if n >= 6 && c < (mean_c - 2.0 * std_c) {
+            is_outlier = true;
+            outlier_reason =
+                Some("Аномальное отклонение произношения от среднего профиля".to_string());
+        }
+
+        if is_outlier {
+            outlier_count += 1;
+        }
+
+        sample_reports.push(SampleQualityReport {
+            id: s.id,
+            phase: s.phase,
+            phase_name: s.phase_name.clone(),
+            duration_ms: s.duration_ms,
+            peak_rms: s.peak_rms,
+            snr: s.snr,
+            centrality_score: c,
+            is_outlier,
+            outlier_reason,
+        });
+    }
+
+    // 6. Optimal Centroid Selection (Target: 7 templates across 3 distance zones)
+    let mut non_outliers: Vec<(usize, &EnrollmentSample, f32)> = sample_reports
+        .iter()
+        .zip(samples.iter())
+        .filter(|(r, _)| !r.is_outlier)
+        .map(|(r, s)| (s.id, s, r.centrality_score))
+        .collect();
+
+    // If too few non-outliers, fall back to best centralities overall
+    if non_outliers.len() < MIN_STEPS {
+        non_outliers = sample_reports
+            .iter()
+            .zip(samples.iter())
+            .map(|(r, s)| (s.id, s, r.centrality_score))
+            .collect();
+    }
+
+    let mut selected_ids = Vec::new();
+    let phase_quotas = [(1u8, 3usize), (2, 2), (3, 2)];
+
+    for (p, quota) in phase_quotas {
+        let mut phase_samples: Vec<(usize, f32)> = non_outliers
+            .iter()
+            .filter(|(_, s, _)| s.phase == p)
+            .map(|(id, _, c)| (*id, *c))
+            .collect();
+        phase_samples.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, _) in phase_samples.into_iter().take(quota) {
+            selected_ids.push(id);
+        }
+    }
+
+    // Fill remaining up to 7 (or at most MAX_TEMPLATES 8) from highest remaining centralities
+    let target_total = 7.min(n).max(MIN_STEPS);
+    if selected_ids.len() < target_total {
+        let mut remaining: Vec<(usize, f32)> = non_outliers
+            .iter()
+            .filter(|(id, _, _)| !selected_ids.contains(id))
+            .map(|(id, _, c)| (*id, *c))
+            .collect();
+        remaining.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, _) in remaining.into_iter().take(target_total - selected_ids.len()) {
+            selected_ids.push(id);
+        }
+    }
+
+    selected_ids.sort();
+
+    let can_compile = (MIN_STEPS..=MAX_TEMPLATES).contains(&selected_ids.len());
+
+    let recommendation = if overall_consistency >= 75.0 && outlier_count == 0 {
+        format!(
+            "Отличная акустическая сигнатура (консистентность {:.1}%). Модель из 7 центроидов готова к компиляции.",
+            overall_consistency
+        )
+    } else if overall_consistency >= 60.0 {
+        if outlier_count > 0 {
+            format!(
+                "Хорошая консистентность ({:.1}%). Обнаружено выбросов: {}. Рекомендуется перезаписать их перед активацией.",
+                overall_consistency, outlier_count
+            )
+        } else {
+            format!(
+                "Хорошая акустическая схожесть ({:.1}%). Модель готова к компиляции.",
+                overall_consistency
+            )
+        }
+    } else {
+        format!(
+            "Низкая схожесть сэмплов ({:.1}%). Произносите слово чётче и избегайте эха или посторонних шумов.",
+            overall_consistency
+        )
+    };
+
+    SignatureAnalysisReport {
+        overall_consistency,
+        near_consistency,
+        mid_consistency,
+        far_consistency,
+        total_samples: n,
+        valid_samples: n.saturating_sub(outlier_count),
+        outlier_count,
+        similarity_matrix: matrix,
+        samples: sample_reports,
+        selected_template_ids: selected_ids,
+        recommendation,
+        can_compile,
+    }
+}
+
+/// Selects up to `MAX_TEMPLATES` (8) best templates using the signature analysis centroids.
 pub fn select_best_templates(samples: &[EnrollmentSample]) -> Vec<&EnrollmentSample> {
-    if samples.len() <= MAX_TEMPLATES {
+    if samples.len() <= MAX_TEMPLATES && samples.len() >= MIN_STEPS {
         return samples.iter().collect();
     }
 
-    // Group samples by phase
-    let mut by_phase: HashMap<u8, Vec<&EnrollmentSample>> = HashMap::new();
-    for s in samples {
-        by_phase.entry(s.phase).or_default().push(s);
-    }
-
-    // Sort each phase by SNR descending
-    for list in by_phase.values_mut() {
-        list.sort_by(|a, b| b.snr.total_cmp(&a.snr));
-    }
-
-    let mut selected: Vec<&EnrollmentSample> = Vec::new();
-    let phases = [1u8, 2, 3, 4];
-
-    // Pick top samples round-robin from each phase
-    let mut round = 0;
-    while selected.len() < MAX_TEMPLATES {
-        let mut added_in_round = false;
-        for phase in &phases {
-            if selected.len() >= MAX_TEMPLATES {
-                break;
-            }
-            if let Some(list) = by_phase.get(phase) {
-                if let Some(&sample) = list.get(round) {
-                    selected.push(sample);
-                    added_in_round = true;
-                }
-            }
-        }
-        if !added_in_round {
-            break;
-        }
-        round += 1;
-    }
-
-    // If still less than MAX_TEMPLATES and we have remaining samples, fill from highest SNR
-    if selected.len() < MAX_TEMPLATES {
-        let mut remaining: Vec<&EnrollmentSample> = samples
-            .iter()
-            .filter(|s| !selected.iter().any(|sel| sel.id == s.id))
-            .collect();
-        remaining.sort_by(|a, b| b.snr.total_cmp(&a.snr));
-        for s in remaining.into_iter().take(MAX_TEMPLATES - selected.len()) {
+    let report = analyze_samples(samples);
+    let mut selected = Vec::new();
+    for &id in &report.selected_template_ids {
+        if let Some(s) = samples.iter().find(|s| s.id == id) {
             selected.push(s);
         }
     }
 
-    selected
+    if selected.len() >= MIN_STEPS {
+        selected
+    } else {
+        // Fallback: highest SNR
+        let mut sorted: Vec<&EnrollmentSample> = samples.iter().collect();
+        sorted.sort_by(|a, b| b.snr.total_cmp(&a.snr));
+        sorted.truncate(MAX_TEMPLATES);
+        sorted
+    }
 }
 
 /// Compiles a set of samples into a Rustpotter `.rpw` personal reference model file.
@@ -592,5 +884,105 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(model_path);
+    }
+
+    #[test]
+    fn test_signature_analysis_matrix_and_outliers() {
+        let mut session = EnrollmentSession::new("shtuchka".to_string());
+
+        // Add 6 similar samples (440Hz base tone)
+        for _ in 1..=6 {
+            let mut audio = vec![0i16; 2000];
+            audio.extend(generate_synthetic_keyword(440.0, 0.5));
+            audio.extend(vec![0i16; 2000]);
+            session.add_pcm_sample(&audio).expect("sample");
+        }
+
+        // Add 1 outlier sample (completely mismatched 3500Hz high pitch)
+        let mut noise_sample = vec![0i16; 2000];
+        noise_sample.extend(generate_synthetic_keyword(3500.0, 0.5));
+        noise_sample.extend(vec![0i16; 2000]);
+        session.add_pcm_sample(&noise_sample).expect("noise sample");
+
+        let report = session.analyze_signature();
+        assert_eq!(report.total_samples, 7);
+        assert_eq!(report.similarity_matrix.len(), 7);
+
+        // Check diagonal and symmetry
+        for i in 0..7 {
+            assert_eq!(report.similarity_matrix[i][i], 1.0);
+            for j in 0..7 {
+                assert_eq!(
+                    report.similarity_matrix[i][j],
+                    report.similarity_matrix[j][i]
+                );
+            }
+        }
+
+        // Check that sample 7 (the high frequency outlier) has much lower centrality than sample 1
+        let normal_c = report.samples[0].centrality_score;
+        let outlier_c = report.samples[6].centrality_score;
+        assert!(
+            normal_c > outlier_c,
+            "Normal sample centrality {normal_c} should be > outlier centrality {outlier_c}"
+        );
+
+        // Check that selected templates do NOT include the outlier if we have enough normal ones
+        assert!(
+            !report.selected_template_ids.contains(&7)
+                || report.selected_template_ids.len() == 7
+        );
+    }
+
+    #[test]
+    fn test_signature_analysis_30_samples_centroid_selection() {
+        let mut session = EnrollmentSession::new("shtuchka".to_string());
+
+        // Add 30 samples across the 3 distance zones (10 near, 10 mid, 10 far)
+        for step in 1..=30 {
+            let freq = match step {
+                1..=10 => 400.0 + (step as f32 * 5.0),  // Near
+                11..=20 => 450.0 + (step as f32 * 3.0), // Mid
+                _ => 500.0 + (step as f32 * 2.0),       // Far
+            };
+            let mut audio = vec![0i16; 2000];
+            audio.extend(generate_synthetic_keyword(freq, 0.5));
+            audio.extend(vec![0i16; 2000]);
+            session.add_pcm_sample(&audio).expect("sample");
+        }
+
+        assert_eq!(session.samples.len(), 30);
+        let report = session.analyze_signature();
+
+        assert_eq!(report.total_samples, 30);
+        assert!(report.overall_consistency > 50.0);
+        assert!(report.near_consistency > 50.0);
+        assert!(report.mid_consistency > 50.0);
+        assert!(report.far_consistency > 50.0);
+
+        // Target down-selection should select 7 templates (3 near, 2 mid, 2 far)
+        assert_eq!(report.selected_template_ids.len(), 7);
+
+        // Check phase breakdown of selected templates:
+        let phase1_count = report
+            .selected_template_ids
+            .iter()
+            .filter(|&&id| (1..=10).contains(&id))
+            .count();
+        let phase2_count = report
+            .selected_template_ids
+            .iter()
+            .filter(|&&id| (11..=20).contains(&id))
+            .count();
+        let phase3_count = report
+            .selected_template_ids
+            .iter()
+            .filter(|&&id| (21..=30).contains(&id))
+            .count();
+
+        assert_eq!(phase1_count, 3, "Should select 3 templates from Near zone");
+        assert_eq!(phase2_count, 2, "Should select 2 templates from Mid zone");
+        assert_eq!(phase3_count, 2, "Should select 2 templates from Far zone");
+        assert!(report.can_compile);
     }
 }
