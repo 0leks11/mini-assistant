@@ -26,7 +26,7 @@ impl SimpleVadEngine {
             base_threshold_rms: threshold_rms,
             noise_floor_rms: threshold_rms * 0.5,
             consecutive_active: 0,
-            required_consecutive: 3, // ~50ms of audio for onset
+            required_consecutive: 3, // ~48ms of audio for onset
             is_speaking: false,
         }
     }
@@ -63,9 +63,8 @@ impl WakeWordEngine for SimpleVadEngine {
             self.noise_floor_rms = 0.90 * self.noise_floor_rms + 0.10 * rms;
         }
 
-        // Dynamic threshold must clear the acoustic noise floor (e.g. ducked music or fan)
-        // while never falling below base_threshold_rms.
-        let dynamic_threshold = (self.noise_floor_rms * 1.35 + 25.0).max(self.base_threshold_rms);
+        // Dynamic threshold must clear acoustic noise floor while sensitive to far-field voice (~2.4m)
+        let dynamic_threshold = (self.noise_floor_rms * 1.15 + 12.0).max(self.base_threshold_rms);
 
         if rms > dynamic_threshold {
             if self.is_speaking {
@@ -115,6 +114,7 @@ pub struct InputGate {
     manual_armed: bool,
     is_active: bool,
     has_spoken: bool,
+    had_spoken_last_turn: bool,
     pre_roll_buffer: std::collections::VecDeque<Vec<u8>>,
     buffered_bytes: usize,
     max_pre_roll_bytes: usize,
@@ -143,6 +143,7 @@ impl InputGate {
             manual_armed: false,
             is_active: continuous_mode,
             has_spoken: false,
+            had_spoken_last_turn: false,
             pre_roll_buffer: std::collections::VecDeque::new(),
             buffered_bytes: 0,
             max_pre_roll_bytes,
@@ -211,6 +212,7 @@ impl InputGate {
             if triggered {
                 self.is_active = true;
                 self.has_spoken = false;
+                self.had_spoken_last_turn = false;
                 self.silence_bytes = 0;
                 let outgoing: Vec<Vec<u8>> = self.pre_roll_buffer.drain(..).collect();
                 self.buffered_bytes = 0;
@@ -229,6 +231,7 @@ impl InputGate {
             };
             if voice_active {
                 self.has_spoken = true;
+                self.had_spoken_last_turn = true;
                 self.silence_bytes = 0;
             } else {
                 self.silence_bytes += chunk.len();
@@ -258,9 +261,9 @@ impl InputGate {
         self.is_active
     }
 
-    /// Check if any speech has been detected since gate opened
+    /// Check if any speech has been detected in current turn or when turn just closed
     pub fn has_spoken(&self) -> bool {
-        self.has_spoken
+        self.has_spoken || self.had_spoken_last_turn
     }
 
     /// Manually reset gate to inactive (e.g. at end of turn)
@@ -269,6 +272,7 @@ impl InputGate {
         if !self.continuous_mode {
             self.is_active = false;
             self.has_spoken = false;
+            self.had_spoken_last_turn = false;
             self.engine.reset();
             if let Some(vad) = &mut self.speech_engine {
                 vad.reset();
@@ -568,6 +572,10 @@ mod tests {
         assert!(
             !gate.is_active(),
             "Gate must close after utterance silence limit"
+        );
+        assert!(
+            gate.has_spoken(),
+            "Gate must retain has_spoken=true after utterance ends"
         );
     }
 

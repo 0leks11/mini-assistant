@@ -479,6 +479,8 @@ async fn main() -> Result<()> {
             ));
             let music_ducker = Arc::new(spotify::MusicDucker::new());
             let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let is_gesture_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            audio::volume::init_volume_clicker();
 
             let is_soloist_playing = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let soloist_poller_client = soloist_client.clone();
@@ -499,12 +501,6 @@ async fn main() -> Result<()> {
                     }
                 }
             });
-
-            // 4d2. Start VL53L0 proximity gesture volume reader task
-            let _vl53_task = audio::vl53::spawn_vl53_volume_task(
-                Some((*soloist_client).clone()),
-                Some(music_ducker.clone()),
-            );
 
             // 4d3. Prepare Wake-Word support and Start Control Center Web Dashboard (:8080)
             let model_path: std::path::PathBuf = std::env::var_os("MINI_WAKEWORD_MODEL")
@@ -547,6 +543,15 @@ async fn main() -> Result<()> {
                 model_path.clone(),
             );
             let current_led_color_holder = web_server.current_led_color();
+
+            // 4d2. Start VL53L0 proximity relative gesture volume task with visual & acoustic click indicators
+            let _vl53_task = audio::vl53::spawn_vl53_volume_task_with_indicators(
+                Some((*soloist_client).clone()),
+                Some(music_ducker.clone()),
+                is_gesture_active.clone(),
+                current_led_color_holder.clone(),
+            );
+
             let web_server = Arc::new(web_server);
             tokio::spawn(async move {
                 let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], web_port));
@@ -1068,7 +1073,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(55.0);
+                .unwrap_or(35.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1140,6 +1145,7 @@ async fn main() -> Result<()> {
             let soloist_playing_for_mic = is_soloist_playing.clone();
             let ducker_for_mic = music_ducker.clone();
             let voice_active_for_mic = voice_active.clone();
+            let is_gesture_for_mic = is_gesture_active.clone();
             let recorder_for_mic = hardware_recorder.clone();
             let led_color_for_mic = current_led_color_holder.clone();
             tokio::spawn(async move {
@@ -1329,12 +1335,14 @@ async fn main() -> Result<()> {
                         gate.set_manual_armed(is_manually_armed);
                     }
 
-                    // Unified visual LED state: active during input, thinking, TTS playback, alarm, or follow-up window.
-                    // Background music playback does NOT keep the blue dialogue LED on!
+                    // Unified visual LED state: active during input, thinking, TTS playback, alarm, gesture, or follow-up window.
+                    // Background music playback does NOT keep the dialogue LED on!
+                    let is_gesture = is_gesture_for_mic.load(Ordering::Relaxed);
                     let is_turn_in_progress = current_auth_turn.is_some()
                         || active_turn.is_some()
                         || is_tts_playing
-                        || is_alarm_ringing;
+                        || is_alarm_ringing
+                        || is_gesture;
                     let should_led_be_on = is_turn_in_progress || now < followup_until;
                     voice_active_for_mic.store(should_led_be_on, Ordering::SeqCst);
                     let cur_color = led_color_for_mic
@@ -1350,6 +1358,12 @@ async fn main() -> Result<()> {
                     let frames = gate.process_frame(chunk);
                     let mut now_active = gate.is_active();
                     if !was_active && now_active {
+                        // Immediately illuminate top LED ring upon wake-word detection
+                        if !led_is_on {
+                            led_is_on = true;
+                            set_led_active(true, &cur_color);
+                        }
+
                         // Prevent acoustic self-interruption: ONLY discard if the assistant's OWN TTS VOICE
                         // is currently playing or within echo decay. Music or alarms must NOT discard the wake-word!
                         if is_tts_playing || now < tts_echo_until {
@@ -1579,7 +1593,7 @@ async fn main() -> Result<()> {
 
             if !dry_run {
                 turn_off_boot_led();
-                web::set_led_hardware(&config.assistant.led_color);
+                set_led_active(false, &config.assistant.led_color);
             }
 
             // Accepted model packets retain their cancellation epoch through actual drain.
@@ -1790,17 +1804,14 @@ fn turn_off_boot_led() {
 /// Set hardware LED activity indicator (sn3236 @ 0x3c)
 fn set_led_active(active: bool, color: &str) {
     if active {
-        if color == "off" {
-            web::set_led_hardware("azure");
+        let active_color = if color.is_empty() || color == "off" {
+            "azure"
         } else {
-            web::set_led_hardware(color);
-        }
+            color
+        };
+        web::set_led_hardware(active_color);
     } else {
-        if color == "off" {
-            web::set_led_hardware("off");
-        } else {
-            web::set_led_hardware(color);
-        }
+        web::set_led_hardware("off");
     }
 }
 

@@ -53,9 +53,124 @@ pub fn scale_sample(sample: i16, level: u8) -> i16 {
     ((sample as i32 * lvl) / 10) as i16
 }
 
+/// Generate the static 48000Hz stereo MPCM byte sequence for a crisp 20ms tactile click ("клац").
+pub fn generate_click_mpcm() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 48000;
+    const DURATION_SECS: f32 = 0.020; // 20ms
+    let num_samples = (SAMPLE_RATE as f32 * DURATION_SECS) as usize; // 960 frames
+    let pcm_len = num_samples * 4; // 2 channels * 2 bytes = 3840 bytes
+
+    let mut out = Vec::with_capacity(16 + 8 + pcm_len + 8);
+
+    // 1. MPCM Preamble (16 bytes): "MPCM", ver=1, rate=48000, ch=2, bits=16
+    out.extend_from_slice(b"MPCM");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&48000u32.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+
+    // 2. DATA Record Header (8 bytes): type=1, length=pcm_len
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(pcm_len as u32).to_le_bytes());
+
+    // 3. PCM Data: 20ms 1800Hz exponential decay
+    for i in 0..num_samples {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let decay = (-t * 250.0).exp();
+        let wave = (2.0 * std::f32::consts::PI * 1800.0 * t).sin()
+            + 0.3 * (2.0 * std::f32::consts::PI * 2700.0 * t).sin();
+        let sample = (wave * decay * 14000.0).clamp(-16000.0, 16000.0) as i16;
+        let le = sample.to_le_bytes();
+        // Stereo: left and right
+        out.extend_from_slice(&le);
+        out.extend_from_slice(&le);
+    }
+
+    // 4. END Record Header (8 bytes): type=2, length=0
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    out
+}
+
+static CLICK_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<()>> =
+    std::sync::OnceLock::new();
+
+/// Trigger a non-blocking acoustic tactile click ("клац") through the audio sink.
+pub fn trigger_volume_click() {
+    if let Some(tx) = CLICK_TX.get() {
+        let _ = tx.send(());
+    }
+}
+
+/// Initialize the acoustic click worker task.
+pub fn init_volume_clicker() {
+    if CLICK_TX.get().is_some() {
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let _ = CLICK_TX.set(tx);
+
+    let click_mpcm = std::sync::Arc::new(generate_click_mpcm());
+
+    std::thread::Builder::new()
+        .name("volume-clicker".into())
+        .spawn(move || {
+            let sink_path = std::path::Path::new("/data/opt/mini-assistant/mini_pcm_sink");
+            while let Some(()) = rx.blocking_recv() {
+                #[cfg(target_os = "linux")]
+                if sink_path.exists() {
+                    use std::io::Write;
+                    if let Ok(mut child) = std::process::Command::new(sink_path)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(&click_mpcm);
+                            let _ = stdin.flush();
+                        }
+                        let _ = child.wait();
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = &click_mpcm;
+                    let _ = &sink_path;
+                }
+            }
+        })
+        .expect("Failed to spawn volume clicker thread");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_generate_click_mpcm_structure() {
+        let mpcm = generate_click_mpcm();
+        assert_eq!(&mpcm[0..4], b"MPCM");
+        assert_eq!(u32::from_le_bytes(mpcm[4..8].try_into().unwrap()), 1); // ver
+        assert_eq!(u32::from_le_bytes(mpcm[8..12].try_into().unwrap()), 48000); // rate
+        assert_eq!(u16::from_le_bytes(mpcm[12..14].try_into().unwrap()), 2); // ch
+        assert_eq!(u16::from_le_bytes(mpcm[14..16].try_into().unwrap()), 16); // bits
+
+        // Total length = 16 (preamble) + 8 (data hdr) + 3840 (pcm) + 8 (end hdr) = 3872
+        assert_eq!(mpcm.len(), 3872);
+
+        // Verify end record header at end: type=2, len=0
+        assert_eq!(
+            u32::from_le_bytes(mpcm[3864..3868].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u32::from_le_bytes(mpcm[3868..3872].try_into().unwrap()),
+            0
+        );
+    }
 
     #[test]
     fn test_volume_scale_bounds() {

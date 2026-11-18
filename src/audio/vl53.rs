@@ -28,6 +28,91 @@ const EV_ABS: u16 = 0x03;
 const EV_SYN: u16 = 0x00;
 const CODE_DISTANCE_UM: u16 = 8;
 
+pub const STEP_MM: u32 = 25;
+pub const MIN_GESTURE_MM: u32 = 40;
+#[allow(dead_code)]
+pub const MAX_GESTURE_MM: u32 = 300;
+pub const IDLE_THRESHOLD_MM: u32 = 330;
+
+/// State tracker for relative vertical hand gestures over the proximity sensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GestureSession {
+    pub in_gesture: bool,
+    pub anchor_mm: u32,
+    pub current_level: u8,
+}
+
+impl GestureSession {
+    pub fn new(current_level: u8) -> Self {
+        Self {
+            in_gesture: false,
+            anchor_mm: 0,
+            current_level: current_level.clamp(1, 10),
+        }
+    }
+
+    /// Process a new distance measurement (in mm).
+    /// Returns `Some(new_level)` if the volume level changed (meaning click + update volume!),
+    /// or `None` if volume did not change.
+    /// Also updates `in_gesture`.
+    pub fn process_distance(&mut self, dist_mm: u32) -> Option<u8> {
+        if dist_mm > IDLE_THRESHOLD_MM {
+            self.in_gesture = false;
+            self.anchor_mm = 0;
+            return None;
+        }
+
+        if dist_mm < MIN_GESTURE_MM {
+            return None;
+        }
+
+        if !self.in_gesture {
+            self.in_gesture = true;
+            self.anchor_mm = dist_mm;
+            return None; // Initial entry anchors the position, no volume change yet
+        }
+
+        // Relative delta: positive = hand raised higher (up), negative = hand lowered (down)
+        if dist_mm >= self.anchor_mm + STEP_MM {
+            let steps = (dist_mm - self.anchor_mm) / STEP_MM;
+            let mut changed = false;
+            for _ in 0..steps {
+                if self.current_level < 10 {
+                    self.current_level += 1;
+                    self.anchor_mm += STEP_MM;
+                    changed = true;
+                } else {
+                    // Reached ceiling 10: clamp anchor so descending responds immediately without deadzone
+                    self.anchor_mm = dist_mm;
+                    break;
+                }
+            }
+            if changed {
+                return Some(self.current_level);
+            }
+        } else if self.anchor_mm >= dist_mm + STEP_MM {
+            let steps = (self.anchor_mm - dist_mm) / STEP_MM;
+            let mut changed = false;
+            for _ in 0..steps {
+                if self.current_level > 1 {
+                    self.current_level -= 1;
+                    self.anchor_mm -= STEP_MM;
+                    changed = true;
+                } else {
+                    // Reached floor 1: clamp anchor
+                    self.anchor_mm = dist_mm;
+                    break;
+                }
+            }
+            if changed {
+                return Some(self.current_level);
+            }
+        }
+
+        None
+    }
+}
+
 /// Map distance in millimeters to volume level (1..=10).
 pub fn distance_to_level(dist_mm: u32) -> Option<u8> {
     const MIN_MM: u32 = 40;
@@ -60,10 +145,26 @@ pub fn enable_hardware_sensor() {
     }
 }
 
-/// Spawn the background gesture-volume reader task.
+/// Spawn the background gesture-volume reader task with backward-compatible defaults.
+#[allow(dead_code)]
 pub fn spawn_vl53_volume_task(
     soloist_client: Option<crate::spotify::SoloistClient>,
     ducker: Option<std::sync::Arc<crate::spotify::MusicDucker>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_vl53_volume_task_with_indicators(
+        soloist_client,
+        ducker,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(tokio::sync::RwLock::new("azure".to_string())),
+    )
+}
+
+/// Spawn the background gesture-volume reader task with visual and tactile indicators.
+pub fn spawn_vl53_volume_task_with_indicators(
+    soloist_client: Option<crate::spotify::SoloistClient>,
+    _ducker: Option<std::sync::Arc<crate::spotify::MusicDucker>>,
+    gesture_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    led_color: std::sync::Arc<tokio::sync::RwLock<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         enable_hardware_sensor();
@@ -93,14 +194,20 @@ pub fn spawn_vl53_volume_task(
 
         let event_size = std::mem::size_of::<InputEvent>();
         let mut buf = vec![0u8; event_size];
-        let mut last_reported_level: u8 = crate::audio::volume::current_level();
-        let mut stable_candidate: Option<u8> = None;
-        let mut stable_count: usize = 0;
+        let mut session = GestureSession::new(crate::audio::volume::current_level());
         let mut last_event_dist: u32 = 0;
+        let mut was_in_gesture = false;
 
         loop {
-            match async_fd.readable().await {
-                Ok(mut guard) => {
+            // Wait up to 400ms for new proximity event; if timed out while in gesture, exit gesture cleanly
+            let poll_result = tokio::time::timeout(
+                tokio::time::Duration::from_millis(400),
+                async_fd.readable(),
+            )
+            .await;
+
+            match poll_result {
+                Ok(Ok(mut guard)) => {
                     use std::io::Read;
                     match guard.get_inner().read_exact(&mut buf) {
                         Ok(_) => {
@@ -113,40 +220,41 @@ pub fn spawn_vl53_volume_task(
                                 last_event_dist = (ev.value / 1000) as u32;
                             } else if ev.ev_type == EV_SYN {
                                 // Process measurement at SYN_REPORT
-                                if let Some(new_level) = distance_to_level(last_event_dist) {
-                                    if stable_candidate == Some(new_level) {
-                                        stable_count += 1;
+                                session.current_level = crate::audio::volume::current_level();
+                                if let Some(new_level) = session.process_distance(last_event_dist) {
+                                    // Step change detected! Update volume and trigger acoustic "клац"
+                                    crate::audio::volume::set_volume_level(new_level);
+                                    crate::audio::volume::trigger_volume_click();
+                                    info!(
+                                        new_level,
+                                        dist_mm = last_event_dist,
+                                        anchor_mm = session.anchor_mm,
+                                        "VL53L0 relative gesture: volume changed with tactile click"
+                                    );
+
+                                    // Sync to Soloist if available
+                                    if let Some(ref soloist) = soloist_client {
+                                        let soloist_vol = new_level * 10;
+                                        let soloist = soloist.clone();
+                                        tokio::spawn(async move {
+                                            let _ = soloist.set_volume(soloist_vol).await;
+                                        });
+                                    }
+                                }
+
+                                // Update visual indicator state
+                                if session.in_gesture != was_in_gesture {
+                                    was_in_gesture = session.in_gesture;
+                                    gesture_active.store(session.in_gesture, std::sync::atomic::Ordering::SeqCst);
+                                    if session.in_gesture {
+                                        let cur_color = led_color
+                                            .try_read()
+                                            .map(|c| c.clone())
+                                            .unwrap_or_else(|_| "azure".to_string());
+                                        crate::web::set_led_hardware(&cur_color);
                                     } else {
-                                        stable_candidate = Some(new_level);
-                                        stable_count = 1;
+                                        crate::web::set_led_hardware("off");
                                     }
-
-                                    // Require 2 consecutive measurements (~60ms) to commit volume change
-                                    if stable_count >= 2 && new_level != last_reported_level {
-                                        last_reported_level = new_level;
-                                        crate::audio::volume::set_volume_level(new_level);
-                                        if let Some(ref d) = ducker {
-                                            d.cancel();
-                                        }
-                                        info!(
-                                            new_level,
-                                            dist_mm = last_event_dist,
-                                            "VL53L0 gesture: volume changed"
-                                        );
-
-                                        // Sync to Soloist if available
-                                        if let Some(ref soloist) = soloist_client {
-                                            let soloist_vol = new_level * 10;
-                                            let soloist = soloist.clone();
-                                            tokio::spawn(async move {
-                                                let _ = soloist.set_volume(soloist_vol).await;
-                                            });
-                                        }
-                                    }
-                                } else {
-                                    // Hand out of range (idle): reset debounce counters
-                                    stable_candidate = None;
-                                    stable_count = 0;
                                 }
                             }
                             guard.clear_ready();
@@ -161,9 +269,20 @@ pub fn spawn_vl53_volume_task(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("VL53L0 poll error: {e}");
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+                Err(_) => {
+                    // 400ms timeout expired with no events: hand was swiftly removed
+                    if was_in_gesture {
+                        session.in_gesture = false;
+                        session.anchor_mm = 0;
+                        was_in_gesture = false;
+                        gesture_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                        crate::web::set_led_hardware("off");
+                        debug!("VL53L0 gesture ended due to inactivity timeout");
+                    }
                 }
             }
         }
@@ -194,5 +313,72 @@ mod tests {
             }
         }
         assert_eq!(prev, 10);
+    }
+
+    #[test]
+    fn test_relative_gesture_session_stepping_up_and_down() {
+        let mut session = GestureSession::new(7);
+        assert!(!session.in_gesture);
+
+        // Hand enters at 150mm: anchors session, no volume change yet
+        assert_eq!(session.process_distance(150), None);
+        assert!(session.in_gesture);
+        assert_eq!(session.anchor_mm, 150);
+        assert_eq!(session.current_level, 7);
+
+        // Small jitter < 25mm: no change
+        assert_eq!(session.process_distance(145), None);
+        assert_eq!(session.current_level, 7);
+
+        // Lower hand to 125mm (-25mm step): level decreases to 6 (1st click)
+        assert_eq!(session.process_distance(125), Some(6));
+        assert_eq!(session.anchor_mm, 125);
+        assert_eq!(session.current_level, 6);
+
+        // Lower hand to 100mm (-25mm step): level decreases to 5 (2nd click)
+        assert_eq!(session.process_distance(100), Some(5));
+        assert_eq!(session.anchor_mm, 100);
+        assert_eq!(session.current_level, 5);
+
+        // Lower hand to 75mm (-25mm step): level decreases to 4 (3rd click)
+        assert_eq!(session.process_distance(75), Some(4));
+        assert_eq!(session.anchor_mm, 75);
+        assert_eq!(session.current_level, 4);
+
+        // Raise hand to 100mm (+25mm step): level increases back to 5
+        assert_eq!(session.process_distance(100), Some(5));
+        assert_eq!(session.anchor_mm, 100);
+        assert_eq!(session.current_level, 5);
+
+        // Hand removed (> 330mm): exits gesture session
+        assert_eq!(session.process_distance(360), None);
+        assert!(!session.in_gesture);
+        assert_eq!(session.anchor_mm, 0);
+    }
+
+    #[test]
+    fn test_relative_gesture_session_clamps_at_boundaries() {
+        // Test ceiling clamp at 10
+        let mut session = GestureSession::new(8);
+        assert_eq!(session.process_distance(100), None);
+
+        assert_eq!(session.process_distance(125), Some(9));
+        assert_eq!(session.process_distance(150), Some(10));
+
+        // Moving higher beyond 10 returns None (no more clicks!)
+        assert_eq!(session.process_distance(175), None);
+        assert_eq!(session.process_distance(200), None);
+        assert_eq!(session.current_level, 10);
+
+        // Test floor clamp at 1
+        let mut session_floor = GestureSession::new(2);
+        assert_eq!(session_floor.process_distance(150), None);
+
+        assert_eq!(session_floor.process_distance(125), Some(1));
+
+        // Moving lower beyond 1 returns None (no more clicks!)
+        assert_eq!(session_floor.process_distance(100), None);
+        assert_eq!(session_floor.process_distance(75), None);
+        assert_eq!(session_floor.current_level, 1);
     }
 }
