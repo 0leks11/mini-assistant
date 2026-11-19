@@ -39,6 +39,10 @@ pub struct AssistantConfig {
     /// Private, locally enrolled Rustpotter reference; absent means manual activation only.
     #[serde(default)]
     pub wakeword_model: Option<PathBuf>,
+    /// Whether acoustic wake-word detection is enabled (default: true).
+    /// If false, the speaker is completely deaf to all acoustic triggers.
+    #[serde(default = "default_true")]
+    pub wakeword_enabled: bool,
     /// Default top ring LED color ("azure", "purple", "emerald", "amber", "white", "off")
     #[serde(default = "default_led_color")]
     pub led_color: String,
@@ -49,6 +53,10 @@ pub struct AssistantConfig {
 
 fn default_led_color() -> String {
     "azure".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -427,6 +435,7 @@ mod tests {
             config.assistant.wake_words,
             vec!["штучка", "штучка-интеллект"]
         );
+        assert!(config.assistant.wakeword_enabled);
         assert_eq!(config.assistant.provider, VoiceProvider::Gemini);
         let gemini = config.gemini.unwrap();
         assert_eq!(gemini.model, "models/gemini-3.8-live");
@@ -459,6 +468,25 @@ mod tests {
         let ha = config.ha.unwrap();
         assert_eq!(ha.url, "http://192.168.77.2:8123");
         assert!(ha.allowed_entities.is_empty(), "HA tools must be opt-in");
+    }
+
+    #[test]
+    fn test_config_wakeword_enabled_can_be_disabled() {
+        let toml_str = r#"
+            [assistant]
+            name = "Тест"
+            voice = "Puck"
+            languages = ["ru-RU"]
+            wakeword_enabled = false
+
+            [audio]
+            capture_device = "hw:0,0"
+            playback_device = "hw:0,0"
+            sample_rate = 16000
+            channels = 1
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.assistant.wakeword_enabled);
     }
 
     #[test]

@@ -532,6 +532,10 @@ async fn main() -> Result<()> {
                         None
                     }
                 });
+            let wakeword_enabled = std::env::var("MINI_WAKEWORD_ENABLED")
+                .ok()
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(config.assistant.wakeword_enabled);
             let web_server = web::ControlCenterServer::new(
                 cfg_path_buf,
                 srv_client_id,
@@ -546,6 +550,7 @@ async fn main() -> Result<()> {
                 Some(hardware_recorder.clone()),
                 Some(tx_reload_wakeword),
                 model_path.clone(),
+                wakeword_enabled,
             );
             let current_led_color_holder = web_server.current_led_color();
 
@@ -1105,7 +1110,10 @@ async fn main() -> Result<()> {
                 .map(std::path::PathBuf::from)
                 .or(config.assistant.wakeword_model.clone())
                 .unwrap_or_else(|| "/bkupgrade/data/opt/mini-assistant/keyword.rpw".into());
-            let activation: Box<dyn wakeword::WakeWordEngine> =
+            let activation: Box<dyn wakeword::WakeWordEngine> = if !wakeword_enabled {
+                info!("Acoustic wake-word is explicitly DISABLED (wakeword_enabled = false); speaker is deaf to all acoustic triggers");
+                Box::new(wakeword::keyword::DisabledKeyword)
+            } else {
                 match wakeword::keyword::KeywordEngine::load(&model_path) {
                     Ok(engine) => {
                         info!("Local personal keyword detector loaded");
@@ -1115,7 +1123,8 @@ async fn main() -> Result<()> {
                         warn!("No valid local keyword enrollment: acoustic activation DISABLED; explicit SIGUSR1 control only");
                         Box::new(wakeword::keyword::DisabledKeyword)
                     }
-                };
+                }
+            };
             let mut gate = wakeword::InputGate::with_activation_and_initial_timeout(
                 activation,
                 vad_threshold,

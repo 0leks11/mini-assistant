@@ -50,6 +50,7 @@ pub struct ControlCenterServer {
     hardware_recorder: Option<HardwareRecorder>,
     wakeword_reload_tx: Option<mpsc::UnboundedSender<PathBuf>>,
     wakeword_model_path: PathBuf,
+    wakeword_enabled: bool,
 }
 
 impl ControlCenterServer {
@@ -76,6 +77,7 @@ impl ControlCenterServer {
             hardware_recorder: None,
             wakeword_reload_tx: None,
             wakeword_model_path: PathBuf::from("/data/opt/mini-assistant/keyword.rpw"),
+            wakeword_enabled: true,
         }
     }
 
@@ -100,10 +102,12 @@ impl ControlCenterServer {
         recorder: Option<HardwareRecorder>,
         reload_tx: Option<mpsc::UnboundedSender<PathBuf>>,
         model_path: PathBuf,
+        enabled: bool,
     ) -> Self {
         self.hardware_recorder = recorder;
         self.wakeword_reload_tx = reload_tx;
         self.wakeword_model_path = model_path;
+        self.wakeword_enabled = enabled;
         self
     }
 
@@ -393,6 +397,7 @@ impl ControlCenterServer {
             "led_color": cur_led,
             "wakeword": {
                 "name": cur_wakeword,
+                "enabled": self.wakeword_enabled,
                 "session_active": wakeword_session_active,
             },
             "ip": metrics.ip,
@@ -826,6 +831,9 @@ impl ControlCenterServer {
     }
 
     fn read_active_wakeword_name(&self) -> String {
+        if !self.wakeword_enabled {
+            return "Отключено (Deaf mode)".to_string();
+        }
         if self.wakeword_model_path.exists() {
             if let Some(path_str) = self.wakeword_model_path.to_str() {
                 if let Ok(ref_model) = WakewordRef::load_from_file(path_str) {
