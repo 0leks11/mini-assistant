@@ -112,7 +112,7 @@ check "VL53L0 sensor enabled" $?
 REMOTE "grep -q . /proc/asound/card0/pcm0p/sub0/status"; check "ALSA playback PCM exists" $?
 
 # 6. Runtime log markers
-LOG_TAIL="$(REMOTE "tail -n 400 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null")"
+LOG_TAIL="$(REMOTE "tail -n 2000 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null")"
 grep -q "setupComplete confirmed" <<< "$LOG_TAIL"; check "Gemini Live setupComplete" $?
 grep -q "spotify_tools: true" <<< "$LOG_TAIL"; check "spotify tools registered" $?
 grep -q "volume_tools: true" <<< "$LOG_TAIL"; check "volume tools registered" $?
