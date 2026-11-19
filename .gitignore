@@ -10,9 +10,27 @@ mini_pcm_source
 config.toml
 *.key
 *.pem
+*.crt
+*.cert
+*.pfx
+*.p12
+*.token
+*.tokens
+*.secret
+*.secrets
+*id_rsa*
+*id_ed25519*
+client_secret*.json
+token.json
+tokens.json
+*.auth
 *.ppn
 .credentials/
 .spotify-credentials
+*.sqlite
+*.sqlite3
+*.db
+*.dump
 
 # OS
 .DS_Store
