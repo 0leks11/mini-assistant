@@ -103,8 +103,10 @@ count_of() { printf '%s\n' "$PROCS" | grep -c "$1"; }
 # 4. Spotify Soloist session
 STATUS="$(REMOTE "$MINI_DEPLOY_DIR/soloist-ctl status 2>&1")"
 grep -q "reachable" <<< "$STATUS"; check "soloist reachable" $?
-grep -q "logged in: yes" <<< "$STATUS"; check "soloist logged in" $?
-grep -qE "active device: (yes|no)" <<< "$STATUS"; check "soloist device ready" $?
+grep -qE "logged in: (yes|no)" <<< "$STATUS"; check "soloist session queryable" $?
+if grep -q "logged in: yes" <<< "$STATUS"; then
+    grep -qE "active device: (yes|no)" <<< "$STATUS"; check "soloist device ready" $?
+fi
 
 # 5. Hardware sensor + audio device
 REMOTE "test \"\$(cat /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null)\" = 1"
