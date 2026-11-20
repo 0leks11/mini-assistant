@@ -14,7 +14,7 @@ use crate::spotify::web_api::SpotifyApiClient;
 use crate::spotify::{MusicDucker, PlaybackState, SoloistClient};
 use crate::wakeword::enrollment::{decode_wav_pcm16, EnrollmentSession, HardwareRecorder};
 use anyhow::{Context, Result};
-use rustpotter::{WakewordLoad, WakewordRef};
+use rustpotter::{WakewordLoad, WakewordRef, WakewordSave};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -283,7 +283,10 @@ impl ControlCenterServer {
                     .await?;
             }
             ("POST", "/api/v1/wakeword/compile") => {
-                self.handle_api_wakeword_compile(&mut stream).await?;
+                self.handle_api_wakeword_compile(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/wakeword/rename") | ("POST", "/api/v1/wakeword/name") => {
+                self.handle_api_wakeword_rename(&mut stream, body).await?;
             }
             ("GET", "/api/v1/wakeword/analysis")
             | ("GET", "/api/v1/wakeword/session/analysis") => {
@@ -860,7 +863,7 @@ impl ControlCenterServer {
             .name
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Штучка".to_string());
+            .unwrap_or_else(|| self.read_active_wakeword_name());
 
         let session = EnrollmentSession::new(kw_name.clone());
         let (phase, phase_name) = EnrollmentSession::phase_for_step(1);
@@ -1098,15 +1101,26 @@ impl ControlCenterServer {
         self.send_json(stream, &resp).await
     }
 
-    async fn handle_api_wakeword_compile(&self, stream: &mut TcpStream) -> Result<()> {
+    async fn handle_api_wakeword_compile(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
         let mut session_guard = self.wakeword_session.write().await;
-        let sess = match session_guard.take() {
+        let mut sess = match session_guard.take() {
             Some(s) => s,
             None => {
                 let err = serde_json::json!({ "status": "error", "message": "Сессия не активна" });
                 return self.send_json_status(stream, "400 Bad Request", &err).await;
             }
         };
+
+        // Accept optional updated keyword name from compile payload
+        #[derive(serde::Deserialize)]
+        struct CompileReq {
+            name: Option<String>,
+        }
+        if let Ok(req) = serde_json::from_str::<CompileReq>(body) {
+            if let Some(n) = req.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                sess.keyword_name = n;
+            }
+        }
 
         if !sess.can_compile {
             *session_guard = Some(sess);
@@ -1123,6 +1137,11 @@ impl ControlCenterServer {
                 if let Some(ref tx) = self.wakeword_reload_tx {
                     let _ = tx.send(self.wakeword_model_path.clone());
                     info!(path = ?self.wakeword_model_path, "Triggered hot-reload of new wake-word model");
+                }
+
+                // Synchronize config.toml
+                if let Some(ref cfg_path) = self.config_path {
+                    let _ = update_config_wakeword(cfg_path, &compile_res.keyword_name);
                 }
 
                 // Visual flash: green / emerald
@@ -1146,6 +1165,80 @@ impl ControlCenterServer {
                     .await
             }
         }
+    }
+
+    async fn handle_api_wakeword_rename(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct RenameReq {
+            name: Option<String>,
+        }
+        let req: RenameReq = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = serde_json::json!({ "status": "error", "message": format!("Неверный JSON: {e}") });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        let raw_name = match req.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(n) => n,
+            None => {
+                let err = serde_json::json!({ "status": "error", "message": "Имя слова вызова не может быть пустым" });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        if raw_name.len() > 64 {
+            let err = serde_json::json!({ "status": "error", "message": "Имя слова вызова слишком длинное (макс 64 символа)" });
+            return self.send_json_status(stream, "400 Bad Request", &err).await;
+        }
+
+        // 1. Rename in model file on disk
+        if self.wakeword_model_path.exists() {
+            if let Some(path_str) = self.wakeword_model_path.to_str() {
+                match WakewordRef::load_from_file(path_str) {
+                    Ok(mut reference) => {
+                        reference.name = raw_name.to_lowercase();
+                        match reference.save_to_buffer() {
+                            Ok(bytes) => {
+                                if let Err(e) = std::fs::write(&self.wakeword_model_path, bytes) {
+                                    tracing::warn!("Failed to save renamed wakeword model to file: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to serialize renamed wakeword model: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Could not load model for rename: {e}");
+                    }
+                }
+            }
+        }
+
+        // 2. Trigger hot reload to InputGate
+        if let Some(ref tx) = self.wakeword_reload_tx {
+            let _ = tx.send(self.wakeword_model_path.clone());
+            info!(path = ?self.wakeword_model_path, keyword = %raw_name, "Triggered hot-reload of renamed wake-word model");
+        }
+
+        // 3. Update config.toml
+        if let Some(ref cfg_path) = self.config_path {
+            if let Err(e) = update_config_wakeword(cfg_path, &raw_name) {
+                tracing::warn!("Failed to update config.toml with new wakeword: {e}");
+            }
+        }
+
+        // 4. Flash emerald LED
+        set_led_hardware("emerald");
+
+        let resp = serde_json::json!({
+            "status": "ok",
+            "keyword_name": raw_name,
+            "message": format!("Слово вызова успешно обновлено на «{}»!", raw_name)
+        });
+        self.send_json(stream, &resp).await
     }
 
     async fn handle_api_wakeword_analysis(&self, stream: &mut TcpStream) -> Result<()> {
@@ -1436,6 +1529,69 @@ pub fn update_config_led_color(config_path: &Path, new_color: &str) -> Result<()
     Ok(())
 }
 
+pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> {
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let mut updated = Vec::new();
+    let mut in_assistant_section = false;
+    let mut replaced_name = false;
+    let mut replaced_wake_words = false;
+
+    let clean_name = new_name.trim();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_assistant_section = trimmed == "[assistant]";
+            updated.push(line.to_string());
+            continue;
+        }
+
+        if in_assistant_section {
+            if trimmed.starts_with("name") && trimmed.contains('=') && !replaced_name {
+                let indent = line
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<String>();
+                updated.push(format!("{}name = \"{}\"", indent, clean_name));
+                replaced_name = true;
+                continue;
+            }
+            if trimmed.starts_with("wake_words") && trimmed.contains('=') && !replaced_wake_words {
+                let indent = line
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<String>();
+                updated.push(format!("{}wake_words = [\"{}\"]", indent, clean_name.to_lowercase()));
+                replaced_wake_words = true;
+                continue;
+            }
+        }
+
+        updated.push(line.to_string());
+    }
+
+    if !replaced_name || !replaced_wake_words {
+        let mut final_lines = Vec::new();
+        for line in updated.drain(..) {
+            let is_assistant = line.trim() == "[assistant]";
+            final_lines.push(line);
+            if is_assistant {
+                if !replaced_name {
+                    final_lines.push(format!("name = \"{}\"", clean_name));
+                }
+                if !replaced_wake_words {
+                    final_lines.push(format!("wake_words = [\"{}\"]", clean_name.to_lowercase()));
+                }
+            }
+        }
+        updated = final_lines;
+    }
+
+    std::fs::write(config_path, updated.join("\n") + "\n")?;
+    Ok(())
+}
+
 pub struct SystemMetrics {
     pub uptime_formatted: String,
     pub mem_total_mb: u64,
@@ -1646,6 +1802,29 @@ capture_device = "hw:0,2"
         let updated = std::fs::read_to_string(&cfg_file).unwrap();
         assert!(updated.contains("led_color = \"purple\""));
         assert!(!updated.contains("led_color = \"azure\""));
+        assert!(updated.contains("capture_device = \"hw:0,2\""));
+
+        std::fs::remove_file(&cfg_file).unwrap();
+    }
+
+    #[test]
+    fn test_update_config_wakeword() {
+        let temp_dir = std::env::temp_dir();
+        let cfg_file = temp_dir.join(format!("test_config_ww_{}.toml", uuid::Uuid::new_v4()));
+        let initial_toml = r#"
+[assistant]
+name = "Штучка"
+wake_words = ["штучка", "штучка-интеллект"]
+
+[audio]
+capture_device = "hw:0,2"
+"#;
+        std::fs::write(&cfg_file, initial_toml).unwrap();
+
+        update_config_wakeword(&cfg_file, "Джарвис").unwrap();
+        let updated = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(updated.contains("name = \"Джарвис\""));
+        assert!(updated.contains("wake_words = [\"джарвис\"]"));
         assert!(updated.contains("capture_device = \"hw:0,2\""));
 
         std::fs::remove_file(&cfg_file).unwrap();

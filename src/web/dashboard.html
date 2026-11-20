@@ -645,19 +645,13 @@
   <div class="card">
     <div class="card-title">
       <span>Громкость колонки</span>
-      <span style="font-weight: normal; font-size: 11px; color: var(--text-muted);">Шкала 0–10</span>
+      <span style="font-weight: normal; font-size: 11px; color: var(--text-muted);">Шкала 1–10</span>
     </div>
     <div class="volume-box">
       <div class="volume-header">
         <div class="volume-level"><span id="vol-display">7</span><span>/ 10</span></div>
       </div>
-      <input type="range" id="vol-slider" min="0" max="10" step="1" value="7">
-      <div class="volume-actions">
-        <button class="btn-icon" onclick="setVolume(0)">🔇 0</button>
-        <button class="btn-icon" onclick="stepVolume(-1)">🔉 -1</button>
-        <button class="btn-icon" onclick="stepVolume(1)">🔊 +1</button>
-        <button class="btn-icon" onclick="setVolume(10)">📢 10</button>
-      </div>
+      <input type="range" id="vol-slider" min="1" max="10" step="1" value="7">
     </div>
   </div>
 
@@ -756,6 +750,10 @@
     <div class="ww-box">
       <!-- State 1: Idle View -->
       <div id="ww-view-idle">
+        <div class="ww-input-row" style="margin-bottom: 12px;">
+          <input type="text" id="ww-name-idle-input" class="ww-input" placeholder="Имя слова вызова (например: Штучка, Джарвис)" value="Штучка">
+          <button class="btn-icon" style="flex: 0 0 auto; padding: 0 14px;" onclick="renameWakeword()">💾 Сохранить</button>
+        </div>
         <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
           Акустическая модель распознавания ключевого слова на устройстве. Вы можете обучить колонку собственному слову вызова с персональным тембром голоса и мгновенно применить его без перезагрузки.
         </p>
@@ -767,7 +765,7 @@
       <!-- State 2: Active Wizard -->
       <div id="ww-view-wizard" class="ww-wizard" style="display: none;">
         <div class="ww-input-row">
-          <input type="text" id="ww-name-input" class="ww-input" placeholder="Имя слова (например: Штучка, Джарвис)" value="Штучка">
+          <input type="text" id="ww-name-input" class="ww-input" placeholder="Имя слова вызова (например: Штучка, Джарвис)" value="Штучка">
           <button class="btn-icon" style="flex: 0 0 auto; padding: 0 12px;" onclick="resetWakewordSession()">Сброс</button>
         </div>
 
@@ -1007,7 +1005,7 @@
   });
 
   async function setVolume(lvl) {
-    lvl = Math.max(0, Math.min(10, lvl));
+    lvl = Math.max(1, Math.min(10, lvl));
     volSlider.value = lvl;
     volDisplay.innerText = lvl;
     try {
@@ -1016,7 +1014,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ level: lvl })
       });
-      showToast("Громкость: " + lvl);
+      showToast("Громкость: " + lvl + " / 10");
     } catch (e) {
       console.error(e);
     }
@@ -1116,6 +1114,10 @@
       // Wake-Word
       if (data.wakeword && data.wakeword.name) {
         document.getElementById("current-ww-badge").innerText = data.wakeword.name;
+        const idleInp = document.getElementById("ww-name-idle-input");
+        if (idleInp && document.activeElement !== idleInp) {
+          idleInp.value = data.wakeword.name;
+        }
       }
 
       // LED Color
@@ -1147,9 +1149,41 @@
     if (p) p.classList.toggle("animating", active);
   }
 
+  async function renameWakeword() {
+    const input = document.getElementById("ww-name-idle-input");
+    const newName = (input.value || "").trim();
+    if (!newName) {
+      showToast("Введите имя слова вызова");
+      return;
+    }
+    try {
+      const res = await fetch("/api/v1/wakeword/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newName })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || "Имя слова вызова обновлено!");
+        document.getElementById("current-ww-badge").innerText = data.keyword_name || newName;
+        fetchStatus();
+      } else {
+        showToast(data.message || "Ошибка обновления имени");
+      }
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
   async function startWakewordWizard() {
-    const nameInput = document.getElementById("ww-name-input");
-    const kwName = nameInput.value.trim() || "Штучка";
+    const idleInput = document.getElementById("ww-name-idle-input");
+    const wizardInput = document.getElementById("ww-name-input");
+    const currentBadge = document.getElementById("current-ww-badge");
+    const currentName = (currentBadge && currentBadge.innerText.trim()) || "Штучка";
+    const kwName = (idleInput && idleInput.value.trim()) || (wizardInput && wizardInput.value.trim()) || currentName;
+    if (wizardInput) wizardInput.value = kwName;
+    if (idleInput) idleInput.value = kwName;
+
     try {
       const res = await fetch("/api/v1/wakeword/session/start", {
         method: "POST",
@@ -1161,7 +1195,7 @@
         document.getElementById("ww-view-idle").style.display = "none";
         document.getElementById("ww-view-wizard").style.display = "flex";
         updateWakewordUI(data);
-        showToast("Сессия обучения начата! Запишите сэмплы.");
+        showToast("Сессия обучения начата для «" + kwName + "»!");
       } else {
         showToast(data.message || "Ошибка запуска сессии");
       }
@@ -1429,16 +1463,25 @@
     const btn = document.getElementById("btn-ww-compile");
     btn.disabled = true;
     btn.innerText = "Компиляция и загрузка в память...";
+    const wizardInput = document.getElementById("ww-name-input");
+    const idleInput = document.getElementById("ww-name-idle-input");
+    const kwName = (wizardInput && wizardInput.value.trim()) || (idleInput && idleInput.value.trim()) || "Штучка";
 
     try {
-      const res = await fetch("/api/v1/wakeword/compile", { method: "POST" });
+      const res = await fetch("/api/v1/wakeword/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: kwName })
+      });
       const data = await res.json();
       if (res.ok) {
         showToast(data.message || "Модель активирована!");
         if (data.details && data.details.keyword_name) {
           document.getElementById("current-ww-badge").innerText = data.details.keyword_name;
+          if (idleInput) idleInput.value = data.details.keyword_name;
         }
         closeWakewordWizard();
+        fetchStatus();
       } else {
         showToast(data.message || "Ошибка компиляции");
         btn.disabled = false;
