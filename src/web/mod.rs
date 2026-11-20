@@ -556,7 +556,14 @@ impl ControlCenterServer {
             color: String,
         }
         let req: LedReq = serde_json::from_str(body).context("Invalid JSON body")?;
-        set_led_hardware(&req.color);
+        let color_clone = req.color.clone();
+        tokio::spawn(async move {
+            if color_clone != "off" {
+                set_led_hardware(&color_clone);
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            set_led_hardware("off");
+        });
         *self.current_led_color.write().await = req.color.clone();
 
         if let Some(ref path) = self.config_path {
@@ -936,15 +943,14 @@ impl ControlCenterServer {
             }
         };
 
-        // Visual indicator: pulse amber LED
-        let prev_color = self.current_led_color.read().await.clone();
+        // Visual indicator: pulse amber LED while recording
         set_led_hardware("amber");
 
         // Record 2.5 seconds of audio from Mini's hardware microphone
         let record_res = recorder.record(Duration::from_millis(2500)).await;
 
-        // Restore LED
-        set_led_hardware(&prev_color);
+        // Turn off LED after sample recording
+        set_led_hardware("off");
 
         let pcm = match record_res {
             Ok(p) => p,
@@ -1144,8 +1150,12 @@ impl ControlCenterServer {
                     let _ = update_config_wakeword(cfg_path, &compile_res.keyword_name);
                 }
 
-                // Visual flash: green / emerald
-                set_led_hardware("emerald");
+                // Visual flash: green / emerald for 800ms to confirm
+                tokio::spawn(async {
+                    set_led_hardware("emerald");
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    set_led_hardware("off");
+                });
 
                 let resp = serde_json::json!({
                     "status": "ok",
@@ -1230,8 +1240,12 @@ impl ControlCenterServer {
             }
         }
 
-        // 4. Flash emerald LED
-        set_led_hardware("emerald");
+        // 4. Flash emerald LED for 800ms to confirm
+        tokio::spawn(async {
+            set_led_hardware("emerald");
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            set_led_hardware("off");
+        });
 
         let resp = serde_json::json!({
             "status": "ok",
