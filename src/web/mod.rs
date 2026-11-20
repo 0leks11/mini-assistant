@@ -807,7 +807,7 @@ impl ControlCenterServer {
         body: &[u8],
     ) -> Result<()> {
         let headers = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(headers.as_bytes()).await?;
