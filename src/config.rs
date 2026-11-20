@@ -43,6 +43,9 @@ pub struct AssistantConfig {
     /// If false, the speaker is completely deaf to all acoustic triggers.
     #[serde(default = "default_true")]
     pub wakeword_enabled: bool,
+    /// Whether to play a soft acoustic earcon chime upon wake-word trigger (default: false).
+    #[serde(default)]
+    pub wake_chime: bool,
     /// Default top ring LED color ("azure", "purple", "emerald", "amber", "white", "off")
     #[serde(default = "default_led_color")]
     pub led_color: String,

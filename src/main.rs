@@ -1095,12 +1095,15 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|v| (200..=10000).contains(v))
-                .unwrap_or(1200);
+                .unwrap_or(1100);
             let initial_silence_timeout_ms = std::env::var("MINI_INITIAL_SILENCE_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|v| (500..=15000).contains(v))
                 .unwrap_or(1800);
+            let wake_chime_enabled = std::env::var("MINI_WAKE_CHIME")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(config.assistant.wake_chime);
             let mic_gain = std::env::var("MINI_MIC_GAIN")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -1400,6 +1403,16 @@ async fn main() -> Result<()> {
                                 info!("Acoustic wake-word barge-in: stopping ringing alarm");
                                 alarm.stop();
                             }
+                        }
+
+                        // Optional acoustic earcon: soft confirmation chime if enabled
+                        if wake_chime_enabled {
+                            let playback = playback_for_mic.clone();
+                            tokio::spawn(async move {
+                                let chime_pcm = alarms::sound::generate_wake_chime();
+                                let epoch = playback.cancellation_epoch();
+                                let _ = playback.play(epoch, 0xFFFF_0001, chime_pcm).await;
+                            });
                         }
 
                         // Acoustic Music Ducking: if Soloist is playing, lower volume to 20%

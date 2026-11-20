@@ -8,6 +8,7 @@
 use crate::audio::volume;
 use crate::spotify::{PlaybackState, SoloistClient};
 use std::sync::atomic::{AtomicU8, Ordering};
+use tokio::time::{sleep, Duration};
 use tracing::info;
 
 /// Calculate proportional ducked volume level (1..=10 scale):
@@ -80,17 +81,26 @@ impl MusicDucker {
             .compare_exchange(0, current_lvl, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
+            let orig_pct = current_lvl * 10;
+            let ducked_pct = ducked_lvl * 10;
             info!(
                 orig_level = current_lvl,
                 ducked_level = ducked_lvl,
-                ducked_pct = ducked_lvl * 10,
-                "Acoustic barge-in: proportionally ducking music volume"
+                ducked_pct,
+                "Acoustic barge-in: smoothly ducking music volume"
             );
-            let _ = soloist.set_volume(ducked_lvl * 10).await;
+
+            // Fast smooth ramp down (~80 ms) if drop is substantial
+            if orig_pct > ducked_pct + 15 {
+                let mid_pct = (orig_pct + ducked_pct) / 2;
+                let _ = soloist.set_volume(mid_pct).await;
+                sleep(Duration::from_millis(40)).await;
+            }
+            let _ = soloist.set_volume(ducked_pct).await;
         }
     }
 
-    /// Restore volume strictly to pre-duck level if still ducked.
+    /// Restore volume strictly to pre-duck level if still ducked, ramping up smoothly over ~350-400 ms.
     pub async fn restore_if_ducked(&self, soloist: &SoloistClient) {
         let pre_level = self.ducked_from_level.swap(0, Ordering::SeqCst);
         if pre_level > 0 {
@@ -106,9 +116,34 @@ impl MusicDucker {
             info!(
                 restored_level = target_level,
                 orig_level = pre_level,
-                "Dialogue ended: restoring music volume strictly to pre-duck level"
+                "Dialogue ended: smoothly restoring music volume to pre-duck level"
             );
-            let _ = soloist.set_volume(target_level * 10).await;
+
+            let start_pct = ducked_lvl * 10;
+            let target_pct = target_level * 10;
+
+            if target_pct > start_pct + 15 {
+                let step = (target_pct - start_pct) / 3;
+                let v1 = start_pct + step;
+                let v2 = start_pct + step * 2;
+
+                let _ = soloist.set_volume(v1).await;
+                sleep(Duration::from_millis(90)).await;
+
+                // Abort ramp if user explicitly intervened during restoration
+                if self.ducked_from_level.load(Ordering::Relaxed) != 0 {
+                    return;
+                }
+
+                let _ = soloist.set_volume(v2).await;
+                sleep(Duration::from_millis(90)).await;
+
+                if self.ducked_from_level.load(Ordering::Relaxed) != 0 {
+                    return;
+                }
+            }
+
+            let _ = soloist.set_volume(target_pct).await;
             volume::set_volume_level(target_level);
         }
     }

@@ -42,6 +42,29 @@ pub fn generate_synthetic_chime(sample_rate: u32) -> Vec<i16> {
     pcm
 }
 
+/// Generate short, soft acoustic wake-word earcon chime (~100ms, 2-tone gentle rising chime: 740 Hz -> 932 Hz).
+/// Formatted as 24kHz 16-bit mono signed PCM for direct output via playback.
+pub fn generate_wake_chime() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 24000;
+    // 2 soft tones: 740 Hz (45ms) and 932 Hz (55ms) with smooth 8ms attack and decay
+    let tones = [(740.0f32, 0.045f32), (932.0f32, 0.055f32)];
+    let mut pcm = Vec::new();
+    for (freq, dur) in tones {
+        let total_samples = (SAMPLE_RATE as f32 * dur) as usize;
+        for i in 0..total_samples {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            let attack = (t / 0.008).min(1.0);
+            let decay = ((dur - t) / 0.008).clamp(0.0, 1.0);
+            let env = attack * decay;
+            let wave = (2.0 * std::f32::consts::PI * freq * t).sin();
+            // Soft volume (~ -18 dBFS, max amplitude ~4000 out of 32767)
+            let sample = (wave * env * 4000.0).clamp(-32767.0, 32767.0) as i16;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    pcm
+}
+
 /// Apply progressive volume ramp (fade-in) to PCM samples.
 /// `progress` smoothly increases from `min_gain` to `max_gain` over `ramp_secs`.
 pub fn apply_volume_ramp(
@@ -203,6 +226,20 @@ mod tests {
         for &s in &pcm {
             assert!(s >= -32767);
         }
+    }
+
+    #[test]
+    fn test_generate_wake_chime() {
+        let pcm = generate_wake_chime();
+        // 24kHz * 100ms = 2400 samples * 2 bytes = 4800 bytes
+        assert_eq!(pcm.len(), 4800);
+        // Non-empty audio with audible but soft amplitude
+        let mut max_val = 0i16;
+        for chunk in pcm.chunks_exact(2) {
+            let val = i16::from_le_bytes([chunk[0], chunk[1]]);
+            max_val = max_val.max(val.abs());
+        }
+        assert!(max_val > 1000 && max_val <= 4000);
     }
 
     #[test]

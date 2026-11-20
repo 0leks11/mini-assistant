@@ -9,6 +9,8 @@ voice = "Aoede"                          # Gemini voice (Aoede/Charon/Fenrir/Kor
 # Labels do not train a detector. A private enrolled reference is required.
 wake_words = ["штучка", "штучка-интеллект"]
 # wakeword_model = "/bkupgrade/data/opt/mini-assistant/keyword.rpw"
+# wakeword_enabled = true                  # false = deaf mode (deactivates acoustic triggers)
+# wake_chime = false                       # true = play soft acoustic confirmation earcon on wake word
 languages = ["ru-RU", "en-US"]
 
 [gemini]
