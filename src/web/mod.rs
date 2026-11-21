@@ -233,7 +233,7 @@ impl ControlCenterServer {
 
         match (method, path) {
             // Dashboard UI
-            ("GET", "/") | ("GET", "/index.html") | ("GET", "/setup") => {
+            ("GET", "/") | ("HEAD", "/") | ("GET", "/index.html") | ("HEAD", "/index.html") | ("GET", "/setup") => {
                 self.send_response(
                     &mut stream,
                     "200 OK",
