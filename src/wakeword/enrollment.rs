@@ -546,7 +546,7 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
     // 5. Outlier Detection: low similarity (< 0.45), low SNR (< 8 dB), or >2σ below mean
     let mean_c = centralities.iter().sum::<f32>() / n as f32;
     let var_c = centralities.iter().map(|&c| (c - mean_c).powi(2)).sum::<f32>() / n as f32;
-    let std_c = var_c.sqrt();
+    let _std_c = var_c.sqrt(); // retained for future 2σ outlier reporting if needed
 
     let mut sample_reports = Vec::with_capacity(n);
     let mut outlier_count = 0usize;
