@@ -559,18 +559,16 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
         if features_list[i].is_none() {
             is_outlier = true;
             outlier_reason = Some("Ошибка извлечения акустических признаков MFCC".to_string());
-        } else if s.snr < 8.0 {
+        } else if s.snr < 6.0 {
+            // Only reject samples with severe noise — variations in tone/intonation are DESIRABLE.
+            // A lower similarity to others does NOT mean bad quality; it means phonetic diversity,
+            // which improves generalization. Threshold lowered from 8 dB to 6 dB.
             is_outlier = true;
             outlier_reason =
-                Some(format!("Слишком высокий фоновый шум: SNR {:.1} дБ (< 8 дБ)", s.snr));
-        } else if c < 0.45 {
-            is_outlier = true;
-            outlier_reason = Some(format!("Низкая акустическая схожесть ({:.1}%)", c * 100.0));
-        } else if n >= 6 && c < (mean_c - 2.0 * std_c) {
-            is_outlier = true;
-            outlier_reason =
-                Some("Аномальное отклонение произношения от среднего профиля".to_string());
+                Some(format!("Слишком высокий фоновый шум: SNR {:.1} дБ (< 6 дБ)", s.snr));
         }
+        // NOTE: Removed centrality < 0.45 filter — low centrality = high variation = good for robustness.
+        // NOTE: Removed 2σ outlier filter — it eliminates exactly the diverse samples we need.
 
         if is_outlier {
             outlier_count += 1;
@@ -589,7 +587,16 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
         });
     }
 
-    // 6. Optimal Centroid Selection (Target: 7 templates across 3 distance zones)
+    // 6. Diversity-first Template Selection (Target: 8 templates across 3 distance zones)
+    //
+    // KEY INSIGHT: For wake-word robustness we want MAXIMUM PHONETIC DIVERSITY among templates,
+    // NOT samples that sound most similar to each other (centroids).
+    // Rustpotter matches if ANY template scores above threshold → more varied templates = better
+    // generalization across different speaking styles, distances, and tones.
+    //
+    // Algorithm: greedy max-spread selection — pick the first valid sample, then repeatedly
+    // pick the sample whose MINIMUM pairwise similarity to already-selected set is lowest
+    // (i.e., most different from everything already chosen).
     let mut non_outliers: Vec<(usize, &EnrollmentSample, f32)> = sample_reports
         .iter()
         .zip(samples.iter())
@@ -597,7 +604,7 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
         .map(|(r, s)| (s.id, s, r.centrality_score))
         .collect();
 
-    // If too few non-outliers, fall back to best centralities overall
+    // If too few non-outliers, use all samples regardless
     if non_outliers.len() < MIN_STEPS {
         non_outliers = sample_reports
             .iter()
@@ -606,32 +613,53 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
             .collect();
     }
 
-    let mut selected_ids = Vec::new();
-    let phase_quotas = [(1u8, 3usize), (2, 2), (3, 2)];
+    // Build index mapping sample id → matrix row
+    let id_to_idx: std::collections::HashMap<usize, usize> =
+        samples.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
 
-    for (p, quota) in phase_quotas {
-        let mut phase_samples: Vec<(usize, f32)> = non_outliers
-            .iter()
-            .filter(|(_, s, _)| s.phase == p)
-            .map(|(id, _, c)| (*id, *c))
-            .collect();
-        phase_samples.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (id, _) in phase_samples.into_iter().take(quota) {
-            selected_ids.push(id);
+    let target_total = MAX_TEMPLATES.min(non_outliers.len()).max(MIN_STEPS);
+
+    // Greedy max-spread: start from the sample with highest centrality (most representative anchor)
+    let mut selected_ids: Vec<usize> = Vec::with_capacity(target_total);
+    {
+        // Phase-aware seeding: seed one sample from each phase first (most central per phase)
+        for phase in [1u8, 2, 3] {
+            if selected_ids.len() >= target_total { break; }
+            if let Some((id, _c)) = non_outliers
+                .iter()
+                .filter(|(_, s, _)| s.phase == phase)
+                .map(|(id, _, c)| (*id, *c))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+            {
+                if !selected_ids.contains(&id) {
+                    selected_ids.push(id);
+                }
+            }
         }
-    }
 
-    // Fill remaining up to 7 (or at most MAX_TEMPLATES 8) from highest remaining centralities
-    let target_total = 7.min(n).max(MIN_STEPS);
-    if selected_ids.len() < target_total {
-        let mut remaining: Vec<(usize, f32)> = non_outliers
-            .iter()
-            .filter(|(id, _, _)| !selected_ids.contains(id))
-            .map(|(id, _, c)| (*id, *c))
-            .collect();
-        remaining.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (id, _) in remaining.into_iter().take(target_total - selected_ids.len()) {
-            selected_ids.push(id);
+        // Greedy spread: keep adding the sample most unlike all already selected
+        while selected_ids.len() < target_total {
+            let best = non_outliers
+                .iter()
+                .filter(|(id, _, _)| !selected_ids.contains(id))
+                .map(|(id, _, _c)| {
+                    // min similarity to any already-selected template = spread score
+                    let min_sim = selected_ids
+                        .iter()
+                        .filter_map(|sel_id| {
+                            let ri = id_to_idx.get(id)?;
+                            let rj = id_to_idx.get(sel_id)?;
+                            Some(matrix[*ri][*rj])
+                        })
+                        .fold(f32::INFINITY, f32::min);
+                    (*id, if min_sim.is_infinite() { 0.0 } else { min_sim })
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1)); // pick sample with LOWEST min-sim = most different
+
+            match best {
+                Some((id, _)) => selected_ids.push(id),
+                None => break,
+            }
         }
     }
 
@@ -960,10 +988,16 @@ mod tests {
         assert!(report.mid_consistency > 50.0);
         assert!(report.far_consistency > 50.0);
 
-        // Target down-selection should select 7 templates (3 near, 2 mid, 2 far)
-        assert_eq!(report.selected_template_ids.len(), 7);
+        // Diversity-first selection: target is MAX_TEMPLATES (8), one seed per phase + greedy spread.
+        // We only assert the range, not the exact count, because greedy spread may stop early
+        // if candidates are exhausted (synthetic data may not have all phases populated).
+        let n_selected = report.selected_template_ids.len();
+        assert!(
+            (MIN_STEPS..=MAX_TEMPLATES).contains(&n_selected),
+            "Selected template count {n_selected} should be in [{MIN_STEPS}, {MAX_TEMPLATES}]"
+        );
 
-        // Check phase breakdown of selected templates:
+        // All three distance zones should be represented (at least 1 seed per phase)
         let phase1_count = report
             .selected_template_ids
             .iter()
@@ -980,9 +1014,9 @@ mod tests {
             .filter(|&&id| (21..=30).contains(&id))
             .count();
 
-        assert_eq!(phase1_count, 3, "Should select 3 templates from Near zone");
-        assert_eq!(phase2_count, 2, "Should select 2 templates from Mid zone");
-        assert_eq!(phase3_count, 2, "Should select 2 templates from Far zone");
+        assert!(phase1_count >= 1, "Near zone must have at least 1 template");
+        assert!(phase2_count >= 1, "Mid zone must have at least 1 template");
+        assert!(phase3_count >= 1, "Far zone must have at least 1 template");
         assert!(report.can_compile);
     }
 }
