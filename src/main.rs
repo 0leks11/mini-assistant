@@ -563,12 +563,13 @@ async fn main() -> Result<()> {
             );
 
             let web_server = Arc::new(web_server);
+            let srv_8080 = web_server.clone();
             tokio::spawn(async move {
                 let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], web_port));
                 match tokio::net::TcpListener::bind(bind_addr).await {
                     Ok(listener) => {
                         let (_tx, rx) = tokio::sync::watch::channel(false);
-                        if let Err(e) = web_server.run(listener, rx).await {
+                        if let Err(e) = srv_8080.run(listener, rx).await {
                             warn!(error = %e, "Control Center web server stopped with error");
                         }
                     }
@@ -577,6 +578,29 @@ async fn main() -> Result<()> {
                     }
                 }
             });
+
+            // Also bind standard HTTP port 80 so users can open clean http://gpt-mini.local/ without typing :8080
+            if web_port != 80 {
+                let srv_80 = web_server.clone();
+                tokio::spawn(async move {
+                    let bind_addr_80 = std::net::SocketAddr::from(([0, 0, 0, 0], 80));
+                    match tokio::net::TcpListener::bind(bind_addr_80).await {
+                        Ok(listener) => {
+                            info!("Control Center also listening on standard HTTP port 80 (http://gpt-mini.local/)");
+                            let (_tx, rx) = tokio::sync::watch::channel(false);
+                            if let Err(e) = srv_80.run(listener, rx).await {
+                                warn!(error = %e, "Control Center port 80 server stopped with error");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "Port 80 not bound; :8080 remains active");
+                        }
+                    }
+                });
+            }
+
+            // Start zero-config mDNS responder announcing http://gpt-mini.local/
+            wifi::mdns::spawn_mdns_responder("gpt-mini.local".to_string(), 80);
 
             // 4e. Initialize Wi-Fi Setup and Mute Button Watcher
             let wifi_cfg = config.wifi.clone().unwrap_or_default();
@@ -1227,9 +1251,6 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    if recorder_for_mic.is_recording() {
-                        tracing::info!("main.rs: recorder_for_mic.is_recording() is TRUE, feeding chunk of {} bytes", chunk.len());
-                    }
                     recorder_for_mic.feed_pcm(&chunk);
 
                     let now = Instant::now();

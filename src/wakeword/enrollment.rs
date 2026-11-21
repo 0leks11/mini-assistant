@@ -64,18 +64,7 @@ impl HardwareRecorder {
             for c in chunks {
                 req.collected.push(i16::from_le_bytes(*c));
             }
-            if req.collected.len() % 8000 < 256 {
-                tracing::info!(
-                    collected = req.collected.len(),
-                    target = req.target_samples,
-                    "HardwareRecorder: accumulating mic samples"
-                );
-            }
             if req.collected.len() >= req.target_samples {
-                tracing::info!(
-                    collected = req.collected.len(),
-                    "HardwareRecorder: reached target samples, sending"
-                );
                 if let Some(tx) = req.sender.take() {
                     let _ = tx.send(std::mem::take(&mut req.collected));
                 }
@@ -88,7 +77,6 @@ impl HardwareRecorder {
     pub async fn record(&self, duration: Duration) -> Result<Vec<i16>> {
         let (tx, rx) = oneshot::channel();
         let target_samples = (SAMPLE_RATE as f64 * duration.as_secs_f64()).round() as usize;
-        tracing::info!(duration_ms = duration.as_millis(), target_samples, "HardwareRecorder: record() initiated");
         {
             let mut guard = self
                 .state
@@ -101,18 +89,13 @@ impl HardwareRecorder {
             });
         }
         match tokio::time::timeout(duration + Duration::from_secs(3), rx).await {
-            Ok(Ok(samples)) => {
-                tracing::info!(samples_len = samples.len(), "HardwareRecorder: record() completed successfully");
-                Ok(samples)
-            }
+            Ok(Ok(samples)) => Ok(samples),
             Ok(Err(_)) => bail!("Hardware recording channel closed unexpectedly"),
             Err(_) => {
                 let mut guard = self
                     .state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
-                let collected = guard.as_ref().map(|r| r.collected.len()).unwrap_or(0);
-                tracing::error!(collected, target_samples, "HardwareRecorder: record() timed out");
                 *guard = None;
                 bail!("Hardware recording timed out (microphone quiet or inactive)");
             }
