@@ -57,6 +57,7 @@ pub struct ControlCenterServer {
     wakeword_enabled: bool,
     acoustic_lab: Option<Arc<crate::acoustics::AcousticLab>>,
     auth_manager: Arc<AuthManager>,
+    profiles_store: Arc<crate::acoustics::profiles::ProfilesStore>,
 }
 
 impl ControlCenterServer {
@@ -68,6 +69,21 @@ impl ControlCenterServer {
         soloist_client: Option<Arc<SoloistClient>>,
         ducker: Arc<MusicDucker>,
     ) -> Self {
+        let profiles_store = {
+            let p = config_path
+                .as_ref()
+                .and_then(|cp| cp.parent())
+                .unwrap_or_else(|| Path::new("."))
+                .join(crate::acoustics::profiles::DEFAULT_PROFILES_FILENAME);
+            Arc::new(
+                crate::acoustics::profiles::ProfilesStore::new(p).unwrap_or_else(|_| {
+                    crate::acoustics::profiles::ProfilesStore::new(
+                        crate::acoustics::profiles::DEFAULT_PROFILES_FILENAME,
+                    )
+                    .unwrap()
+                }),
+            )
+        };
         Self {
             config_path,
             spotify_client,
@@ -86,7 +102,20 @@ impl ControlCenterServer {
             wakeword_enabled: true,
             acoustic_lab: None,
             auth_manager: Arc::new(AuthManager::default()),
+            profiles_store,
         }
+    }
+
+    pub fn with_profiles_store(
+        mut self,
+        store: Arc<crate::acoustics::profiles::ProfilesStore>,
+    ) -> Self {
+        self.profiles_store = store;
+        self
+    }
+
+    pub fn profiles_store(&self) -> Arc<crate::acoustics::profiles::ProfilesStore> {
+        self.profiles_store.clone()
     }
 
     pub fn with_auth_manager(mut self, auth_manager: Arc<AuthManager>) -> Self {
@@ -206,6 +235,7 @@ impl ControlCenterServer {
         let mut json_content = false;
         let mut if_match = None;
         let mut auth_header = None;
+        let mut idempotency_key = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
                 let k_trim = k.trim();
@@ -223,6 +253,8 @@ impl ControlCenterServer {
                     if_match = Some(v.trim().to_string());
                 } else if k_trim.eq_ignore_ascii_case("authorization") {
                     auth_header = Some(v.trim().to_string());
+                } else if k_trim.eq_ignore_ascii_case("idempotency-key") {
+                    idempotency_key = Some(v.trim().to_string());
                 }
             }
         }
@@ -302,33 +334,36 @@ impl ControlCenterServer {
                 .await;
         }
 
-        if method == "POST"
-            && matches!(
-                path,
-                "/api/v1/acoustics"
-                    | "/api/v1/calibration"
-                    | "/api/v1/acoustics/restore"
-                    | "/api/v1/calibration/restore"
-                    | "/api/v1/acoustics/test_session"
-                    | "/api/v1/calibration/test_session"
-                    | "/api/v1/acoustics/tokens"
-                    | "/api/v1/calibration/tokens"
-                    | "/api/v1/acoustics/tokens/revoke"
-                    | "/api/v1/calibration/tokens/revoke"
-                    | "/api/v1/acoustics/lease/revoke"
-                    | "/api/v1/calibration/lease/revoke"
-            )
+        if (method == "POST" || method == "PUT" || method == "DELETE")
+            && (path.starts_with("/api/v1/acoustics") || path.starts_with("/api/v1/calibration"))
         {
             let is_authorized_caller = same_origin
                 || identity.is_owner()
                 || matches!(identity, RequestIdentity::Calibration { .. });
             let is_restore =
                 path == "/api/v1/acoustics/restore" || path == "/api/v1/calibration/restore";
-            if !is_authorized_caller || (!is_restore && !json_content) {
-                return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require JSON"})).await;
+            let is_delete_or_empty = method == "DELETE"
+                || (method == "POST"
+                    && (path.ends_with("/archive")
+                        || path.ends_with("/activate")
+                        || path.ends_with("/export")));
+            if !is_authorized_caller || (!is_restore && !is_delete_or_empty && !json_content) {
+                return self
+                    .send_json_status(
+                        &mut stream,
+                        "403 Forbidden",
+                        &serde_json::json!({"status":"error","message":"Acoustic updates require JSON"}),
+                    )
+                    .await;
             }
-            if body.len() > 16 * 1024 {
-                return self.send_json_status(&mut stream, "413 Content Too Large", &serde_json::json!({"status":"error","message":"Acoustic profile too large"})).await;
+            if body.len() > 2 * 1024 * 1024 {
+                return self
+                    .send_json_status(
+                        &mut stream,
+                        "413 Content Too Large",
+                        &serde_json::json!({"status":"error","message":"Acoustic payload too large"}),
+                    )
+                    .await;
             }
         }
         match (method, path) {
@@ -433,6 +468,79 @@ impl ControlCenterServer {
             | ("POST", "/api/v1/calibration/lease/revoke") => {
                 self.handle_api_post_acoustic_lease_revoke(&mut stream, body)
                     .await?;
+            }
+
+            // Room Profiles and Candidate Preview
+            ("GET", "/api/v1/acoustics/profiles") | ("GET", "/api/v1/calibration/profiles") => {
+                self.handle_api_get_profiles(&mut stream, query).await?;
+            }
+            ("POST", "/api/v1/acoustics/profiles") | ("POST", "/api/v1/calibration/profiles") => {
+                self.handle_api_post_profiles(
+                    &mut stream,
+                    body,
+                    idempotency_key.as_deref(),
+                    &identity,
+                )
+                .await?;
+            }
+            ("POST", "/api/v1/acoustics/profiles/export")
+            | ("POST", "/api/v1/calibration/profiles/export") => {
+                self.handle_api_post_profiles_export(&mut stream).await?;
+            }
+            ("POST", "/api/v1/acoustics/profiles/import")
+            | ("POST", "/api/v1/calibration/profiles/import") => {
+                self.handle_api_post_profiles_import(&mut stream, body, &identity)
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/preview") | ("POST", "/api/v1/calibration/preview") => {
+                self.handle_api_post_preview(&mut stream, body).await?;
+            }
+            (m, p)
+                if p.starts_with("/api/v1/acoustics/profiles/")
+                    || p.starts_with("/api/v1/calibration/profiles/") =>
+            {
+                let sub = p
+                    .strip_prefix("/api/v1/acoustics/profiles/")
+                    .or_else(|| p.strip_prefix("/api/v1/calibration/profiles/"))
+                    .unwrap_or("");
+                if let Some(profile_id) = sub.strip_suffix("/activate") {
+                    if m == "POST" {
+                        self.handle_api_post_profile_activate(&mut stream, profile_id)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(profile_id) = sub.strip_suffix("/archive") {
+                    if m == "POST" {
+                        self.handle_api_post_profile_archive(&mut stream, profile_id)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(profile_id) = sub.strip_suffix("/rename") {
+                    if m == "POST" {
+                        self.handle_api_post_profile_rename(&mut stream, profile_id, body)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if m == "GET" {
+                    self.handle_api_get_profile_by_id(&mut stream, sub).await?;
+                } else if m == "PUT" || m == "POST" {
+                    self.handle_api_put_profile_by_id(
+                        &mut stream,
+                        sub,
+                        body,
+                        if_match.as_deref(),
+                        &identity,
+                    )
+                    .await?;
+                } else if m == "DELETE" {
+                    self.handle_api_delete_profile_by_id(&mut stream, sub)
+                        .await?;
+                } else {
+                    self.send_not_found(&mut stream).await?;
+                }
             }
 
             // Spotify OAuth PKCE Flow
@@ -1214,6 +1322,487 @@ impl ControlCenterServer {
         .await
     }
 
+    async fn handle_api_get_profiles(
+        &self,
+        stream: &mut TcpStream,
+        query: Option<&str>,
+    ) -> Result<()> {
+        let include_archived = query
+            .map(|q| q.contains("include_archived=true"))
+            .unwrap_or(false);
+        match self.profiles_store.list(include_archived) {
+            Ok(profiles) => {
+                let active_id = self
+                    .profiles_store
+                    .get_active()
+                    .ok()
+                    .flatten()
+                    .map(|p| p.id);
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "active_profile_id": active_id,
+                        "profiles": profiles,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({"status": "error", "message": format!("Failed to list profiles: {e}")}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_profiles(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        idempotency_key: Option<&str>,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        let dto: crate::acoustics::profiles::CreateProfileDto = match serde_json::from_str(body) {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status": "error", "message": format!("Invalid profile payload: {e}")}),
+                    )
+                    .await;
+            }
+        };
+
+        let is_owner = identity.is_owner();
+        match self.profiles_store.create(dto, idempotency_key, is_owner) {
+            Ok(profile) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "profile": profile,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let status_code = if err_msg.contains("Only the owner can set owner_confirmed") {
+                    "403 Forbidden"
+                } else if err_msg.contains("already exists") {
+                    "409 Conflict"
+                } else {
+                    "400 Bad Request"
+                };
+                self.send_json_status(
+                    stream,
+                    status_code,
+                    &serde_json::json!({"status": "error", "message": err_msg}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_get_profile_by_id(&self, stream: &mut TcpStream, id: &str) -> Result<()> {
+        match self.profiles_store.get(id) {
+            Ok(Some(profile)) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "profile": profile,
+                    }),
+                )
+                .await
+            }
+            Ok(None) => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({"status": "error", "message": format!("Profile '{id}' not found")}),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({"status": "error", "message": e.to_string()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_put_profile_by_id(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+        body: &str,
+        if_match: Option<&str>,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        let dto: crate::acoustics::profiles::UpdateProfileDto = match serde_json::from_str(body) {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status": "error", "message": format!("Invalid profile update payload: {e}")}),
+                    )
+                    .await;
+            }
+        };
+
+        let if_match_rev = if_match.and_then(|im| im.trim().trim_matches('"').parse::<u64>().ok());
+        let is_owner = identity.is_owner();
+
+        match self.profiles_store.update(id, dto, if_match_rev, is_owner) {
+            Ok(updated) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "profile": updated,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let status_code = if err_msg.contains("Only the owner can set owner_confirmed") {
+                    "403 Forbidden"
+                } else if err_msg.contains("Precondition Failed") {
+                    "412 Precondition Failed"
+                } else if err_msg.contains("not found") {
+                    "404 Not Found"
+                } else {
+                    "400 Bad Request"
+                };
+                self.send_json_status(
+                    stream,
+                    status_code,
+                    &serde_json::json!({"status": "error", "message": err_msg}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_profile_activate(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+    ) -> Result<()> {
+        let profile = match self.profiles_store.get(id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "404 Not Found",
+                        &serde_json::json!({"status": "error", "message": format!("Profile '{id}' not found")}),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "500 Internal Server Error",
+                        &serde_json::json!({"status": "error", "message": e.to_string()}),
+                    )
+                    .await;
+            }
+        };
+
+        if profile.archived {
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({"status": "error", "message": "Cannot activate archived profile"}),
+                )
+                .await;
+        }
+
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status": "error", "message": "Audio loop is unavailable"}),
+                )
+                .await;
+        };
+
+        let config_path = self
+            .resolve_config_path()
+            .unwrap_or_else(|| PathBuf::from("config.toml"));
+
+        let current_snap = lab.snapshot();
+        let payload = crate::acoustics::ApplyPayload {
+            expected_revision: current_snap.revision,
+            settings: profile.settings.clone(),
+            expected_instance_id: None,
+        };
+
+        match lab.apply(&config_path, payload).await {
+            Ok(_) => {
+                let _ = self
+                    .profiles_store
+                    .set_active_profile_id(Some(id.to_string()));
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "activated_profile_id": id,
+                        "snapshot": lab.response(),
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({"status": "error", "message": format!("Failed to apply profile to audio loop: {e}")}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_profile_archive(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+    ) -> Result<()> {
+        match self.profiles_store.archive(id) {
+            Ok(()) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "archived": true,
+                        "profile_id": id,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({"status": "error", "message": e.to_string()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_delete_profile_by_id(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+    ) -> Result<()> {
+        match self.profiles_store.delete(id) {
+            Ok(()) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "deleted": true,
+                        "profile_id": id,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({"status": "error", "message": e.to_string()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_profile_rename(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct RenameDto {
+            name: String,
+        }
+        let dto: RenameDto = match serde_json::from_str(body) {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status": "error", "message": format!("Invalid rename payload: {e}")}),
+                    )
+                    .await;
+            }
+        };
+        match self.profiles_store.rename(id, &dto.name) {
+            Ok(profile) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "profile": profile,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({"status": "error", "message": e.to_string()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_profiles_export(&self, stream: &mut TcpStream) -> Result<()> {
+        match self.profiles_store.export_all() {
+            Ok(export) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "export": export,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({"status": "error", "message": e.to_string()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_profiles_import(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        let export: crate::acoustics::profiles::ProfilesExportDto = match serde_json::from_str(body)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status": "error", "message": format!("Invalid export payload: {e}")}),
+                    )
+                    .await;
+            }
+        };
+        let is_owner = identity.is_owner();
+        match self.profiles_store.import_all(export, is_owner) {
+            Ok(imported_count) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "imported_count": imported_count,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({"status": "error", "message": e.to_string()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_preview(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct PreviewPayload {
+            settings: crate::acoustics::AcousticSettingsDto,
+            ttl_secs: Option<u64>,
+        }
+        let payload: PreviewPayload = match serde_json::from_str(body) {
+            Ok(p) => p,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status": "error", "message": format!("Invalid preview payload: {e}")}),
+                    )
+                    .await;
+            }
+        };
+
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status": "error", "message": "Audio loop is unavailable"}),
+                )
+                .await;
+        };
+
+        let ttl_secs = payload.ttl_secs.unwrap_or(30).clamp(5, 300);
+        match lab
+            .apply_candidate_preview(payload.settings, Duration::from_secs(ttl_secs))
+            .await
+        {
+            Ok(_) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "preview": true,
+                        "ttl_secs": ttl_secs,
+                        "snapshot": lab.response(),
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({"status": "error", "message": format!("Failed to apply preview: {e}")}),
+                )
+                .await
+            }
+        }
+    }
+
     fn resolve_config_path(&self) -> Option<std::path::PathBuf> {
         if let Some(ref path) = self.config_path {
             return Some(path.clone());
@@ -1401,6 +1990,11 @@ impl ControlCenterServer {
         *self.spotify_client.write().await = Some(new_client);
 
         Ok(())
+    }
+
+    async fn send_not_found(&self, stream: &mut TcpStream) -> Result<()> {
+        self.send_response(stream, "404 Not Found", "text/plain", b"Not Found")
+            .await
     }
 
     async fn send_response(
@@ -2547,8 +3141,19 @@ capture_device = "hw:0,2"
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (lab, _rx) =
+        let (lab, mut rx) =
             crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        let metrics = crate::acoustics::RuntimeMetrics {
+            ready: true,
+            ..Default::default()
+        };
+        lab.ready(crate::config::WakewordCalibrationConfig::default(), metrics);
+        let lab_mock = lab.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                lab_mock.acknowledge(req, None);
+            }
+        });
         let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
         let auth_manager = Arc::new(crate::web::auth::AuthManager::new(Some(
             "test-owner-token".to_string(),
@@ -2749,5 +3354,252 @@ capture_device = "hw:0,2"
         // Cleanup
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_http_profiles_lifecycle_and_candidate_preview() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("http_prof_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let profiles_store =
+            Arc::new(crate::acoustics::profiles::ProfilesStore::new(&temp_dir).unwrap());
+        let (lab, mut rx) =
+            crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        let metrics = crate::acoustics::RuntimeMetrics {
+            ready: true,
+            ..Default::default()
+        };
+        lab.ready(crate::config::WakewordCalibrationConfig::default(), metrics);
+        let lab_mock = lab.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                lab_mock.acknowledge(req, None);
+            }
+        });
+        let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
+        let auth_manager = Arc::new(crate::web::auth::AuthManager::new(Some(
+            "owner-secret-123".to_string(),
+        )));
+
+        let cfg_file = temp_dir.join("config.toml");
+        let initial_toml = r#"
+[assistant]
+name = "Штучка"
+wake_words = ["штучка"]
+
+[audio]
+capture_device = "hw:0,2"
+"#;
+        std::fs::write(&cfg_file, initial_toml).unwrap();
+
+        let server = Arc::new(
+            ControlCenterServer::new(
+                Some(cfg_file.clone()),
+                "client_id".to_string(),
+                "http://127.0.0.1/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                ducker,
+            )
+            .with_acoustic_lab(lab.clone())
+            .with_auth_manager(auth_manager.clone())
+            .with_profiles_store(profiles_store.clone()),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(300), stream.read(&mut buf)).await
+                {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+                    Ok(Err(_)) => break,
+                }
+            }
+            let res_str = String::from_utf8_lossy(&response).to_string();
+            let status_line = res_str.lines().next().unwrap_or("");
+            let status_code: u16 = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let json_body = res_str
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b.trim()).ok())
+                .unwrap_or(serde_json::Value::Null);
+            (status_code, json_body)
+        }
+
+        // Issue calibration token with Profiles scope
+        let issue_body = serde_json::json!({
+            "identity_id": "agent-profiles",
+            "ttl_secs": 3600,
+            "scopes": ["acoustics_read", "acoustics_write", "profiles"],
+            "lease": {
+                "baseline_revision": 1,
+                "max_duration_secs": 300,
+                "max_volume_pct": 50,
+                "max_runs": 10
+            }
+        })
+        .to_string();
+
+        let req = format!(
+            "POST /api/v1/acoustics/tokens HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer owner-secret-123\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, issue_body.len(), issue_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        let token = resp["token"].as_str().unwrap().to_string();
+
+        // 1. Create room profile via agent token
+        let default_dto = crate::acoustics::AcousticSettingsDto::from(
+            crate::config::WakewordCalibrationConfig::default(),
+        );
+        let create_body = serde_json::json!({
+            "id": "prof_bedroom",
+            "name": "Спальня с коврами",
+            "notes": "Мягкая мебель, мало эха",
+            "settings": default_dto,
+            "conditions": "quiet",
+            "status": "draft"
+        })
+        .to_string();
+
+        let req = format!(
+            "POST /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nIdempotency-Key: idem-prof-1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, create_body.len(), create_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["profile"]["id"], "prof_bedroom");
+        assert_eq!(resp["profile"]["name"], "Спальня с коврами");
+        assert_eq!(resp["profile"]["revision"], 1);
+
+        // 2. Duplicate create with same idempotency key returns same profile
+        let (code_dup, resp_dup) = send_req(local_addr, &req).await;
+        assert_eq!(code_dup, 200);
+        assert_eq!(resp_dup["profile"]["id"], "prof_bedroom");
+        assert_eq!(resp_dup["profile"]["revision"], 1);
+
+        // 3. Agent cannot set owner_confirmed status (403 Forbidden)
+        let owner_conf_body = serde_json::json!({
+            "id": "prof_fraud",
+            "name": "Фейк",
+            "settings": default_dto,
+            "status": "owner_confirmed"
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, owner_conf_body.len(), owner_conf_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 403);
+        assert!(resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("Only the owner can set owner_confirmed"));
+
+        // 4. List profiles
+        let req = format!(
+            "GET /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            local_addr, token
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["profiles"].as_array().unwrap().len(), 1);
+
+        // 5. Update profile with If-Match check
+        let update_body = serde_json::json!({
+            "name": "Спальня (проверено)",
+            "status": "automated_tested"
+        })
+        .to_string();
+
+        // Mismatched If-Match -> 412 Precondition Failed
+        let req = format!(
+            "PUT /api/v1/acoustics/profiles/prof_bedroom HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nIf-Match: \"999\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, update_body.len(), update_body
+        );
+        let (code, _) = send_req(local_addr, &req).await;
+        assert_eq!(code, 412);
+
+        // Correct If-Match -> 200 OK
+        let req = format!(
+            "PUT /api/v1/acoustics/profiles/prof_bedroom HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nIf-Match: \"1\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, update_body.len(), update_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["profile"]["revision"], 2);
+        assert_eq!(resp["profile"]["name"], "Спальня (проверено)");
+        assert_eq!(resp["profile"]["status"], "automated_tested");
+
+        // 6. Preview candidate in RAM with TTL
+        let preview_body = serde_json::json!({
+            "settings": default_dto,
+            "ttl_secs": 10
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/v1/acoustics/preview HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, preview_body.len(), preview_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200, "Preview failed: {:?}", resp);
+        assert_eq!(resp["preview"], true);
+
+        // 7. Activate profile
+        let req = format!(
+            "POST /api/v1/acoustics/profiles/prof_bedroom/activate HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            local_addr, token
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["activated_profile_id"], "prof_bedroom");
+        assert_eq!(
+            profiles_store.get_active().unwrap().unwrap().id,
+            "prof_bedroom"
+        );
+
+        // 8. Export profiles
+        let req = format!(
+            "POST /api/v1/acoustics/profiles/export HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            local_addr, token
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["export"]["profiles"].as_array().unwrap().len(), 1);
+
+        // 9. Anonymous caller gets 401 Unauthorized
+        let req = format!(
+            "POST /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, create_body.len(), create_body
+        );
+        let (code, _) = send_req(local_addr, &req).await;
+        assert_eq!(code, 401);
+
+        // Cleanup
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

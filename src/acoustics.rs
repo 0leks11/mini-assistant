@@ -1,4 +1,5 @@
 //! Local acoustic settings and metadata. No microphone, provider or shell access.
+pub mod profiles;
 use crate::config::{Config, WakewordCalibrationConfig};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -63,7 +64,13 @@ pub struct Snapshot {
 pub struct ApplyRequest {
     pub revision: u64,
     pub settings: WakewordCalibrationConfig,
-    reply: oneshot::Sender<()>,
+    pub reply: oneshot::Sender<()>,
+}
+
+impl ApplyRequest {
+    pub fn ack(self) {
+        let _ = self.reply.send(());
+    }
 }
 
 /// Strict network DTO for the acoustic profile API.
@@ -448,6 +455,95 @@ impl AcousticLab {
         s.pending = false;
         s.error = None;
         Ok(s.clone())
+    }
+
+    /// Apply candidate settings temporarily in RAM with an ACK and automatic rollback after TTL.
+    pub async fn apply_candidate_preview(
+        self: &Arc<Self>,
+        settings: AcousticSettingsDto,
+        ttl: Duration,
+    ) -> Result<Snapshot> {
+        settings.validate()?;
+        let target_config: WakewordCalibrationConfig = settings.into();
+        let _guard = self
+            .writer
+            .try_lock()
+            .context("Another acoustic update is in progress")?;
+        let old = self.snapshot();
+        ensure!(
+            !old.pending,
+            "Previous update is still awaiting the audio loop"
+        );
+        ensure!(
+            old.runtime.ready && !self.tx.is_closed(),
+            "Audio loop is unavailable"
+        );
+        let revision = old
+            .revision
+            .checked_add(1)
+            .context("Acoustic revision exhausted")?;
+        let permit = self
+            .tx
+            .try_reserve()
+            .context("Audio settings queue is unavailable")?;
+        let (reply, ack) = oneshot::channel();
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.revision = revision;
+            s.pending = true;
+            s.error = None;
+        }
+        permit.send(ApplyRequest {
+            revision,
+            settings: target_config,
+            reply,
+        });
+        match tokio::time::timeout(Duration::from_secs(3), ack).await {
+            Ok(Ok(())) => {
+                let s = self.snapshot();
+                ensure!(
+                    s.applied_revision == Some(revision) && s.error.is_none(),
+                    "Candidate preview rejected by audio loop"
+                );
+                let lab = Arc::clone(self);
+                let saved_config = s.saved.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(ttl).await;
+                    let should_rollback = {
+                        let st = lab.state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.applied_revision == Some(revision)
+                    };
+                    if should_rollback {
+                        if let Ok(permit) = lab.tx.try_reserve() {
+                            let (reply, _ack) = oneshot::channel();
+                            let rollback_rev = revision.wrapping_add(1);
+                            {
+                                let mut st = lab.state.lock().unwrap_or_else(|e| e.into_inner());
+                                st.revision = rollback_rev;
+                                st.pending = true;
+                            }
+                            permit.send(ApplyRequest {
+                                revision: rollback_rev,
+                                settings: saved_config,
+                                reply,
+                            });
+                        }
+                    }
+                });
+                Ok(s)
+            }
+            Ok(Err(_closed)) => {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.pending = false;
+                s.error = Some("Audio loop closed ACK channel without confirming".to_string());
+                anyhow::bail!("Audio loop closed ACK channel without confirming");
+            }
+            Err(_timeout) => {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.error = Some("Audio confirmation timed out awaiting audio loop".to_string());
+                anyhow::bail!("Audio confirmation timed out awaiting audio loop");
+            }
+        }
     }
 
     /// Clear stale pending flag if an operation failed or timed out.

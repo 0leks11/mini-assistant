@@ -107,6 +107,10 @@ class TestMcpAcousticAgent(unittest.TestCase):
         self.assertIn("get_acoustic_events", tool_names)
         self.assertIn("set_test_session", tool_names)
         self.assertIn("revoke_calibration_lease", tool_names)
+        self.assertIn("list_room_profiles", tool_names)
+        self.assertIn("create_room_profile", tool_names)
+        self.assertIn("activate_room_profile", tool_names)
+        self.assertIn("preview_candidate_profile", tool_names)
 
         # 3. Call get_acoustic_status
         proc.stdin.write(

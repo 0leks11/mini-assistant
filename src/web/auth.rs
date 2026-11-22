@@ -315,6 +315,65 @@ impl AuthManager {
             ));
         }
 
+        // Acoustic profiles read endpoints
+        let is_profile_read = (method == "GET")
+            && (path.starts_with("/api/v1/acoustics/profiles")
+                || path.starts_with("/api/v1/calibration/profiles"));
+
+        if is_profile_read {
+            if identity.has_scope(Scope::Profiles) || identity.has_scope(Scope::AcousticsRead) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: reading profiles requires calibration identity or owner",
+                ));
+            }
+            return Err(("403 Forbidden", "Forbidden: token lacks profiles scope"));
+        }
+
+        // Acoustic profiles write / mutation endpoints
+        let is_profile_write = (method == "POST" || method == "PUT" || method == "DELETE")
+            && (path.starts_with("/api/v1/acoustics/profiles")
+                || path.starts_with("/api/v1/calibration/profiles"));
+
+        if is_profile_write {
+            if identity.has_scope(Scope::Profiles) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: profile mutations require calibration identity with profiles scope",
+                ));
+            }
+            return Err(("403 Forbidden", "Forbidden: token lacks profiles scope"));
+        }
+
+        // Candidate preview endpoint
+        let is_preview = (method == "POST")
+            && matches!(
+                path,
+                "/api/v1/acoustics/preview" | "/api/v1/calibration/preview"
+            );
+
+        if is_preview {
+            if identity.has_scope(Scope::AcousticsWrite) || identity.has_scope(Scope::Profiles) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: preview requires calibration identity",
+                ));
+            }
+            return Err((
+                "403 Forbidden",
+                "Forbidden: token lacks acoustics_write or profiles scope",
+            ));
+        }
+
         // Static pages and public status
         if method == "GET"
             && matches!(

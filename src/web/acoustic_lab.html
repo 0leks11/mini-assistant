@@ -117,8 +117,21 @@
         <div id="controls"><div class="card empty">Получаем параметры и допустимые диапазоны с GPT Mini…</div></div>
       </form>
       <section class="card" aria-labelledby="profiles-title">
-        <h2 id="profiles-title">Профили для сравнения</h2>
-        <p class="section-desc">Экспорт содержит только акустические параметры. Импорт и значения по умолчанию меняют форму — на колонку они попадут только после «Применить».</p>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h2 id="profiles-title" style="margin:0">Профили помещений и сравнение</h2>
+          <span id="active-profile-badge" class="badge">Профиль: по умолчанию</span>
+        </div>
+        <p class="section-desc">Сохраняйте проверенные наборы акустических параметров для разных комнат (например, «Гостиная с эхом», «Спальня с коврами»).</p>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+          <label for="room-profiles-select" style="font-size:13px;color:var(--text-dim)">Комната:</label>
+          <select id="room-profiles-select" style="background:#131a29;color:var(--text);border:1px solid #243048;border-radius:6px;padding:6px 10px;font-size:13px;min-width:180px">
+            <option value="">— Сохранённые комнаты —</option>
+          </select>
+          <button type="button" id="load-room-profile-btn" disabled>Загрузить в форму</button>
+          <button type="button" id="activate-room-profile-btn" disabled>Активировать на Mini</button>
+          <button type="button" id="preview-candidate-btn" title="Применить параметры в RAM на 30 секунд без записи на диск">Предпросмотр (30 сек)</button>
+          <button type="button" id="save-room-profile-btn">Сохранить как комнату…</button>
+        </div>
         <div class="toolbar">
           <button type="button" id="export-btn" disabled>Скачать профиль</button>
           <button type="button" id="import-btn" disabled>Загрузить профиль</button>
@@ -564,6 +577,98 @@ function initAcousticLab() {
     }
   });
   el("print-btn").addEventListener("click", () => window.print());
+
+  let cachedProfiles = [];
+  async function refreshProfilesList() {
+    try {
+      const res = await fetch("/api/v1/acoustics/profiles");
+      if (!res.ok) return;
+      const data = await res.json();
+      cachedProfiles = data.profiles || [];
+      const sel = el("room-profiles-select");
+      if (sel) {
+        sel.innerHTML = '<option value="">— Сохранённые комнаты —</option>';
+        for (const p of cachedProfiles) {
+          const opt = document.createElement("option");
+          opt.value = p.id;
+          opt.textContent = `${p.name} [${p.status}]`;
+          sel.appendChild(opt);
+        }
+      }
+      const badge = el("active-profile-badge");
+      if (badge && data.active_profile_id) {
+        const act = cachedProfiles.find(p => p.id === data.active_profile_id);
+        badge.textContent = act ? `Активен: ${act.name}` : `Активен: ${data.active_profile_id}`;
+      }
+    } catch (_) {}
+  }
+
+  el("room-profiles-select").addEventListener("focus", refreshProfilesList);
+  el("room-profiles-select").addEventListener("change", event => {
+    const selectedId = event.target.value;
+    el("load-room-profile-btn").disabled = !selectedId;
+    el("activate-room-profile-btn").disabled = !selectedId;
+  });
+
+  el("load-room-profile-btn").addEventListener("click", () => {
+    const sel = el("room-profiles-select");
+    const p = cachedProfiles.find(x => x.id === sel.value);
+    if (p && p.settings) {
+      fillForm(p.settings, baseRevision, false);
+      message(`Профиль «${p.name}» загружен в форму. Нажмите «Применить» для сохранения на Mini.`);
+    }
+  });
+
+  el("activate-room-profile-btn").addEventListener("click", async () => {
+    const sel = el("room-profiles-select");
+    const id = sel.value;
+    if (!id) return;
+    try {
+      const res = await fetch(`/api/v1/acoustics/profiles/${id}/activate`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Не удалось активировать профиль");
+      message(`Профиль комнаты активирован на GPT Mini!`, "good");
+      refreshProfilesList();
+      poll();
+    } catch (e) {
+      message(e.message, "bad");
+    }
+  });
+
+  el("preview-candidate-btn").addEventListener("click", async () => {
+    try {
+      const settings = validateSettings(draft, latest.controls, latest.defaults);
+      const res = await fetch("/api/v1/acoustics/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings, ttl_secs: 30 })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка применения предпросмотра");
+      message("Включён предпросмотр кандидата на 30 секунд (в RAM без записи на диск).", "good");
+    } catch (e) {
+      message(e.message, "bad");
+    }
+  });
+
+  el("save-room-profile-btn").addEventListener("click", async () => {
+    const name = window.prompt("Введите название комнаты (например, 'Гостиная с эхом'):");
+    if (!name || !name.trim()) return;
+    try {
+      const settings = validateSettings(draft, latest.controls, latest.defaults);
+      const res = await fetch("/api/v1/acoustics/profiles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim(), settings, status: "draft" })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Не удалось сохранить профиль комнаты");
+      message(`Профиль комнаты «${name.trim()}» сохранён!`, "good");
+      refreshProfilesList();
+    } catch (e) {
+      message(e.message, "bad");
+    }
+  });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
   window.addEventListener("beforeunload", event => { if (dirty() || busy) { event.preventDefault(); event.returnValue = ""; } });
   window.addEventListener("pagehide", () => { if (pollTimer !== null) clearInterval(pollTimer); });

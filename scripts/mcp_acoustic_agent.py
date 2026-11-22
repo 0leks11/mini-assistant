@@ -108,6 +108,91 @@ class GptMiniAcousticClient:
             "POST", "/api/v1/acoustics/lease/revoke", data={"lease_id": lease_id}
         )
 
+    def list_profiles(self, include_archived: bool = False) -> Dict[str, Any]:
+        qs = "?include_archived=true" if include_archived else ""
+        return self._request("GET", f"/api/v1/acoustics/profiles{qs}")
+
+    def get_profile(self, profile_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/acoustics/profiles/{profile_id}")
+
+    def create_profile(
+        self,
+        name: str,
+        settings: Dict[str, Any],
+        profile_id: Optional[str] = None,
+        notes: Optional[str] = None,
+        conditions: Optional[str] = None,
+        status: str = "draft",
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "name": name,
+            "settings": settings,
+            "status": status,
+        }
+        if profile_id:
+            payload["id"] = profile_id
+        if notes:
+            payload["notes"] = notes
+        if conditions:
+            payload["conditions"] = conditions
+        headers = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return self._request(
+            "POST", "/api/v1/acoustics/profiles", data=payload, headers=headers
+        )
+
+    def update_profile(
+        self,
+        profile_id: str,
+        name: Optional[str] = None,
+        settings: Optional[Dict[str, Any]] = None,
+        notes: Optional[str] = None,
+        conditions: Optional[str] = None,
+        status: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if settings is not None:
+            payload["settings"] = settings
+        if notes is not None:
+            payload["notes"] = notes
+        if conditions is not None:
+            payload["conditions"] = conditions
+        if status is not None:
+            payload["status"] = status
+        headers = {}
+        if expected_revision is not None:
+            headers["If-Match"] = f'"{expected_revision}"'
+        return self._request(
+            "PUT",
+            f"/api/v1/acoustics/profiles/{profile_id}",
+            data=payload,
+            headers=headers,
+        )
+
+    def activate_profile(self, profile_id: str) -> Dict[str, Any]:
+        return self._request(
+            "POST", f"/api/v1/acoustics/profiles/{profile_id}/activate"
+        )
+
+    def archive_profile(self, profile_id: str) -> Dict[str, Any]:
+        return self._request(
+            "POST", f"/api/v1/acoustics/profiles/{profile_id}/archive"
+        )
+
+    def preview_candidate_profile(
+        self, settings: Dict[str, Any], ttl_secs: int = 30
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/acoustics/preview",
+            data={"settings": settings, "ttl_secs": ttl_secs},
+        )
+
 
 TOOLS = [
     {
@@ -195,6 +280,132 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "list_room_profiles",
+        "description": "List all saved room profiles on GPT Mini (e.g., 'Гостиная с эхом', 'Спальня с коврами').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_archived": {
+                    "type": "boolean",
+                    "description": "Whether to include archived room profiles",
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_room_profile",
+        "description": "Retrieve full details and settings for a specific room profile by ID.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["profile_id"],
+            "properties": {
+                "profile_id": {
+                    "type": "string",
+                    "description": "The room profile ID",
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "create_room_profile",
+        "description": "Create a new named room profile with 33 acoustic parameters. Status can be 'draft' or 'automated_tested'.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["name", "settings"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Display name of the room (e.g., 'Гостиная с эхом')",
+                },
+                "settings": {
+                    "type": "object",
+                    "description": "Full dictionary of 33 acoustic settings",
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Optional custom profile ID (e.g., 'prof_living_room')",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional notes or room acoustic observations",
+                },
+                "conditions": {
+                    "type": "string",
+                    "description": "Optional acoustic conditions (e.g., 'echo', 'quiet', 'carpet')",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["draft", "automated_tested"],
+                    "description": "Initial status: 'draft' or 'automated_tested' ('owner_confirmed' is reserved for owner only)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "update_room_profile",
+        "description": "Update an existing room profile's metadata, settings, or automated test status.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["profile_id"],
+            "properties": {
+                "profile_id": {
+                    "type": "string",
+                    "description": "The profile ID to update",
+                },
+                "name": {"type": "string"},
+                "settings": {"type": "object"},
+                "notes": {"type": "string"},
+                "conditions": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["draft", "automated_tested"],
+                },
+                "expected_revision": {
+                    "type": "integer",
+                    "description": "Optimistic concurrency revision check",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "preview_candidate_profile",
+        "description": "Apply a candidate profile temporarily in RAM with a TTL (e.g. 30 seconds). Reverts automatically if not activated.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["settings"],
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "description": "Full dictionary of 33 acoustic settings to test in RAM",
+                },
+                "ttl_secs": {
+                    "type": "integer",
+                    "description": "Number of seconds before rolling back (default 30, max 300)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "activate_room_profile",
+        "description": "Activate a room profile on GPT Mini: applies its settings to audio loop and saves as active working config.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["profile_id"],
+            "properties": {
+                "profile_id": {
+                    "type": "string",
+                    "description": "The room profile ID to activate",
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -225,7 +436,6 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             }
         )
     elif method == "notifications/initialized":
-        # No reply for notification
         pass
     elif method == "tools/list":
         send_response(
@@ -258,6 +468,41 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             result = client.set_test_session(active=args.get("active", False))
         elif tool_name == "revoke_calibration_lease":
             result = client.revoke_lease(lease_id=args.get("lease_id", ""))
+        elif tool_name == "list_room_profiles":
+            result = client.list_profiles(
+                include_archived=args.get("include_archived", False)
+            )
+        elif tool_name == "get_room_profile":
+            result = client.get_profile(profile_id=args.get("profile_id", ""))
+        elif tool_name == "create_room_profile":
+            result = client.create_profile(
+                name=args.get("name", ""),
+                settings=args.get("settings", {}),
+                profile_id=args.get("id"),
+                notes=args.get("notes"),
+                conditions=args.get("conditions"),
+                status=args.get("status", "draft"),
+                idempotency_key=args.get("idempotency_key"),
+            )
+        elif tool_name == "update_room_profile":
+            result = client.update_profile(
+                profile_id=args.get("profile_id", ""),
+                name=args.get("name"),
+                settings=args.get("settings"),
+                notes=args.get("notes"),
+                conditions=args.get("conditions"),
+                status=args.get("status"),
+                expected_revision=args.get("expected_revision"),
+            )
+        elif tool_name == "preview_candidate_profile":
+            result = client.preview_candidate_profile(
+                settings=args.get("settings", {}),
+                ttl_secs=args.get("ttl_secs", 30),
+            )
+        elif tool_name == "activate_room_profile":
+            result = client.activate_profile(
+                profile_id=args.get("profile_id", "")
+            )
         else:
             send_response(
                 {
@@ -311,9 +556,7 @@ def main() -> None:
         line = line.strip()
         if not line:
             continue
-        # Support Content-Length prefix if client uses header framing
         if line.startswith("Content-Length:"):
-            # Skip empty lines until body
             for next_line in sys.stdin:
                 if not next_line.strip():
                     break
