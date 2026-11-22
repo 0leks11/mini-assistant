@@ -58,6 +58,7 @@ pub struct ControlCenterServer {
     acoustic_lab: Option<Arc<crate::acoustics::AcousticLab>>,
     auth_manager: Arc<AuthManager>,
     profiles_store: Arc<crate::acoustics::profiles::ProfilesStore>,
+    samples_store: Arc<crate::acoustics::samples::SamplesStore>,
 }
 
 impl ControlCenterServer {
@@ -84,6 +85,18 @@ impl ControlCenterServer {
                 }),
             )
         };
+        let samples_store = {
+            let p = config_path
+                .as_ref()
+                .and_then(|cp| cp.parent())
+                .unwrap_or_else(|| Path::new("."))
+                .join("samples");
+            Arc::new(
+                crate::acoustics::samples::SamplesStore::new(p).unwrap_or_else(|_| {
+                    crate::acoustics::samples::SamplesStore::new(PathBuf::from("samples")).unwrap()
+                }),
+            )
+        };
         Self {
             config_path,
             spotify_client,
@@ -103,7 +116,20 @@ impl ControlCenterServer {
             acoustic_lab: None,
             auth_manager: Arc::new(AuthManager::default()),
             profiles_store,
+            samples_store,
         }
+    }
+
+    pub fn with_samples_store(
+        mut self,
+        store: Arc<crate::acoustics::samples::SamplesStore>,
+    ) -> Self {
+        self.samples_store = store;
+        self
+    }
+
+    pub fn samples_store(&self) -> Arc<crate::acoustics::samples::SamplesStore> {
+        self.samples_store.clone()
     }
 
     pub fn with_profiles_store(
@@ -230,6 +256,7 @@ impl ControlCenterServer {
             .or_else(|| req_str.find("\n\n").map(|p| (p, 2)));
 
         let mut content_length = 0usize;
+        let mut content_type = String::new();
         let mut host = None;
         let mut origin = None;
         let mut json_content = false;
@@ -242,10 +269,11 @@ impl ControlCenterServer {
                 if k_trim.eq_ignore_ascii_case("origin") {
                     origin = Some(v.trim().to_string());
                 } else if k_trim.eq_ignore_ascii_case("content-type") {
-                    json_content = v.trim().split(';').next() == Some("application/json");
+                    content_type = v.trim().to_string();
+                    json_content = content_type.split(';').next() == Some("application/json");
                 } else if k_trim.eq_ignore_ascii_case("content-length") {
                     if let Ok(len) = v.trim().parse::<usize>() {
-                        content_length = len.min(512 * 1024);
+                        content_length = len.min(4 * 1024 * 1024);
                     }
                 } else if k_trim.eq_ignore_ascii_case("host") {
                     host = Some(v.trim().to_string());
@@ -259,15 +287,22 @@ impl ControlCenterServer {
             }
         }
 
+        let mut full_body_bytes = Vec::new();
         let body_owned: String;
         let body: &str = if let Some((pos, delim_len)) = header_end {
             let body_start = pos + delim_len;
             let already_read = n.saturating_sub(body_start);
-            if content_length > already_read && content_length <= 512 * 1024 {
-                let mut full_body = Vec::with_capacity(content_length);
-                full_body.extend_from_slice(&buf[body_start..n]);
-                let mut remaining = content_length - already_read;
-                let mut chunk_buf = [0u8; 8192];
+            let target_len = if content_length > 0 {
+                content_length
+            } else {
+                already_read
+            };
+            if target_len <= 4 * 1024 * 1024 {
+                full_body_bytes.reserve(target_len);
+                let initial_take = already_read.min(target_len);
+                full_body_bytes.extend_from_slice(&buf[body_start..body_start + initial_take]);
+                let mut remaining = target_len.saturating_sub(already_read);
+                let mut chunk_buf = [0u8; 16384];
                 while remaining > 0 {
                     let to_read = remaining.min(chunk_buf.len());
                     match tokio::time::timeout(
@@ -277,13 +312,13 @@ impl ControlCenterServer {
                     .await
                     {
                         Ok(Ok(read_bytes)) if read_bytes > 0 => {
-                            full_body.extend_from_slice(&chunk_buf[..read_bytes]);
+                            full_body_bytes.extend_from_slice(&chunk_buf[..read_bytes]);
                             remaining -= read_bytes;
                         }
                         _ => break,
                     }
                 }
-                body_owned = String::from_utf8_lossy(&full_body).to_string();
+                body_owned = String::from_utf8_lossy(&full_body_bytes).to_string();
                 &body_owned
             } else {
                 &req_str[body_start..n]
@@ -347,16 +382,27 @@ impl ControlCenterServer {
                     && (path.ends_with("/archive")
                         || path.ends_with("/activate")
                         || path.ends_with("/export")));
-            if !is_authorized_caller || (!is_restore && !is_delete_or_empty && !json_content) {
+            let is_wav_upload = (path == "/api/v1/acoustics/samples"
+                || path == "/api/v1/calibration/samples")
+                && (content_type.starts_with("audio/wav")
+                    || content_type.starts_with("application/octet-stream"));
+            if !is_authorized_caller
+                || (!is_restore && !is_delete_or_empty && !json_content && !is_wav_upload)
+            {
                 return self
                     .send_json_status(
                         &mut stream,
                         "403 Forbidden",
-                        &serde_json::json!({"status":"error","message":"Acoustic updates require JSON"}),
+                        &serde_json::json!({"status":"error","message":"Acoustic updates require JSON or WAV"}),
                     )
                     .await;
             }
-            if body.len() > 2 * 1024 * 1024 {
+            let max_payload = if path.contains("/samples") {
+                4 * 1024 * 1024
+            } else {
+                2 * 1024 * 1024
+            };
+            if body.len() > max_payload || full_body_bytes.len() > max_payload {
                 return self
                     .send_json_status(
                         &mut stream,
@@ -538,6 +584,54 @@ impl ControlCenterServer {
                 } else if m == "DELETE" {
                     self.handle_api_delete_profile_by_id(&mut stream, sub)
                         .await?;
+                } else {
+                    self.send_not_found(&mut stream).await?;
+                }
+            }
+
+            // Samples Library
+            ("GET", "/api/v1/acoustics/samples") | ("GET", "/api/v1/calibration/samples") => {
+                self.handle_api_list_samples(&mut stream, query).await?;
+            }
+            ("POST", "/api/v1/acoustics/samples") | ("POST", "/api/v1/calibration/samples") => {
+                self.handle_api_create_sample(
+                    &mut stream,
+                    body,
+                    &content_type,
+                    &full_body_bytes,
+                    query,
+                )
+                .await?;
+            }
+            (m, p)
+                if p.starts_with("/api/v1/acoustics/samples/")
+                    || p.starts_with("/api/v1/calibration/samples/") =>
+            {
+                let sub = p
+                    .strip_prefix("/api/v1/acoustics/samples/")
+                    .or_else(|| p.strip_prefix("/api/v1/calibration/samples/"))
+                    .unwrap_or("");
+                if let Some(sample_id) = sub.strip_suffix("/wav") {
+                    if m == "GET" {
+                        self.handle_api_get_sample_wav(&mut stream, sample_id)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(sample_id) = sub.strip_suffix("/archive") {
+                    if m == "POST" {
+                        self.handle_api_archive_sample(&mut stream, sample_id)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if m == "GET" {
+                    self.handle_api_get_sample(&mut stream, sub).await?;
+                } else if m == "PUT" || m == "POST" {
+                    self.handle_api_update_sample(&mut stream, sub, body)
+                        .await?;
+                } else if m == "DELETE" {
+                    self.handle_api_delete_sample(&mut stream, sub).await?;
                 } else {
                     self.send_not_found(&mut stream).await?;
                 }
@@ -1797,6 +1891,364 @@ impl ControlCenterServer {
                     stream,
                     "500 Internal Server Error",
                     &serde_json::json!({"status": "error", "message": format!("Failed to apply preview: {e}")}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_list_samples(
+        &self,
+        stream: &mut TcpStream,
+        query: Option<&str>,
+    ) -> Result<()> {
+        let include_archived = query
+            .map(|q| q.contains("include_archived=true"))
+            .unwrap_or(false);
+        let split_filter = query.and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let mut it = pair.split('=');
+                if it.next()? == "split" {
+                    match it.next()? {
+                        "train" => Some(crate::acoustics::samples::SampleSplit::Train),
+                        "calibration" => Some(crate::acoustics::samples::SampleSplit::Calibration),
+                        "held_out" => Some(crate::acoustics::samples::SampleSplit::HeldOut),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        });
+        let label_filter = query.and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let mut it = pair.split('=');
+                if it.next()? == "label" {
+                    match it.next()? {
+                        "positive" | "positive_wake_word" => {
+                            Some(crate::acoustics::samples::SampleLabel::PositiveWakeWord)
+                        }
+                        "negative" | "negative_speech" => {
+                            Some(crate::acoustics::samples::SampleLabel::NegativeSpeech)
+                        }
+                        "own_output" => Some(crate::acoustics::samples::SampleLabel::OwnOutput),
+                        "ambient" | "ambient_noise" => {
+                            Some(crate::acoustics::samples::SampleLabel::AmbientNoise)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        });
+
+        let samples = self
+            .samples_store
+            .list(include_archived, split_filter, label_filter);
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "samples": samples,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_get_sample(&self, stream: &mut TcpStream, sample_id: &str) -> Result<()> {
+        match self.samples_store.get_metadata(sample_id) {
+            Some(sample) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "sample": sample,
+                    }),
+                )
+                .await
+            }
+            None => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Sample '{sample_id}' not found")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_get_sample_wav(
+        &self,
+        stream: &mut TcpStream,
+        sample_id: &str,
+    ) -> Result<()> {
+        match self.samples_store.get_wav_bytes(sample_id) {
+            Ok(bytes) => {
+                self.send_response(stream, "200 OK", "audio/wav", &bytes)
+                    .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": e.to_string()
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_create_sample(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        content_type: &str,
+        raw_body: &[u8],
+        query: Option<&str>,
+    ) -> Result<()> {
+        let (dto, wav_bytes) = if content_type.starts_with("application/json") {
+            let req: crate::acoustics::samples::CreateSampleDto = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "400 Bad Request",
+                            &serde_json::json!({"status": "error", "message": format!("Invalid JSON sample dto: {e}")}),
+                        )
+                        .await;
+                }
+            };
+            let b64 = match &req.wav_base64 {
+                Some(b) if !b.is_empty() => b.as_str(),
+                _ => {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "400 Bad Request",
+                            &serde_json::json!({"status": "error", "message": "Missing wav_base64 audio data in JSON"}),
+                        )
+                        .await;
+                }
+            };
+            use base64::Engine;
+            let bytes = match base64::prelude::BASE64_STANDARD.decode(b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "400 Bad Request",
+                            &serde_json::json!({"status": "error", "message": format!("Invalid base64 audio: {e}")}),
+                        )
+                        .await;
+                }
+            };
+            (req, bytes)
+        } else if content_type.starts_with("audio/wav")
+            || content_type.starts_with("application/octet-stream")
+        {
+            let name = query
+                .and_then(|q| {
+                    q.split('&').find_map(|p| {
+                        p.strip_prefix("name=")
+                            .map(|v| v.replace("%20", " ").replace('+', " "))
+                    })
+                })
+                .unwrap_or_else(|| "Uploaded Sample".into());
+
+            let label = query
+                .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("label=")))
+                .and_then(|l| match l {
+                    "positive" | "positive_wake_word" => {
+                        Some(crate::acoustics::samples::SampleLabel::PositiveWakeWord)
+                    }
+                    "negative" | "negative_speech" => {
+                        Some(crate::acoustics::samples::SampleLabel::NegativeSpeech)
+                    }
+                    "own_output" => Some(crate::acoustics::samples::SampleLabel::OwnOutput),
+                    "ambient" | "ambient_noise" => {
+                        Some(crate::acoustics::samples::SampleLabel::AmbientNoise)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(crate::acoustics::samples::SampleLabel::PositiveWakeWord);
+
+            let split = query
+                .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("split=")))
+                .and_then(|s| match s {
+                    "train" => Some(crate::acoustics::samples::SampleSplit::Train),
+                    "calibration" => Some(crate::acoustics::samples::SampleSplit::Calibration),
+                    "held_out" => Some(crate::acoustics::samples::SampleSplit::HeldOut),
+                    _ => None,
+                })
+                .unwrap_or(crate::acoustics::samples::SampleSplit::Train);
+
+            let start_ms = query
+                .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("start_ms=")))
+                .and_then(|v| v.parse::<u32>().ok());
+            let end_ms = query
+                .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("end_ms=")))
+                .and_then(|v| v.parse::<u32>().ok());
+            let interval = match (start_ms, end_ms) {
+                (Some(s), Some(e)) => Some(crate::acoustics::samples::SampleInterval {
+                    start_ms: s,
+                    end_ms: e,
+                }),
+                _ => None,
+            };
+
+            let dto = crate::acoustics::samples::CreateSampleDto {
+                name,
+                source: Some(crate::acoustics::samples::SampleSource::Upload),
+                label,
+                split,
+                interval,
+                notes: None,
+                wav_base64: None,
+            };
+            (dto, raw_body.to_vec())
+        } else {
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({"status": "error", "message": "Expected Content-Type application/json or audio/wav"}),
+                )
+                .await;
+        };
+
+        match self.samples_store.store_sample(dto, &wav_bytes) {
+            Ok(meta) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "sample": meta,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": e.to_string()
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_update_sample(
+        &self,
+        stream: &mut TcpStream,
+        sample_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        let dto: crate::acoustics::samples::UpdateSampleDto = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status": "error", "message": format!("Invalid update dto: {e}")}),
+                    )
+                    .await;
+            }
+        };
+
+        match self.samples_store.update_sample(sample_id, dto) {
+            Ok(meta) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "sample": meta,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": e.to_string()
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_archive_sample(
+        &self,
+        stream: &mut TcpStream,
+        sample_id: &str,
+    ) -> Result<()> {
+        match self.samples_store.archive_sample(sample_id) {
+            Ok(meta) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "sample": meta,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": e.to_string()
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_delete_sample(
+        &self,
+        stream: &mut TcpStream,
+        sample_id: &str,
+    ) -> Result<()> {
+        match self.samples_store.delete_sample(sample_id) {
+            Ok(()) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "deleted": sample_id,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": e.to_string()
+                    }),
                 )
                 .await
             }
@@ -3595,6 +4047,243 @@ capture_device = "hw:0,2"
             local_addr, create_body.len(), create_body
         );
         let (code, _) = send_req(local_addr, &req).await;
+        assert_eq!(code, 401);
+
+        // Cleanup
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_http_samples_lifecycle_and_validation() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("http_samples_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let samples_store =
+            Arc::new(crate::acoustics::samples::SamplesStore::new(temp_dir.clone()).unwrap());
+
+        let auth_manager = Arc::new(AuthManager::new(Some("test_owner_secret".into())));
+        let (_token_secret, cal_token) = auth_manager.issue_calibration_token(
+            "test_calib_agent".into(),
+            std::time::Duration::from_secs(3600),
+            std::collections::HashSet::from([Scope::Samples, Scope::AcousticsRead]),
+            CalibrationLease::default(),
+        );
+        let token = &cal_token.token;
+
+        let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
+        let cfg_file = temp_dir.join("config.toml");
+        std::fs::write(&cfg_file, "").unwrap();
+
+        let server = Arc::new(
+            ControlCenterServer::new(
+                Some(cfg_file.clone()),
+                "client_id".to_string(),
+                "http://127.0.0.1/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                ducker,
+            )
+            .with_auth_manager(auth_manager.clone())
+            .with_samples_store(samples_store.clone()),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let s = String::from_utf8_lossy(&buf);
+            let code = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse::<u16>()
+                .unwrap_or(0);
+            let body_part = s.split("\r\n\r\n").nth(1).unwrap_or("{}");
+            let json = serde_json::from_str(body_part).unwrap_or(serde_json::json!({}));
+            (code, json)
+        }
+
+        async fn send_req_raw(addr: std::net::SocketAddr, raw_bytes: &[u8]) -> (u16, Vec<u8>) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw_bytes).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let mut split_pos = None;
+            for i in 0..buf.len().saturating_sub(3) {
+                if &buf[i..i + 4] == b"\r\n\r\n" {
+                    split_pos = Some(i + 4);
+                    break;
+                }
+            }
+            let header_str = String::from_utf8_lossy(&buf[..split_pos.unwrap_or(0)]);
+            let code = header_str
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse::<u16>()
+                .unwrap_or(0);
+            let body = split_pos.map(|p| buf[p..].to_vec()).unwrap_or_default();
+            (code, body)
+        }
+
+        // 1. Prepare valid WAV (16kHz, mono, PCM16, 0.5s)
+        let pcm = vec![1500i16; 8000];
+        let wav_bytes = crate::acoustics::samples::encode_wav_pcm16_mono(&pcm).unwrap();
+        use base64::Engine;
+        let wav_b64 = base64::prelude::BASE64_STANDARD.encode(&wav_bytes);
+
+        let create_body = serde_json::json!({
+            "name": "Тестовое слово (Алиса)",
+            "label": "positive",
+            "split": "train",
+            "interval": { "start_ms": 50, "end_ms": 450 },
+            "notes": "Чистая запись",
+            "wav_base64": wav_b64
+        })
+        .to_string();
+
+        // 2. Upload valid sample via JSON
+        let req = format!(
+            "POST /api/v1/acoustics/samples HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, create_body.len(), create_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200, "Upload failed: {:?}", resp);
+        assert_eq!(resp["status"], "ok");
+        let sample_id = resp["sample"]["id"].as_str().unwrap().to_string();
+        assert!(sample_id.starts_with("smp_"));
+        assert_eq!(resp["sample"]["metrics"]["channels"], 1);
+        assert_eq!(resp["sample"]["metrics"]["sample_rate"], 16000);
+        assert_eq!(resp["sample"]["metrics"]["duration_ms"], 500);
+        assert_eq!(resp["sample"]["metrics"]["is_clipped"], false);
+
+        // 3. Download WAV bytes and verify exact byte match
+        let req_wav = format!(
+            "GET /api/v1/acoustics/samples/{}/wav HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            sample_id, local_addr, token
+        );
+        let (code, downloaded_wav) = send_req_raw(local_addr, req_wav.as_bytes()).await;
+        assert_eq!(code, 200);
+        assert_eq!(downloaded_wav, wav_bytes);
+
+        // 4. Get metadata
+        let req_meta = format!(
+            "GET /api/v1/acoustics/samples/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            sample_id, local_addr, token
+        );
+        let (code, meta_resp) = send_req(local_addr, &req_meta).await;
+        assert_eq!(code, 200);
+        assert_eq!(meta_resp["sample"]["name"], "Тестовое слово (Алиса)");
+        assert_eq!(meta_resp["sample"]["split"], "train");
+
+        // 5. Update sample
+        let update_body = serde_json::json!({
+            "name": "Алиса (обновлено)",
+            "split": "held_out",
+            "notes": "Перенесено в контроль"
+        })
+        .to_string();
+        let req_upd = format!(
+            "PUT /api/v1/acoustics/samples/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sample_id, local_addr, token, update_body.len(), update_body
+        );
+        let (code, upd_resp) = send_req(local_addr, &req_upd).await;
+        assert_eq!(code, 200);
+        assert_eq!(upd_resp["sample"]["name"], "Алиса (обновлено)");
+        assert_eq!(upd_resp["sample"]["split"], "held_out");
+
+        // 6. Upload invalid sample (stereo) -> 400 Bad Request
+        let mut stereo_cursor = std::io::Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::new(&mut stereo_cursor, spec).unwrap();
+            writer.write_sample(100i16).unwrap();
+            writer.write_sample(100i16).unwrap();
+            writer.finalize().unwrap();
+        }
+        let stereo_b64 = base64::prelude::BASE64_STANDARD.encode(stereo_cursor.into_inner());
+        let bad_body = serde_json::json!({
+            "name": "Плохой файл",
+            "label": "positive",
+            "split": "train",
+            "wav_base64": stereo_b64
+        })
+        .to_string();
+        let req_bad = format!(
+            "POST /api/v1/acoustics/samples HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, bad_body.len(), bad_body
+        );
+        let (code, bad_resp) = send_req(local_addr, &req_bad).await;
+        assert_eq!(code, 400);
+        assert!(bad_resp["message"].as_str().unwrap().contains("1 channel"));
+
+        // 7. Upload sample with i16::MIN -> detected as clipping without panic
+        let mut clipped_pcm = vec![500i16; 8000];
+        clipped_pcm[400] = i16::MIN; // -32768
+        let clipped_wav = crate::acoustics::samples::encode_wav_pcm16_mono(&clipped_pcm).unwrap();
+        let clipped_b64 = base64::prelude::BASE64_STANDARD.encode(&clipped_wav);
+        let clip_body = serde_json::json!({
+            "name": "Клиппинг клип",
+            "label": "positive",
+            "split": "calibration",
+            "wav_base64": clipped_b64
+        })
+        .to_string();
+        let req_clip = format!(
+            "POST /api/v1/acoustics/samples HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, clip_body.len(), clip_body
+        );
+        let (code, clip_resp) = send_req(local_addr, &req_clip).await;
+        assert_eq!(code, 200);
+        assert_eq!(clip_resp["sample"]["metrics"]["is_clipped"], true);
+        assert_eq!(clip_resp["sample"]["metrics"]["peak_amplitude"], 32768);
+
+        // 8. Delete sample
+        let req_del = format!(
+            "DELETE /api/v1/acoustics/samples/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            sample_id, local_addr, token
+        );
+        let (code, del_resp) = send_req(local_addr, &req_del).await;
+        assert_eq!(code, 200);
+        assert_eq!(del_resp["deleted"], sample_id);
+
+        let (code, _) = send_req(local_addr, &req_meta).await;
+        assert_eq!(code, 404);
+
+        // 9. Anonymous caller gets 401 Unauthorized
+        let anon_req = format!(
+            "POST /api/v1/acoustics/samples HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, create_body.len(), create_body
+        );
+        let (code, _) = send_req(local_addr, &anon_req).await;
         assert_eq!(code, 401);
 
         // Cleanup

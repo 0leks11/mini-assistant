@@ -376,9 +376,9 @@ pub fn process_sample(
 
     // Calculate overall peak and noise floor
     let mut sum_sq = 0.0f64;
-    let mut max_abs = 0i16;
+    let mut max_abs = 0i32;
     for &s in raw_pcm {
-        let abs = s.abs();
+        let abs = (s as i32).abs();
         if abs > max_abs {
             max_abs = abs;
         }
@@ -1079,5 +1079,18 @@ mod tests {
         assert!(phase2_count >= 1, "Mid zone must have at least 1 template");
         assert!(phase3_count >= 1, "Far zone must have at least 1 template");
         assert!(report.can_compile);
+    }
+
+    #[test]
+    fn test_process_sample_i16_min_no_panic_and_detects_clipping() {
+        let mut pcm = vec![1000i16; 3200]; // 200 ms
+        pcm[500] = i16::MIN; // -32768
+        let res = process_sample(&pcm, 1, 1, "near");
+        assert!(res.is_err(), "i16::MIN must be rejected as clipping");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("клиппингом"),
+            "Expected clipping error, got: {err_msg}"
+        );
     }
 }

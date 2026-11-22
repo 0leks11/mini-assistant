@@ -1,5 +1,6 @@
 //! Local acoustic settings and metadata. No microphone, provider or shell access.
 pub mod profiles;
+pub mod samples;
 use crate::config::{Config, WakewordCalibrationConfig};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};

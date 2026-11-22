@@ -111,6 +111,12 @@ class TestMcpAcousticAgent(unittest.TestCase):
         self.assertIn("create_room_profile", tool_names)
         self.assertIn("activate_room_profile", tool_names)
         self.assertIn("preview_candidate_profile", tool_names)
+        self.assertIn("list_samples", tool_names)
+        self.assertIn("get_sample", tool_names)
+        self.assertIn("upload_sample", tool_names)
+        self.assertIn("update_sample", tool_names)
+        self.assertIn("archive_sample", tool_names)
+        self.assertIn("delete_sample", tool_names)
 
         # 3. Call get_acoustic_status
         proc.stdin.write(
@@ -153,6 +159,23 @@ class TestMcpAcousticAgent(unittest.TestCase):
         self.assertEqual(resp4["id"], 4)
         self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/test_session")
         self.assertIn('"active": true', self.mock_server.last_body)
+
+        # 5. Call list_samples
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {"name": "list_samples", "arguments": {"split": "train"}},
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp5 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp5["id"], 5)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/samples?split=train")
 
         # Clean shutdown
         proc.stdin.close()

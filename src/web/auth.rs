@@ -39,6 +39,20 @@ pub struct CalibrationLease {
     pub active: bool,
 }
 
+impl Default for CalibrationLease {
+    fn default() -> Self {
+        Self {
+            lease_id: format!("lease_{}", uuid::Uuid::new_v4()),
+            baseline_revision: 0,
+            max_duration_secs: 300,
+            max_volume_pct: 70,
+            max_runs: 10,
+            runs_count: 0,
+            active: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CalibrationToken {
     pub token: String,
@@ -372,6 +386,45 @@ impl AuthManager {
                 "403 Forbidden",
                 "Forbidden: token lacks acoustics_write or profiles scope",
             ));
+        }
+
+        // Acoustic samples read endpoints (metadata, WAV stream, list)
+        let is_sample_read = (method == "GET")
+            && (path.starts_with("/api/v1/acoustics/samples")
+                || path.starts_with("/api/v1/calibration/samples"));
+
+        if is_sample_read {
+            if identity.has_scope(Scope::Samples) || identity.has_scope(Scope::AcousticsRead) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: reading samples requires calibration identity or owner",
+                ));
+            }
+            return Err((
+                "403 Forbidden",
+                "Forbidden: token lacks samples or acoustics_read scope",
+            ));
+        }
+
+        // Acoustic samples mutation endpoints (upload, update, archive, delete)
+        let is_sample_write = (method == "POST" || method == "PUT" || method == "DELETE")
+            && (path.starts_with("/api/v1/acoustics/samples")
+                || path.starts_with("/api/v1/calibration/samples"));
+
+        if is_sample_write {
+            if identity.has_scope(Scope::Samples) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: sample mutations require calibration identity with samples scope",
+                ));
+            }
+            return Err(("403 Forbidden", "Forbidden: token lacks samples scope"));
         }
 
         // Static pages and public status

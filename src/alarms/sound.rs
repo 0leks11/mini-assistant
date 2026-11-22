@@ -216,7 +216,7 @@ mod tests {
         assert!(pcm.len() > 40000 && pcm.len() < 50000);
 
         // Verify non-zero peak
-        let max_amp = pcm.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        let max_amp = pcm.iter().map(|&s| s.saturating_abs()).max().unwrap_or(0);
         assert!(
             max_amp > 5000,
             "Synthetic chime should have audible amplitude"

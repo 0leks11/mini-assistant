@@ -193,6 +193,80 @@ class GptMiniAcousticClient:
             data={"settings": settings, "ttl_secs": ttl_secs},
         )
 
+    def list_samples(
+        self,
+        include_archived: bool = False,
+        split: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params = []
+        if include_archived:
+            params.append("include_archived=true")
+        if split:
+            params.append(f"split={split}")
+        if label:
+            params.append(f"label={label}")
+        query = ("?" + "&".join(params)) if params else ""
+        return self._request("GET", f"/api/v1/acoustics/samples{query}")
+
+    def get_sample(self, sample_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/acoustics/samples/{sample_id}")
+
+    def upload_sample(
+        self,
+        name: str,
+        label: str,
+        split: str,
+        wav_base64_or_path: str,
+        interval: Optional[Dict[str, int]] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if os.path.isfile(wav_base64_or_path):
+            with open(wav_base64_or_path, "rb") as f:
+                wav_b64 = base64.b64encode(f.read()).decode("utf-8")
+        else:
+            wav_b64 = wav_base64_or_path
+
+        payload: Dict[str, Any] = {
+            "name": name,
+            "label": label,
+            "split": split,
+            "wav_base64": wav_b64,
+        }
+        if interval:
+            payload["interval"] = interval
+        if notes:
+            payload["notes"] = notes
+        return self._request("POST", "/api/v1/acoustics/samples", data=payload)
+
+    def update_sample(
+        self,
+        sample_id: str,
+        name: Optional[str] = None,
+        label: Optional[str] = None,
+        split: Optional[str] = None,
+        interval: Optional[Dict[str, int]] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if label is not None:
+            payload["label"] = label
+        if split is not None:
+            payload["split"] = split
+        if interval is not None:
+            payload["interval"] = interval
+        if notes is not None:
+            payload["notes"] = notes
+        return self._request("PUT", f"/api/v1/acoustics/samples/{sample_id}", data=payload)
+
+    def archive_sample(self, sample_id: str) -> Dict[str, Any]:
+        return self._request("POST", f"/api/v1/acoustics/samples/{sample_id}/archive")
+
+    def delete_sample(self, sample_id: str) -> Dict[str, Any]:
+        return self._request("DELETE", f"/api/v1/acoustics/samples/{sample_id}")
+
 
 TOOLS = [
     {
@@ -406,6 +480,104 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "list_samples",
+        "description": "List control audio samples stored in GPT Mini library with optional split or label filtering.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_archived": {"type": "boolean", "description": "Include archived samples"},
+                "split": {"type": "string", "enum": ["train", "calibration", "held_out"], "description": "Filter by dataset split"},
+                "label": {"type": "string", "enum": ["positive", "negative", "own_output", "ambient"], "description": "Filter by sample label"}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_sample",
+        "description": "Get metadata and audio metrics for a specific sample ID.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["sample_id"],
+            "properties": {
+                "sample_id": {"type": "string", "description": "Unique sample ID (e.g. smp_...)"}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "upload_sample",
+        "description": "Upload a validated mono PCM16 16kHz WAV sample (duration <= 60s) to GPT Mini audio library.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["name", "label", "split", "wav_base64_or_path"],
+            "properties": {
+                "name": {"type": "string", "description": "Human-readable sample name"},
+                "label": {"type": "string", "enum": ["positive", "negative", "own_output", "ambient"], "description": "Sample classification label"},
+                "split": {"type": "string", "enum": ["train", "calibration", "held_out"], "description": "Target dataset split (held-out is strictly isolated from training)"},
+                "wav_base64_or_path": {"type": "string", "description": "Base64-encoded WAV audio data or local file path to WAV file"},
+                "interval": {
+                    "type": "object",
+                    "properties": {
+                        "start_ms": {"type": "integer"},
+                        "end_ms": {"type": "integer"}
+                    },
+                    "required": ["start_ms", "end_ms"],
+                    "description": "Optional speech interval in milliseconds"
+                },
+                "notes": {"type": "string", "description": "Optional acoustic notes or recording conditions"}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "update_sample",
+        "description": "Update metadata, label, dataset split, or speech interval of an existing sample.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["sample_id"],
+            "properties": {
+                "sample_id": {"type": "string", "description": "Unique sample ID"},
+                "name": {"type": "string"},
+                "label": {"type": "string", "enum": ["positive", "negative", "own_output", "ambient"]},
+                "split": {"type": "string", "enum": ["train", "calibration", "held_out"]},
+                "interval": {
+                    "type": "object",
+                    "properties": {
+                        "start_ms": {"type": "integer"},
+                        "end_ms": {"type": "integer"}
+                    },
+                    "required": ["start_ms", "end_ms"]
+                },
+                "notes": {"type": "string"}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "archive_sample",
+        "description": "Mark a sample as archived without permanently deleting it from disk.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["sample_id"],
+            "properties": {
+                "sample_id": {"type": "string", "description": "Unique sample ID to archive"}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "delete_sample",
+        "description": "Permanently delete an audio sample and its metadata from GPT Mini.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["sample_id"],
+            "properties": {
+                "sample_id": {"type": "string", "description": "Unique sample ID to permanently remove"}
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -503,6 +675,36 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             result = client.activate_profile(
                 profile_id=args.get("profile_id", "")
             )
+        elif tool_name == "list_samples":
+            result = client.list_samples(
+                include_archived=args.get("include_archived", False),
+                split=args.get("split"),
+                label=args.get("label"),
+            )
+        elif tool_name == "get_sample":
+            result = client.get_sample(sample_id=args.get("sample_id", ""))
+        elif tool_name == "upload_sample":
+            result = client.upload_sample(
+                name=args.get("name", ""),
+                label=args.get("label", "positive"),
+                split=args.get("split", "train"),
+                wav_base64_or_path=args.get("wav_base64_or_path", ""),
+                interval=args.get("interval"),
+                notes=args.get("notes"),
+            )
+        elif tool_name == "update_sample":
+            result = client.update_sample(
+                sample_id=args.get("sample_id", ""),
+                name=args.get("name"),
+                label=args.get("label"),
+                split=args.get("split"),
+                interval=args.get("interval"),
+                notes=args.get("notes"),
+            )
+        elif tool_name == "archive_sample":
+            result = client.archive_sample(sample_id=args.get("sample_id", ""))
+        elif tool_name == "delete_sample":
+            result = client.delete_sample(sample_id=args.get("sample_id", ""))
         else:
             send_response(
                 {
