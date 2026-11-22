@@ -9,6 +9,9 @@ pub trait WakeWordEngine: Send + Sync {
 
     /// Reset internal state
     fn reset(&mut self);
+
+    /// Hot-update calibration settings on the fly
+    fn update_calibration(&mut self, _cfg: &rustpotter::PersonalDetectorConfig) {}
 }
 
 /// Simple energy-based Voice Activity Detector (VAD) fallback
@@ -294,6 +297,16 @@ impl InputGate {
     pub fn reload_engine(&mut self, new_engine: Box<dyn WakeWordEngine>) {
         self.engine = new_engine;
         self.reset_gate();
+    }
+
+    /// Hot-updates the detector calibration on the fly without interrupting audio loop.
+    pub fn update_calibration(&mut self, cfg: &rustpotter::PersonalDetectorConfig) {
+        self.engine.update_calibration(cfg);
+    }
+
+    /// Hot-updates VAD speech detection threshold.
+    pub fn update_vad_threshold(&mut self, threshold_rms: f32) {
+        self.speech_engine = Some(Box::new(SimpleVadEngine::new(threshold_rms)));
     }
 }
 

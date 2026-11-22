@@ -21,6 +21,8 @@ pub struct Config {
     pub spotify: Option<SpotifyConfig>,
     #[serde(default)]
     pub wifi: Option<WifiConfig>,
+    #[serde(default)]
+    pub wakeword: Option<WakewordCalibrationConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,44 +54,6 @@ pub struct AssistantConfig {
     /// Languages to understand: ["ru-RU", "en-US"]
     #[allow(dead_code)]
     pub languages: Vec<String>,
-    /// Peak similarity threshold for wake-word match (default: 0.38)
-    #[serde(default = "default_wakeword_threshold")]
-    pub wakeword_threshold: f32,
-    /// Average window threshold for wake-word match (default: 0.19)
-    #[serde(default = "default_wakeword_avg_threshold")]
-    pub wakeword_avg_threshold: f32,
-    /// Minimum consecutive positive scores (default: 4)
-    #[serde(default = "default_wakeword_min_scores")]
-    pub wakeword_min_scores: usize,
-    /// Eager mode: trigger immediately without waiting for silence countdown (default: true)
-    #[serde(default = "default_true")]
-    pub wakeword_eager: bool,
-    /// Wake-word scoring mode: "max" or "avg" (default: "max")
-    #[serde(default = "default_wakeword_score_mode")]
-    pub wakeword_score_mode: String,
-    /// Voice activity detection threshold / ambient noise gate (default: 45.0)
-    #[serde(default = "default_vad_threshold")]
-    pub vad_threshold: f32,
-}
-
-fn default_wakeword_threshold() -> f32 {
-    0.38
-}
-
-fn default_wakeword_avg_threshold() -> f32 {
-    0.19
-}
-
-fn default_wakeword_min_scores() -> usize {
-    4
-}
-
-fn default_wakeword_score_mode() -> String {
-    "max".to_string()
-}
-
-fn default_vad_threshold() -> f32 {
-    45.0
 }
 
 fn default_led_color() -> String {
@@ -362,6 +326,88 @@ impl Default for WifiConfig {
             portal_port: default_wifi_portal_port(),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct WakewordCalibrationConfig {
+    #[serde(default = "default_ww_threshold")]
+    pub threshold: f32,
+    #[serde(default = "default_ww_avg_threshold")]
+    pub avg_threshold: f32,
+    #[serde(default = "default_ww_min_scores")]
+    pub min_scores: usize,
+    #[serde(default = "default_ww_score_mode")]
+    pub score_mode: String,
+    #[serde(default = "default_true")]
+    pub eager: bool,
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    #[serde(default = "default_true")]
+    pub gain_normalizer: bool,
+    #[serde(default = "default_false")]
+    pub band_pass: bool,
+}
+
+impl Default for WakewordCalibrationConfig {
+    fn default() -> Self {
+        Self {
+            threshold: default_ww_threshold(),
+            avg_threshold: default_ww_avg_threshold(),
+            min_scores: default_ww_min_scores(),
+            score_mode: default_ww_score_mode(),
+            eager: true,
+            vad_threshold: default_vad_threshold(),
+            gain_normalizer: true,
+            band_pass: false,
+        }
+    }
+}
+
+impl WakewordCalibrationConfig {
+    pub fn to_detector_config(&self) -> rustpotter::PersonalDetectorConfig {
+        rustpotter::PersonalDetectorConfig {
+            threshold: self.threshold.clamp(0.10, 0.90),
+            avg_threshold: self.avg_threshold.clamp(0.05, 0.50),
+            min_scores: self.min_scores.clamp(1, 10),
+            score_mode: match self.score_mode.trim().to_ascii_lowercase().as_str() {
+                "max" => rustpotter::ScoreMode::Max,
+                "median" | "p50" => rustpotter::ScoreMode::Median,
+                "average" | "avg" => rustpotter::ScoreMode::Average,
+                "p75" => rustpotter::ScoreMode::P75,
+                "p80" => rustpotter::ScoreMode::P80,
+                "p90" => rustpotter::ScoreMode::P90,
+                "p95" => rustpotter::ScoreMode::P95,
+                _ => rustpotter::ScoreMode::Max,
+            },
+            gain_normalizer_enabled: self.gain_normalizer,
+            band_pass_enabled: self.band_pass,
+            eager: self.eager,
+        }
+    }
+}
+
+fn default_ww_threshold() -> f32 {
+    0.38
+}
+
+fn default_ww_avg_threshold() -> f32 {
+    0.19
+}
+
+fn default_ww_min_scores() -> usize {
+    4
+}
+
+fn default_ww_score_mode() -> String {
+    "max".to_string()
+}
+
+fn default_vad_threshold() -> f32 {
+    45.0
+}
+
+fn default_false() -> bool {
+    false
 }
 
 impl Config {

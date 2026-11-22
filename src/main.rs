@@ -511,11 +511,13 @@ async fn main() -> Result<()> {
             let model_path: std::path::PathBuf = std::env::var_os("MINI_WAKEWORD_MODEL")
                 .map(std::path::PathBuf::from)
                 .or(config.assistant.wakeword_model.clone())
-                .unwrap_or_else(|| "/bkupgrade/data/opt/mini-assistant/keyword.rpw".into());
+                .unwrap_or_else(|| "/data/opt/mini-assistant/keyword.rpw".into());
 
             let hardware_recorder = wakeword::enrollment::HardwareRecorder::new();
             let (tx_reload_wakeword, mut rx_reload_wakeword) =
                 tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+            let (tx_calibration, mut rx_calibration) =
+                tokio::sync::mpsc::channel::<crate::config::WakewordCalibrationConfig>(10);
 
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
@@ -551,7 +553,8 @@ async fn main() -> Result<()> {
                 Some(tx_reload_wakeword),
                 model_path.clone(),
                 wakeword_enabled,
-            );
+            )
+            .with_calibration_tx(tx_calibration);
             let current_led_color_holder = web_server.current_led_color();
 
             // 4d2. Start VL53L0 proximity relative gesture volume task with visual & acoustic click indicators
@@ -1089,7 +1092,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(config.assistant.vad_threshold)
+                .unwrap_or_else(|| config.wakeword.as_ref().map(|w| w.vad_threshold).unwrap_or(45.0))
                 .clamp(20.0, 100.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()
@@ -1117,7 +1120,7 @@ async fn main() -> Result<()> {
                 info!("Acoustic wake-word is explicitly DISABLED (wakeword_enabled = false); speaker is deaf to all acoustic triggers");
                 Box::new(wakeword::keyword::DisabledKeyword)
             } else {
-                match wakeword::keyword::KeywordEngine::load_with_config(&model_path, Some(&config.assistant)) {
+                match wakeword::keyword::KeywordEngine::load_with_calibration(&model_path, config.wakeword.as_ref()) {
                     Ok(engine) => {
                         info!("Local personal keyword detector loaded");
                         Box::new(engine)
@@ -1210,14 +1213,17 @@ async fn main() -> Result<()> {
                 while let Some(chunk) = rx_raw_mic.recv().await {
                     if let Ok(new_path) = rx_reload_wakeword.try_recv() {
                         let reloaded_cfg = crate::config::Config::load().ok();
-                        let asst_cfg = reloaded_cfg.as_ref().map(|c| &c.assistant);
-                        match wakeword::keyword::KeywordEngine::load_with_config(&new_path, asst_cfg) {
+                        let cal_cfg = reloaded_cfg.as_ref().and_then(|c| c.wakeword.as_ref());
+                        match wakeword::keyword::KeywordEngine::load_with_calibration(&new_path, cal_cfg) {
                             Ok(engine) => {
                                 info!(
                                     path = ?new_path,
                                     "Hot-reloaded personal wake-word engine into InputGate"
                                 );
                                 gate.reload_engine(Box::new(engine));
+                                if let Some(c) = cal_cfg {
+                                    gate.update_vad_threshold(c.vad_threshold);
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -1227,6 +1233,20 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
+                    }
+
+                    if let Ok(cal) = rx_calibration.try_recv() {
+                        gate.update_calibration(&cal.to_detector_config());
+                        gate.update_vad_threshold(cal.vad_threshold);
+                        info!(
+                            threshold = cal.threshold,
+                            avg_threshold = cal.avg_threshold,
+                            min_scores = cal.min_scores,
+                            vad_threshold = cal.vad_threshold,
+                            gain_norm = cal.gain_normalizer,
+                            band_pass = cal.band_pass,
+                            "Hot-applied updated acoustic calibration to InputGate"
+                        );
                     }
 
                     let is_enrolling = recorder_for_mic.is_recording();

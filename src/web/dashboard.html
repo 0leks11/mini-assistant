@@ -183,6 +183,18 @@
       transition: background 0.2s, transform 0.1s;
     }
     .btn-icon:active { transform: scale(0.96); background: #30363d; }
+    .btn-icon.active {
+      background: rgba(88, 166, 255, 0.2);
+      border-color: var(--accent);
+      color: #fff;
+      box-shadow: 0 0 10px rgba(88, 166, 255, 0.25);
+    }
+    .cal-control-box {
+      background: rgba(13, 17, 23, 0.7);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+    }
 
     /* Voice Grid */
     .provider-tab {
@@ -833,6 +845,124 @@
           <button class="sp-btn" style="flex: 0 0 auto;" onclick="closeWakewordWizard()">✕</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Acoustic Calibration & Sensitivity Card -->
+  <div class="card" id="card-calibration">
+    <div class="card-title">
+      <span>🎛️ Чувствительность и калибровка звука</span>
+      <span id="cal-status-badge" style="font-size: 11px; color: var(--success); font-weight: normal;">Активна</span>
+    </div>
+
+    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px; line-height: 1.4;">
+      Тонкая настройка порогов слышимости, отсечки шумов и адаптивности детектора к вашему голосу. Изменения применяются на лету без перезагрузки колонки.
+    </p>
+
+    <!-- Calibration Controls Container -->
+    <div style="display: flex; flex-direction: column; gap: 14px;">
+      
+      <!-- 1. Wake-Word Sensitivity (threshold) -->
+      <div class="cal-control-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+          <span style="font-size: 13px; font-weight: 600;">Порог отклика Wake-Word</span>
+          <span id="cal-val-threshold" style="font-size: 14px; font-weight: 700; color: var(--accent);">38%</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
+          Пиковая схожесть с образцами. Выше (50–60%) — строже, ниже (30–38%) — легче позвать издалека.
+        </div>
+        <input type="range" id="cal-range-threshold" min="15" max="75" step="1" value="38" oninput="updateCalDisplay()">
+      </div>
+
+      <!-- 2. Window Density (avg_threshold) -->
+      <div class="cal-control-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+          <span style="font-size: 13px; font-weight: 600;">Порог плотности фразы (Avg)</span>
+          <span id="cal-val-avg-threshold" style="font-size: 14px; font-weight: 700; color: var(--accent);">19%</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
+          Средняя схожесть по всей длине слова. Для длинных слов («штучкаинтелект») рекомендуем 16–22%.
+        </div>
+        <input type="range" id="cal-range-avg-threshold" min="8" max="45" step="1" value="19" oninput="updateCalDisplay()">
+      </div>
+
+      <!-- 3. Ambient Noise Cutoff (vad_threshold) -->
+      <div class="cal-control-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+          <span style="font-size: 13px; font-weight: 600;">Отсечка шумов помещения (VAD)</span>
+          <span id="cal-val-vad-threshold" style="font-size: 14px; font-weight: 700; color: var(--accent);">45 RMS</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
+          Порог тишины. Ниже (25–35) — слышит даже шёпот; выше (50–70) — отсекает телевизор и бытовой шум.
+        </div>
+        <input type="range" id="cal-range-vad-threshold" min="20" max="90" step="1" value="45" oninput="updateCalDisplay()">
+      </div>
+
+      <!-- 4. Min Consecutive Frames (min_scores) -->
+      <div class="cal-control-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+          <span style="font-size: 13px; font-weight: 600;">Кадров подтверждения</span>
+          <span id="cal-val-min-scores" style="font-size: 14px; font-weight: 700; color: var(--accent);">4 кадра</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
+          Длительность совпадения для срабатывания. 3–4 кадра обеспечивают мгновенный отклик.
+        </div>
+        <input type="range" id="cal-range-min-scores" min="1" max="8" step="1" value="4" oninput="updateCalDisplay()">
+      </div>
+
+      <!-- 5. Strategy Mode (score_mode) -->
+      <div class="cal-control-box">
+        <div style="font-size: 13px; font-weight: 600; margin-bottom: 6px;">Стратегия сопоставления с базой сэмплов</div>
+        <div style="display: flex; gap: 8px;">
+          <button type="button" class="btn-icon active" id="btn-mode-max" onclick="setCalScoreMode('max')" style="padding: 8px 12px; font-weight: 600;">
+            🔥 По лучшему (Max)
+          </button>
+          <button type="button" class="btn-icon" id="btn-mode-avg" onclick="setCalScoreMode('avg')" style="padding: 8px 12px; font-weight: 600;">
+            ⚖️ По среднему (Avg)
+          </button>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
+          Режим <b>Max</b> рекомендуется: позволяет колонкам узнавать разные интонации (сонный/бодрый голос).
+        </div>
+      </div>
+
+      <!-- 6. Toggles (Eager, Gain Normalizer, Band-Pass) -->
+      <div style="background: rgba(13, 17, 23, 0.7); border: 1px solid var(--card-border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 10px;">
+        <label style="display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer;">
+          <input type="checkbox" id="cal-toggle-eager" checked style="width: 18px; height: 18px; accent-color: var(--accent);">
+          <div>
+            <div style="font-weight: 600;">Мгновенный триггер (Eager mode)</div>
+            <div style="font-size: 11px; color: var(--text-muted);">Не ожидать тишины после фразы, срабатывать мгновенно</div>
+          </div>
+        </label>
+
+        <label style="display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer;">
+          <input type="checkbox" id="cal-toggle-gain" checked style="width: 18px; height: 18px; accent-color: var(--accent);">
+          <div>
+            <div style="font-weight: 600;">Аппаратное выравнивание усиления (Gain Normalizer)</div>
+            <div style="font-size: 11px; color: var(--text-muted);">Автоматически усиливает тихий голос и защищает от перегрузок</div>
+          </div>
+        </label>
+
+        <label style="display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer;">
+          <input type="checkbox" id="cal-toggle-bandpass" style="width: 18px; height: 18px; accent-color: var(--accent);">
+          <div>
+            <div style="font-weight: 600;">Полосовой фильтр частот речи (200–4000 Гц)</div>
+            <div style="font-size: 11px; color: var(--text-muted);">Срезает гул вентиляторов, кондиционера и высокочастотный свист</div>
+          </div>
+        </label>
+      </div>
+
+      <!-- Action buttons -->
+      <div style="display: flex; gap: 8px; margin-top: 4px;">
+        <button class="btn-compile" id="btn-save-cal" onclick="saveCalibration()" style="background: linear-gradient(135deg, #1f6feb, #2ea043);">
+          <span>💾 Сохранить и применить</span>
+        </button>
+        <button class="btn-icon" style="flex: 0 0 auto; padding: 0 14px;" onclick="resetCalibrationDefaults()" title="Сбросить к рекомендованным">
+          🔄 По умолчанию
+        </button>
+      </div>
+
     </div>
   </div>
 
@@ -1491,9 +1621,128 @@
     }
   }
 
+  let currentCalScoreMode = "max";
+
+  function setCalScoreMode(mode) {
+    currentCalScoreMode = mode;
+    const btnMax = document.getElementById("btn-mode-max");
+    const btnAvg = document.getElementById("btn-mode-avg");
+    if (btnMax) btnMax.classList.toggle("active", mode === "max");
+    if (btnAvg) btnAvg.classList.toggle("active", mode === "avg");
+  }
+
+  function updateCalDisplay() {
+    const elTh = document.getElementById("cal-range-threshold");
+    const elAvg = document.getElementById("cal-range-avg-threshold");
+    const elVad = document.getElementById("cal-range-vad-threshold");
+    const elMin = document.getElementById("cal-range-min-scores");
+
+    if (elTh) document.getElementById("cal-val-threshold").innerText = elTh.value + "%";
+    if (elAvg) document.getElementById("cal-val-avg-threshold").innerText = elAvg.value + "%";
+    if (elVad) document.getElementById("cal-val-vad-threshold").innerText = elVad.value + " RMS";
+    if (elMin) {
+      const minScores = parseInt(elMin.value, 10);
+      const label = minScores === 1 ? "1 кадр" : (minScores < 5 ? minScores + " кадра" : minScores + " кадров");
+      document.getElementById("cal-val-min-scores").innerText = label;
+    }
+  }
+
+  async function fetchCalibration() {
+    try {
+      const res = await fetch("/api/v1/calibration");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.threshold !== undefined) {
+        document.getElementById("cal-range-threshold").value = Math.round(data.threshold * 100);
+      }
+      if (data.avg_threshold !== undefined) {
+        document.getElementById("cal-range-avg-threshold").value = Math.round(data.avg_threshold * 100);
+      }
+      if (data.vad_threshold !== undefined) {
+        document.getElementById("cal-range-vad-threshold").value = Math.round(data.vad_threshold);
+      }
+      if (data.min_scores !== undefined) {
+        document.getElementById("cal-range-min-scores").value = data.min_scores;
+      }
+      if (data.score_mode) {
+        setCalScoreMode(data.score_mode.toLowerCase() === "avg" ? "avg" : "max");
+      }
+      if (data.eager !== undefined) {
+        document.getElementById("cal-toggle-eager").checked = !!data.eager;
+      }
+      if (data.gain_normalizer !== undefined) {
+        document.getElementById("cal-toggle-gain").checked = !!data.gain_normalizer;
+      }
+      if (data.band_pass !== undefined) {
+        document.getElementById("cal-toggle-bandpass").checked = !!data.band_pass;
+      }
+      updateCalDisplay();
+    } catch (e) {
+      console.error("fetchCalibration error:", e);
+    }
+  }
+
+  async function saveCalibration() {
+    const btn = document.getElementById("btn-save-cal");
+    btn.disabled = true;
+    btn.innerText = "Применение на лету...";
+
+    const thPct = parseFloat(document.getElementById("cal-range-threshold").value);
+    const avgThPct = parseFloat(document.getElementById("cal-range-avg-threshold").value);
+    const vad = parseFloat(document.getElementById("cal-range-vad-threshold").value);
+    const minScores = parseInt(document.getElementById("cal-range-min-scores").value, 10);
+    const eager = document.getElementById("cal-toggle-eager").checked;
+    const gainNorm = document.getElementById("cal-toggle-gain").checked;
+    const bandPass = document.getElementById("cal-toggle-bandpass").checked;
+
+    const payload = {
+      threshold: thPct / 100.0,
+      avg_threshold: avgThPct / 100.0,
+      min_scores: minScores,
+      score_mode: currentCalScoreMode,
+      eager: eager,
+      vad_threshold: vad,
+      gain_normalizer: gainNorm,
+      band_pass: bandPass
+    };
+
+    try {
+      const res = await fetch("/api/v1/calibration", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || "Калибровка успешно применена!");
+      } else {
+        showToast("Ошибка: " + (data.message || "Не удалось сохранить"));
+      }
+    } catch (e) {
+      showToast("Ошибка соединения: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerText = "💾 Сохранить и применить";
+    }
+  }
+
+  function resetCalibrationDefaults() {
+    document.getElementById("cal-range-threshold").value = 38;
+    document.getElementById("cal-range-avg-threshold").value = 19;
+    document.getElementById("cal-range-vad-threshold").value = 45;
+    document.getElementById("cal-range-min-scores").value = 4;
+    setCalScoreMode("max");
+    document.getElementById("cal-toggle-eager").checked = true;
+    document.getElementById("cal-toggle-gain").checked = true;
+    document.getElementById("cal-toggle-bandpass").checked = false;
+    updateCalDisplay();
+    showToast("Установлены рекомендованные значения. Нажмите «Сохранить».");
+  }
+
   // Poll status every 3 seconds
   fetchStatus();
   fetchWakewordStatus();
+  fetchCalibration();
   setInterval(fetchStatus, 3000);
 </script>
 </body>

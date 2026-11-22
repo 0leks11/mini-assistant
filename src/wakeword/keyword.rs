@@ -15,61 +15,65 @@ pub struct KeywordEngine {
 
 impl KeywordEngine {
     pub fn load(path: &Path) -> Result<Self> {
-        let app_config = crate::config::Config::load().ok();
-        Self::load_with_config(path, app_config.as_ref().map(|c| &c.assistant))
+        Self::load_with_calibration(path, None)
     }
 
-    pub fn load_with_config(
+    pub fn load_with_calibration(
         path: &Path,
-        assistant_cfg: Option<&crate::config::AssistantConfig>,
+        cal: Option<&crate::config::WakewordCalibrationConfig>,
     ) -> Result<Self> {
         let reference =
             WakewordRef::load_from_file(path.to_str().context("Invalid keyword reference path")?)
                 .map_err(anyhow::Error::msg)?;
 
-        let cfg_threshold = assistant_cfg.map(|c| c.wakeword_threshold).unwrap_or(0.38);
-        let cfg_avg_threshold = assistant_cfg.map(|c| c.wakeword_avg_threshold).unwrap_or(0.19);
-        let cfg_min_scores = assistant_cfg.map(|c| c.wakeword_min_scores).unwrap_or(4);
-        let cfg_eager = assistant_cfg.map(|c| c.wakeword_eager).unwrap_or(true);
-        let cfg_score_mode = assistant_cfg
-            .and_then(|c| parse_score_mode(&c.wakeword_score_mode))
-            .unwrap_or(ScoreMode::Max);
+        let def_cal = crate::config::WakewordCalibrationConfig::default();
+        let cal_ref = cal.unwrap_or(&def_cal);
 
         let threshold = std::env::var("MINI_WAKEWORD_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(cfg_threshold);
+            .unwrap_or(cal_ref.threshold);
 
         let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(cfg_avg_threshold);
+            .unwrap_or(cal_ref.avg_threshold);
 
         let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| (1..=20).contains(v))
-            .unwrap_or(cfg_min_scores);
-
-        let eager = std::env::var("MINI_WAKEWORD_EAGER")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(cfg_eager);
+            .unwrap_or(cal_ref.min_scores);
 
         let score_mode = std::env::var("MINI_WAKEWORD_SCORE_MODE")
             .ok()
             .and_then(|v| parse_score_mode(&v))
-            .unwrap_or(cfg_score_mode);
+            .unwrap_or_else(|| parse_score_mode(&cal_ref.score_mode).unwrap_or(ScoreMode::Max));
+
+        let eager = std::env::var("MINI_WAKEWORD_EAGER")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(cal_ref.eager);
+
+        let gain_norm = std::env::var("MINI_WAKEWORD_GAIN_NORM")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(cal_ref.gain_normalizer);
+
+        let band_pass = std::env::var("MINI_WAKEWORD_BAND_PASS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(cal_ref.band_pass);
 
         let detector_cfg = PersonalDetectorConfig {
             threshold,
             avg_threshold,
             min_scores,
             score_mode,
-            gain_normalizer_enabled: true,
-            band_pass_enabled: false,
+            gain_normalizer_enabled: gain_norm,
+            band_pass_enabled: band_pass,
             eager,
         };
 
@@ -77,8 +81,10 @@ impl KeywordEngine {
             threshold,
             avg_threshold,
             min_scores,
-            eager,
             ?score_mode,
+            eager,
+            gain_norm,
+            band_pass,
             "Loaded personal wake-word detector with calibrated parameters"
         );
 
@@ -140,7 +146,7 @@ impl KeywordEngine {
     }
 }
 
-fn parse_score_mode(s: &str) -> Option<ScoreMode> {
+pub fn parse_score_mode(s: &str) -> Option<ScoreMode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "max" => Some(ScoreMode::Max),
         "median" | "p50" => Some(ScoreMode::Median),
@@ -154,6 +160,21 @@ fn parse_score_mode(s: &str) -> Option<ScoreMode> {
 }
 
 impl WakeWordEngine for KeywordEngine {
+    fn update_calibration(&mut self, cfg: &PersonalDetectorConfig) {
+        if let Ok(Some(d)) = self.detector.get_mut() {
+            d.update_personal_config(cfg);
+            info!(
+                threshold = cfg.threshold,
+                avg_threshold = cfg.avg_threshold,
+                min_scores = cfg.min_scores,
+                ?cfg.score_mode,
+                eager = cfg.eager,
+                gain_norm = cfg.gain_normalizer_enabled,
+                band_pass = cfg.band_pass_enabled,
+                "Hot-updated personal wake-word detector calibration"
+            );
+        }
+    }
     fn process(&mut self, pcm: &[u8]) -> bool {
         if pcm.len() > 8192 || !pcm.len().is_multiple_of(2) {
             self.reset();

@@ -68,6 +68,23 @@ pub fn personal_reference_detector_with_config(
     Ok(detector)
 }
 
+impl Rustpotter {
+    pub fn update_personal_config(&mut self, cfg: &PersonalDetectorConfig) {
+        let mut d_cfg = crate::config::DetectorConfig::default();
+        d_cfg.threshold = cfg.threshold;
+        d_cfg.avg_threshold = cfg.avg_threshold;
+        d_cfg.min_scores = cfg.min_scores;
+        d_cfg.score_mode = cfg.score_mode;
+        d_cfg.eager = cfg.eager;
+        self.update_detector_config(&d_cfg);
+
+        let mut f_cfg = crate::config::FiltersConfig::default();
+        f_cfg.gain_normalizer.enabled = cfg.gain_normalizer_enabled;
+        f_cfg.band_pass.enabled = cfg.band_pass_enabled;
+        self.update_filters_config(&f_cfg);
+    }
+}
+
 /// Construct the Mini's personal MFCC/DTW matcher with default parameters.
 pub fn personal_reference_detector(reference: WakewordRef) -> Result<Rustpotter, String> {
     personal_reference_detector_with_config(reference, &PersonalDetectorConfig::default())
