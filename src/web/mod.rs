@@ -190,6 +190,7 @@ impl ControlCenterServer {
         let mut host = None;
         let mut origin = None;
         let mut json_content = false;
+        let mut if_match = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
                 let k_trim = k.trim();
@@ -203,6 +204,8 @@ impl ControlCenterServer {
                     }
                 } else if k_trim.eq_ignore_ascii_case("host") {
                     host = Some(v.trim().to_string());
+                } else if k_trim.eq_ignore_ascii_case("if-match") {
+                    if_match = Some(v.trim().to_string());
                 }
             }
         }
@@ -245,12 +248,22 @@ impl ControlCenterServer {
             _ => self.redirect_uri.clone(),
         };
 
-        if method == "POST" && matches!(path, "/api/v1/acoustics" | "/api/v1/calibration") {
+        if method == "POST"
+            && matches!(
+                path,
+                "/api/v1/acoustics"
+                    | "/api/v1/calibration"
+                    | "/api/v1/acoustics/restore"
+                    | "/api/v1/calibration/restore"
+            )
+        {
             let same_origin = origin.as_ref().is_none_or(|o| {
                 host.as_ref()
                     .is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}"))
             });
-            if !same_origin || !json_content {
+            let is_restore =
+                path == "/api/v1/acoustics/restore" || path == "/api/v1/calibration/restore";
+            if !same_origin || (!is_restore && !json_content) {
                 return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require same-origin JSON"})).await;
             }
             if body.len() > 16 * 1024 {
@@ -331,7 +344,11 @@ impl ControlCenterServer {
                 self.handle_api_get_calibration(&mut stream).await?;
             }
             ("POST", "/api/v1/acoustics") | ("POST", "/api/v1/calibration") => {
-                self.handle_api_post_calibration(&mut stream, body).await?;
+                self.handle_api_post_calibration(&mut stream, body, if_match.as_deref())
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/restore") | ("POST", "/api/v1/calibration/restore") => {
+                self.handle_api_restore_calibration(&mut stream).await?;
             }
 
             // Spotify OAuth PKCE Flow
@@ -655,7 +672,12 @@ impl ControlCenterServer {
 
     async fn handle_api_get_calibration(&self, stream: &mut TcpStream) -> Result<()> {
         match &self.acoustic_lab {
-            Some(lab) => self.send_json(stream, &lab.response()).await,
+            Some(lab) => {
+                let snap = lab.snapshot();
+                let etag = format!("\"{}\"", snap.revision);
+                self.send_json_with_etag(stream, &lab.response(), &etag)
+                    .await
+            }
             None => {
                 self.send_json_status(
                     stream,
@@ -667,7 +689,12 @@ impl ControlCenterServer {
         }
     }
 
-    async fn handle_api_post_calibration(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+    async fn handle_api_post_calibration(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        if_match: Option<&str>,
+    ) -> Result<()> {
         let Some(lab) = &self.acoustic_lab else {
             return self
                 .send_json_status(
@@ -677,9 +704,40 @@ impl ControlCenterServer {
                 )
                 .await;
         };
+        let snapshot = lab.snapshot();
+        if let Some(im) = if_match {
+            let im_clean = im.trim().trim_matches('"');
+            let current_rev_str = snapshot.revision.to_string();
+            let current_full_tag =
+                format!("{}:{}", snapshot.runtime_instance_id, snapshot.revision);
+            if im_clean != current_rev_str && im_clean != current_full_tag {
+                return self
+                    .send_json_status(
+                        stream,
+                        "412 Precondition Failed",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": "If-Match condition failed; acoustic profile revision mismatch",
+                            "snapshot": lab.response()
+                        }),
+                    )
+                    .await;
+            }
+        }
         let payload: crate::acoustics::ApplyPayload = match serde_json::from_str(body) {
             Ok(value) => value,
-            Err(_) => return self.send_json_status(stream,"400 Bad Request",&serde_json::json!({"status":"error","message":"Expected {expected_revision, settings} acoustic profile"})).await,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Invalid acoustic profile payload: {e}")
+                        }),
+                    )
+                    .await;
+            }
         };
         if let Err(e) = payload.settings.validate() {
             return self
@@ -690,15 +748,93 @@ impl ControlCenterServer {
                 )
                 .await;
         }
-        if payload.expected_revision != lab.snapshot().revision || lab.snapshot().pending {
-            return self.send_json_status(stream,"409 Conflict",&serde_json::json!({"status":"error","message":"Профиль изменился или ожидает применения. Обновите статус.","snapshot":lab.response()})).await;
+        if let Some(ref inst) = payload.expected_instance_id {
+            if inst != &snapshot.runtime_instance_id {
+                return self
+                    .send_json_status(
+                        stream,
+                        "409 Conflict",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": "Instance ID mismatch; GPT Mini was restarted. Reload status before updating.",
+                            "snapshot": lab.response()
+                        }),
+                    )
+                    .await;
+            }
+        }
+        if payload.expected_revision != snapshot.revision || snapshot.pending {
+            return self
+                .send_json_status(
+                    stream,
+                    "409 Conflict",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "Профиль изменился или ожидает применения. Обновите статус.",
+                        "snapshot": lab.response()
+                    }),
+                )
+                .await;
         }
         let Some(path) = self.resolve_config_path() else {
-            return self.send_json_status(stream,"503 Service Unavailable",&serde_json::json!({"status":"error","message":"Config path is unavailable; nothing saved"})).await;
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Config path is unavailable; nothing saved"}),
+                )
+                .await;
         };
-        match lab.apply(&path,payload).await {
-            Ok(_) => self.send_json(stream,&lab.response()).await,
-            Err(e) => self.send_json_status(stream,"503 Service Unavailable",&serde_json::json!({"status":"error","message":e.to_string(),"snapshot":lab.response()})).await,
+        match lab.apply(&path, payload).await {
+            Ok(new_snap) => {
+                let etag = format!("\"{}\"", new_snap.revision);
+                self.send_json_with_etag(stream, &lab.response(), &etag)
+                    .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":e.to_string(),"snapshot":lab.response()}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_restore_calibration(&self, stream: &mut TcpStream) -> Result<()> {
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await;
+        };
+        let Some(path) = self.resolve_config_path() else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Config path is unavailable"}),
+                )
+                .await;
+        };
+        match lab.restore_working(&path).await {
+            Ok(snap) => {
+                let etag = format!("\"{}\"", snap.revision);
+                self.send_json_with_etag(stream, &lab.response(), &etag)
+                    .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({"status":"error","message":e.to_string(),"snapshot":lab.response()}),
+                )
+                .await
+            }
         }
     }
 
@@ -912,6 +1048,23 @@ impl ControlCenterServer {
         let bytes = serde_json::to_vec(val)?;
         self.send_response(stream, "200 OK", "application/json", &bytes)
             .await
+    }
+
+    async fn send_json_with_etag(
+        &self,
+        stream: &mut TcpStream,
+        val: &serde_json::Value,
+        etag: &str,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(val)?;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nETag: {etag}\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(&bytes).await?;
+        stream.flush().await?;
+        Ok(())
     }
 
     async fn send_json_status(

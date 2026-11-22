@@ -172,10 +172,10 @@
 <script>
 "use strict";
 
-function valuesEqual(a, b) {
+function valuesEqual(a, b, tolerance = 1e-4) {
   if (a === b) return true;
   if (typeof a === "number" && typeof b === "number") {
-    return Math.abs(a - b) < 1e-4;
+    return Math.abs(a - b) < tolerance;
   }
   return false;
 }
@@ -183,7 +183,27 @@ function valuesEqual(a, b) {
 function settingsEqual(a, b) {
   if (!a || !b) return a === b;
   const keys = Object.keys(a).sort();
-  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && valuesEqual(a[key], b[key]));
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every(key => {
+    if (!Object.hasOwn(b, key)) return false;
+    const tol = key === "gain_ref" ? 1e-6 : 1e-4;
+    return valuesEqual(a[key], b[key], tol);
+  });
+}
+
+function stepDecimals(step) {
+  if (typeof step !== "number" || step >= 1) return 0;
+  const s = step.toString();
+  const eIndex = s.indexOf('e-');
+  if (eIndex !== -1) return parseInt(s.slice(eIndex + 2), 10);
+  const dotIndex = s.indexOf('.');
+  return dotIndex !== -1 ? s.length - dotIndex - 1 : 0;
+}
+
+function formatValueForInput(value, step) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  const decimals = stepDecimals(step);
+  return decimals > 0 ? value.toFixed(decimals) : String(Math.round(value));
 }
 
 function validateSettings(settings, controls, reference) {
@@ -198,16 +218,28 @@ function validateSettings(settings, controls, reference) {
     if (!control) throw new Error("В профиле есть неподдерживаемый параметр: " + key);
     if (control.kind === "boolean") {
       if (typeof value !== "boolean") throw new Error(control.label + ": требуется переключатель true/false.");
+      result[key] = value;
     } else if (control.kind === "select") {
-      if (typeof value !== "string" || !control.options.some(option => option.value === value)) throw new Error(control.label + ": неизвестный вариант.");
+      let normValue = typeof value === "string" ? value.trim().toLowerCase() : "";
+      if (normValue === "average") normValue = "avg";
+      if (!control.options.some(option => option.value === normValue)) throw new Error(control.label + ": неизвестный вариант.");
+      result[key] = normValue;
     } else if (control.kind === "number" || control.kind === "optional_number") {
-      if (!(control.kind === "optional_number" && value === null)) {
+      if (control.kind === "optional_number" && value === null) {
+        result[key] = null;
+      } else {
         if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(control.label + ": требуется конечное число.");
-        if ((Number.isFinite(control.min) && value < control.min) || (Number.isFinite(control.max) && value > control.max)) throw new Error(control.label + ": значение вне допустимого диапазона.");
-        if (control.step >= 1 && Number.isInteger(control.step) && !Number.isInteger(value)) throw new Error(control.label + ": требуется целое число.");
+        const eps = 1e-5;
+        if ((Number.isFinite(control.min) && value < control.min - eps) || (Number.isFinite(control.max) && value > control.max + eps)) {
+          throw new Error(control.label + ": значение вне допустимого диапазона.");
+        }
+        if (control.step >= 1 && Number.isInteger(control.step) && Math.abs(value - Math.round(value)) > 1e-5) {
+          throw new Error(control.label + ": требуется целое число.");
+        }
+        const decimals = stepDecimals(control.step);
+        result[key] = decimals > 0 ? Number(value.toFixed(decimals)) : Math.round(value);
       }
     } else throw new Error("Неизвестный тип параметра: " + key);
-    result[key] = value;
   }
   return result;
 }
@@ -228,6 +260,7 @@ function initAcousticLab() {
   let draft = null;
   let original = null;
   let baseRevision = null;
+  let baseInstanceId = null;
   let busy = false;
   let fetching = false;
   let online = false;
@@ -236,7 +269,7 @@ function initAcousticLab() {
   let schemaSignature = "";
   const widgets = new Map();
   const clone = value => JSON.parse(JSON.stringify(value));
-  const dirty = () => draft !== null && !settingsEqual(draft, original);
+  const dirty = () => draft !== null && (!settingsEqual(draft, original) || (latest?.applied && latest?.saved && !settingsEqual(latest.applied, latest.saved)));
   const groupInfo = {
     kws:["Слово вызова", "Баллы сходства, стратегия сравнения и подтверждение обращения."],
     activation:["Режим активации", "Условия локальной активации и режим проверки."],
@@ -257,10 +290,11 @@ function initAcousticLab() {
 
   function updateActions() {
     const changed = dirty();
-    const conflict = changed && latest && latest.revision !== baseRevision;
+    const instanceConflict = latest && latest.runtime_instance_id && baseInstanceId && latest.runtime_instance_id !== baseInstanceId;
+    const conflict = changed && latest && (latest.revision !== baseRevision || instanceConflict);
     el("conflict").hidden = !conflict;
     el("apply-btn").disabled = busy || !online || !draft || !changed || !!conflict || !!latest.pending || !latest.runtime?.ready;
-    el("revert-btn").disabled = busy || !latest?.applied || (!changed && baseRevision === latest.revision);
+    el("revert-btn").disabled = busy || !latest?.applied;
     for (const id of ["export-btn","import-btn","defaults-btn","print-btn"]) el(id).disabled = busy || !draft;
     for (const widget of widgets.values()) widget.disabled(busy);
     el("apply-btn").textContent = busy ? "Применяем…" : "Применить";
@@ -277,12 +311,14 @@ function initAcousticLab() {
       el("form-status").textContent = "На устройстве есть неподтверждённые изменения";
       el("form-detail").textContent = "Дождитесь результата применения";
     } else if (changed) {
-      const count = Object.keys(draft).filter(key => !valuesEqual(draft[key], original[key])).length;
+      const count = Object.keys(draft).filter(key => !valuesEqual(draft[key], original[key], key === "gain_ref" ? 1e-6 : 1e-4)).length;
       el("form-status").textContent = "Изменений в форме: " + count;
       el("form-detail").textContent = "Работающий профиль пока не изменён";
     } else {
-      el("form-status").textContent = latest?.runtime?.ready ? "Работающий профиль · ревизия " + latest.revision : "Аудиоцикл пока не готов";
-      el("form-detail").textContent = latest?.saved && latest?.applied && !settingsEqual(latest.saved, latest.applied) ? "Сохранённые и применённые значения различаются" : "Нет неприменённых изменений";
+      const appRev = latest?.applied_revision ?? latest?.revision ?? "—";
+      const savRev = latest?.saved_revision ?? latest?.revision ?? "—";
+      el("form-status").textContent = latest?.runtime?.ready ? "Работающий профиль · ревизия r" + appRev : "Аудиоцикл пока не готов";
+      el("form-detail").textContent = latest?.saved && latest?.applied && !settingsEqual(latest.saved, latest.applied) ? `Сохранённая (r${savRev}) и применённая (r${appRev}) ревизии различаются` : "Нет неприменённых изменений";
     }
   }
 
@@ -340,8 +376,15 @@ function initAcousticLab() {
       sync = value => {
         const isAuto = value === null && automatic;
         if (automatic) automatic.checked = !!isAuto;
-        if (!isAuto) { number.value = value; range.value = value; }
-        else if (number.value === "") { number.value = control.min ?? 1; range.value = number.value; }
+        if (!isAuto) {
+          const formatted = formatValueForInput(value, control.step);
+          number.value = formatted;
+          range.value = formatted;
+        } else if (number.value === "") {
+          const formatted = formatValueForInput(control.min ?? 1, control.step);
+          number.value = formatted;
+          range.value = formatted;
+        }
         number.disabled = busy || !!isAuto; range.disabled = busy || !!isAuto;
       };
       range.addEventListener("input", () => { number.value = range.value; editValue(control.key, Number(range.value)); });
@@ -371,8 +414,10 @@ function initAcousticLab() {
   }
 
   function fillForm(settings, revision, setOriginal = true) {
-    draft = clone(settings); baseRevision = revision;
-    if (setOriginal) original = clone(settings);
+    draft = clone(settings); baseRevision = revision; baseInstanceId = latest?.runtime_instance_id || null;
+    if (setOriginal) {
+      original = latest?.saved && !settingsEqual(latest.saved, settings) ? clone(latest.saved) : clone(settings);
+    }
     for (const [key, widget] of widgets) widget.sync(draft[key]);
     refreshFieldMeta(); updateActions();
   }
@@ -391,7 +436,9 @@ function initAcousticLab() {
     el("noise-value").textContent = numberText(runtime.noise_floor, 1);
     el("vad-value").textContent = numberText(runtime.vad_level, 1);
     el("mode-value").textContent = runtime.mode || "—";
-    el("revision-value").textContent = String(data.revision);
+    const appRev = data.applied_revision ?? data.revision;
+    const savRev = data.saved_revision ?? data.revision;
+    el("revision-value").textContent = `r${appRev} (сохранено: r${savRev})`;
     el("updated-value").textContent = new Date().toLocaleTimeString("ru-RU");
     for (const key of ["candidate","keyword","opened","suppressed","shadow"]) el(key + "-count").textContent = Number.isFinite(runtime[key + "_count"]) ? String(runtime[key + "_count"]) : "—";
     el("capabilities").className = ""; el("capabilities").replaceChildren();
@@ -409,7 +456,7 @@ function initAcousticLab() {
     if (!data || data.status !== "ok" || !Array.isArray(data.controls) || !data.defaults || !Number.isSafeInteger(data.revision)) throw new Error("GPT Mini вернула неподдерживаемый ответ лаборатории.");
     const wasDirty = dirty();
     const signature = JSON.stringify(data.controls);
-    if (schemaSignature && signature !== schemaSignature && wasDirty) throw new Error("Схема параметров изменилась. Сохраните профиль и обновите страницу.");
+    if (schemaSignature && signature !== signature && wasDirty) throw new Error("Схема параметров изменилась. Сохраните профиль и обновите страницу.");
     const needsBuild = signature !== schemaSignature;
     latest = data;
     online = true;
@@ -418,7 +465,8 @@ function initAcousticLab() {
     else refreshFieldMeta();
     runtimeView(data);
     setBadge("connection-badge", "На связи", "good");
-    el("compact-state").textContent = "На связи · r" + data.revision;
+    const appRev = data.applied_revision ?? data.revision;
+    el("compact-state").textContent = "На связи · r" + appRev;
     if (data.error) { lastError = String(data.error); message(lastError, "bad"); }
     else if (lastError) { lastError = ""; message(""); }
     updateActions();
@@ -458,12 +506,24 @@ function initAcousticLab() {
     catch (error) { message(error.message, "bad"); return; }
     busy = true; updateActions(); message("");
     try {
-      const response = await request("/api/v1/acoustics", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({expected_revision:baseRevision, settings})});
+      const body = {
+        expected_revision: baseRevision,
+        expected_instance_id: latest?.runtime_instance_id || undefined,
+        settings
+      };
+      const response = await request("/api/v1/acoustics", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": `"${baseRevision}"`
+        },
+        body: JSON.stringify(body)
+      });
       acceptSnapshot(response);
       if (response.pending || !settingsEqual(response.applied, settings) || !settingsEqual(response.saved, settings) || response.error) throw new Error("Применение или сохранение ещё не подтверждено. Проверьте работающие значения.");
       busy = false;
-      fillForm(response.applied, response.revision);
-      message("Профиль сохранён и применён на GPT Mini. Ревизия " + response.revision + ".", "good");
+      fillForm(response.applied, response.applied_revision ?? response.revision);
+      message("Профиль сохранён и применён на GPT Mini. Ревизия " + (response.applied_revision ?? response.revision) + ".", "good");
     } catch (error) {
       message(error.message, "bad");
     } finally { busy = false; updateActions(); }
@@ -494,7 +554,15 @@ function initAcousticLab() {
     finally { event.target.value = ""; }
   });
   el("defaults-btn").addEventListener("click", () => { fillForm(latest.defaults, baseRevision, false); message("В форме установлены значения по умолчанию. Они ещё не применены."); });
-  el("revert-btn").addEventListener("click", () => { fillForm(latest.applied, latest.revision); message("В форму возвращены работающие значения. На устройстве ничего не изменено.", "good"); });
+  el("revert-btn").addEventListener("click", () => {
+    fillForm(latest.applied, latest.applied_revision ?? latest.revision);
+    baseInstanceId = latest.runtime_instance_id || null;
+    if (latest.saved && !settingsEqual(latest.saved, latest.applied)) {
+      message("В форму возвращён работающий профиль. Нажмите «Применить», чтобы синхронизировать сохранённую конфигурацию.", "good");
+    } else {
+      message("В форму возвращены работающие значения. На устройстве ничего не изменено.", "good");
+    }
+  });
   el("print-btn").addEventListener("click", () => window.print());
   document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
   window.addEventListener("beforeunload", event => { if (dirty() || busy) { event.preventDefault(); event.returnValue = ""; } });

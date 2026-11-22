@@ -29,10 +29,12 @@ pub struct RuntimeMetrics {
     pub mode: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
+    pub runtime_instance_id: String,
     pub revision: u64,
     pub applied_revision: Option<u64>,
+    pub saved_revision: u64,
     pub applied: Option<WakewordCalibrationConfig>,
     pub saved: WakewordCalibrationConfig,
     pub pending: bool,
@@ -47,11 +49,145 @@ pub struct ApplyRequest {
     reply: oneshot::Sender<()>,
 }
 
-#[derive(Deserialize)]
+/// Strict network DTO for the acoustic profile API.
+/// Missing fields are NOT defaulted (preventing silent profile resets).
+/// Unknown fields are rejected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcousticSettingsDto {
+    pub enabled: bool,
+    pub shadow_mode: bool,
+    pub threshold: f32,
+    pub avg_threshold: f32,
+    pub min_scores: usize,
+    pub eager: bool,
+    pub score_mode: String,
+    pub score_ref: f32,
+    pub dtw_band_size: u16,
+    pub gain_normalizer: bool,
+    pub gain_min: f32,
+    pub gain_max: f32,
+    pub gain_ref: Option<f32>,
+    pub band_pass: bool,
+    pub band_low_hz: f32,
+    pub band_high_hz: f32,
+    pub mic_gain: f32,
+    pub vad_threshold: f32,
+    pub vad_noise_adaptation: bool,
+    pub vad_noise_multiplier: f32,
+    pub vad_noise_offset: f32,
+    pub vad_rise_alpha: f32,
+    pub vad_fall_alpha: f32,
+    pub vad_onset_frames: usize,
+    pub pre_roll_ms: u32,
+    pub initial_silence_timeout_ms: u32,
+    pub silence_timeout_ms: u32,
+    pub max_utterance_secs: u64,
+    pub manual_activation_secs: u64,
+    pub followup_timeout_secs: u64,
+    pub echo_tail_ms: u64,
+    pub startup_suppression_ms: u32,
+    pub wake_chime: bool,
+}
+
+impl AcousticSettingsDto {
+    pub fn validate(&self) -> Result<()> {
+        let config: WakewordCalibrationConfig = self.clone().into();
+        config.validate()
+    }
+}
+
+impl From<WakewordCalibrationConfig> for AcousticSettingsDto {
+    fn from(c: WakewordCalibrationConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            shadow_mode: c.shadow_mode,
+            threshold: c.threshold,
+            avg_threshold: c.avg_threshold,
+            min_scores: c.min_scores,
+            eager: c.eager,
+            score_mode: c.score_mode,
+            score_ref: c.score_ref,
+            dtw_band_size: c.dtw_band_size,
+            gain_normalizer: c.gain_normalizer,
+            gain_min: c.gain_min,
+            gain_max: c.gain_max,
+            gain_ref: c.gain_ref,
+            band_pass: c.band_pass,
+            band_low_hz: c.band_low_hz,
+            band_high_hz: c.band_high_hz,
+            mic_gain: c.mic_gain,
+            vad_threshold: c.vad_threshold,
+            vad_noise_adaptation: c.vad_noise_adaptation,
+            vad_noise_multiplier: c.vad_noise_multiplier,
+            vad_noise_offset: c.vad_noise_offset,
+            vad_rise_alpha: c.vad_rise_alpha,
+            vad_fall_alpha: c.vad_fall_alpha,
+            vad_onset_frames: c.vad_onset_frames,
+            pre_roll_ms: c.pre_roll_ms,
+            initial_silence_timeout_ms: c.initial_silence_timeout_ms,
+            silence_timeout_ms: c.silence_timeout_ms,
+            max_utterance_secs: c.max_utterance_secs,
+            manual_activation_secs: c.manual_activation_secs,
+            followup_timeout_secs: c.followup_timeout_secs,
+            echo_tail_ms: c.echo_tail_ms,
+            startup_suppression_ms: c.startup_suppression_ms,
+            wake_chime: c.wake_chime,
+        }
+    }
+}
+
+impl From<AcousticSettingsDto> for WakewordCalibrationConfig {
+    fn from(d: AcousticSettingsDto) -> Self {
+        let normalized_score_mode = match d.score_mode.trim().to_ascii_lowercase().as_str() {
+            "average" => "avg".to_string(),
+            other => other.to_string(),
+        };
+        Self {
+            threshold: d.threshold,
+            avg_threshold: d.avg_threshold,
+            min_scores: d.min_scores,
+            score_mode: normalized_score_mode,
+            eager: d.eager,
+            vad_threshold: d.vad_threshold,
+            gain_normalizer: d.gain_normalizer,
+            band_pass: d.band_pass,
+            enabled: d.enabled,
+            shadow_mode: d.shadow_mode,
+            mic_gain: d.mic_gain,
+            pre_roll_ms: d.pre_roll_ms,
+            silence_timeout_ms: d.silence_timeout_ms,
+            initial_silence_timeout_ms: d.initial_silence_timeout_ms,
+            max_utterance_secs: d.max_utterance_secs,
+            echo_tail_ms: d.echo_tail_ms,
+            startup_suppression_ms: d.startup_suppression_ms,
+            manual_activation_secs: d.manual_activation_secs,
+            wake_chime: d.wake_chime,
+            followup_timeout_secs: d.followup_timeout_secs,
+            vad_noise_adaptation: d.vad_noise_adaptation,
+            vad_noise_multiplier: d.vad_noise_multiplier,
+            vad_noise_offset: d.vad_noise_offset,
+            vad_rise_alpha: d.vad_rise_alpha,
+            vad_fall_alpha: d.vad_fall_alpha,
+            vad_onset_frames: d.vad_onset_frames,
+            gain_min: d.gain_min,
+            gain_max: d.gain_max,
+            gain_ref: d.gain_ref,
+            band_low_hz: d.band_low_hz,
+            band_high_hz: d.band_high_hz,
+            score_ref: d.score_ref,
+            dtw_band_size: d.dtw_band_size,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyPayload {
     pub expected_revision: u64,
-    pub settings: WakewordCalibrationConfig,
+    #[serde(default)]
+    pub expected_instance_id: Option<String>,
+    pub settings: AcousticSettingsDto,
 }
 
 pub struct AcousticLab {
@@ -63,11 +199,14 @@ pub struct AcousticLab {
 impl AcousticLab {
     pub fn new(initial: WakewordCalibrationConfig) -> (Arc<Self>, mpsc::Receiver<ApplyRequest>) {
         let (tx, rx) = mpsc::channel(1);
+        let runtime_instance_id = uuid::Uuid::new_v4().to_string();
         (
             Arc::new(Self {
                 state: Mutex::new(Snapshot {
+                    runtime_instance_id,
                     revision: 0,
                     applied_revision: None,
+                    saved_revision: 0,
                     applied: None,
                     saved: initial,
                     pending: false,
@@ -89,6 +228,7 @@ impl AcousticLab {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.applied = Some(settings);
         s.applied_revision = Some(s.revision);
+        s.saved_revision = s.revision;
         s.runtime = metrics;
         s.runtime.ready = true;
     }
@@ -104,6 +244,7 @@ impl AcousticLab {
             if error.is_none() {
                 s.applied = Some(request.settings);
                 s.applied_revision = Some(request.revision);
+                s.saved_revision = request.revision;
             }
             s.pending = false;
             s.error = error;
@@ -125,11 +266,18 @@ impl AcousticLab {
         deadline: Duration,
     ) -> Result<Snapshot> {
         payload.settings.validate()?;
+        let target_config: WakewordCalibrationConfig = payload.settings.into();
         let _guard = self
             .writer
             .try_lock()
             .context("Another acoustic update is in progress")?;
         let old = self.snapshot();
+        if let Some(ref inst) = payload.expected_instance_id {
+            ensure!(
+                inst == &old.runtime_instance_id,
+                "Instance ID mismatch; GPT Mini was restarted. Reload status before updating."
+            );
+        }
         ensure!(
             old.revision == payload.expected_revision,
             "Stale acoustic revision; reload settings"
@@ -151,18 +299,18 @@ impl AcousticLab {
             .tx
             .try_reserve()
             .context("Audio settings queue is unavailable")?;
-        save_settings(path, &payload.settings)?;
+        save_settings(path, &target_config)?;
         let (reply, ack) = oneshot::channel();
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.revision = revision;
-            s.saved = payload.settings.clone();
+            s.saved = target_config.clone();
             s.pending = true;
             s.error = None;
         }
         permit.send(ApplyRequest {
             revision,
-            settings: payload.settings,
+            settings: target_config,
             reply,
         });
         match tokio::time::timeout(deadline, ack).await {
@@ -174,10 +322,46 @@ impl AcousticLab {
                 );
                 Ok(s)
             }
-            _ => anyhow::bail!(
-                "Profile saved; audio confirmation pending. Reload status before another update"
-            ),
+            Ok(Err(_closed)) => {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.pending = false;
+                s.error = Some("Audio loop closed ACK channel without confirming".to_string());
+                anyhow::bail!("Audio loop closed ACK channel without confirming");
+            }
+            Err(_timeout) => {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.error = Some("Audio confirmation timed out awaiting audio loop".to_string());
+                anyhow::bail!(
+                    "Profile saved; audio confirmation pending. Reload status before another update"
+                );
+            }
         }
+    }
+
+    /// Revert saved on disk and pending errors back to the currently applied working settings.
+    pub async fn restore_working(&self, path: &Path) -> Result<Snapshot> {
+        let _guard = self
+            .writer
+            .try_lock()
+            .context("Another acoustic update is in progress")?;
+        let current = self.snapshot();
+        let applied = current
+            .applied
+            .as_ref()
+            .context("No working profile currently applied to restore")?;
+        save_settings(path, applied)?;
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.saved = applied.clone();
+        s.saved_revision = s.applied_revision.unwrap_or(s.revision);
+        s.pending = false;
+        s.error = None;
+        Ok(s.clone())
+    }
+
+    /// Clear stale pending flag if an operation failed or timed out.
+    pub fn reset_pending(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.pending = false;
     }
 
     pub fn response(&self) -> Value {
@@ -303,21 +487,22 @@ pub fn apply_gain(pcm: &mut [u8], gain: f32) {
 
 pub fn controls() -> Value {
     let mut out = Vec::new();
-    macro_rules! n {($key:literal,$label:literal,$help:literal,$group:literal,$min:expr,$max:expr,$step:expr,$unit:literal)=>{
-        out.push(json!({"key":$key,"label":$label,"help":$help,"group":$group,"kind":"number","min":$min,"max":$max,"step":$step,"unit":$unit}));
+    macro_rules! n {($key:literal,$label:literal,$help:literal,$group:literal,$min:expr,$max:expr,$step:expr,$unit:literal,$timing:literal)=>{
+        out.push(json!({"key":$key,"label":$label,"help":$help,"group":$group,"kind":"number","min":$min,"max":$max,"step":$step,"unit":$unit,"apply_timing":$timing}));
     };}
-    macro_rules! b {($key:literal,$label:literal,$help:literal,$group:literal)=>{
-        out.push(json!({"key":$key,"label":$label,"help":$help,"group":$group,"kind":"boolean"}));
+    macro_rules! b {($key:literal,$label:literal,$help:literal,$group:literal,$timing:literal)=>{
+        out.push(json!({"key":$key,"label":$label,"help":$help,"group":$group,"kind":"boolean","apply_timing":$timing}));
     };}
     b!(
         "enabled",
         "Распознавание слова включено",
         "Выключение блокирует акустические вызовы. Не заменяет физическую кнопку mute.",
-        "Режим работы"
+        "Режим работы",
+        "live"
     );
-    b!("shadow_mode","Бесшумная лабораторная проверка","Детектор считает события; новые обращения не отправляются в облако и не запускают звук или команды.","Режим работы");
-    n!("threshold","Основной порог","Условный DTW-балл, не вероятность. Выше — строже; качество проверяется на обращениях и фоне.","Слово вызова",0.0,0.7311,0.001,"балл");
-    n!("avg_threshold","Порог усреднённой модели","Отдельное сравнение с усреднёнными MFCC-признаками. Ноль отключает предварительный фильтр.","Слово вызова",0.0,0.7311,0.001,"балл");
+    b!("shadow_mode","Бесшумная лабораторная проверка","Детектор считает события; новые обращения не отправляются в облако и не запускают звук или команды.","Режим работы","live");
+    n!("threshold","Основной порог","Условный DTW-балл, не вероятность. Выше — строже; качество проверяется на обращениях и фоне.","Слово вызова",0.0,0.7311,0.001,"балл","live");
+    n!("avg_threshold","Порог усреднённой модели","Отдельное сравнение с усреднёнными MFCC-признаками. Ноль отключает предварительный фильтр.","Слово вызова",0.0,0.7311,0.001,"балл","live");
     n!(
         "min_scores",
         "Подтверждения совпадения",
@@ -326,16 +511,18 @@ pub fn controls() -> Value {
         1,
         100,
         1,
-        "совпадений"
+        "совпадений",
+        "live"
     );
     b!(
         "eager",
         "Раннее срабатывание",
         "Выдать событие после достижения числа подтверждений, не ждать завершения countdown.",
-        "Слово вызова"
+        "Слово вызова",
+        "live"
     );
-    out.push(json!({"key":"score_mode","label":"Объединение эталонов","help":"Max принимает лучший эталон; среднее требует согласия нескольких. Это не выбор качества модели.","group":"Слово вызова","kind":"select","options":[{"value":"max","label":"Лучший (Max)"},{"value":"avg","label":"Среднее (Average)"},{"value":"median","label":"Медиана"},{"value":"p25","label":"P25"},{"value":"p75","label":"P75"},{"value":"p80","label":"P80"},{"value":"p90","label":"P90"},{"value":"p95","label":"P95"}]}));
-    n!("score_ref","Масштаб DTW-балла","Меняет преобразование расстояния в балл; после изменения старые пороги нельзя сравнивать напрямую.","Слово вызова",0.01,2.0,0.01,"");
+    out.push(json!({"key":"score_mode","label":"Объединение эталонов","help":"Max принимает лучший эталон; среднее требует согласия нескольких. Это не выбор качества модели.","group":"Слово вызова","kind":"select","apply_timing":"live","options":[{"value":"max","label":"Лучший (Max)"},{"value":"avg","label":"Среднее (Average)"},{"value":"median","label":"Медиана"},{"value":"p25","label":"P25"},{"value":"p75","label":"P75"},{"value":"p80","label":"P80"},{"value":"p90","label":"P90"},{"value":"p95","label":"P95"}]}));
+    n!("score_ref","Масштаб DTW-балла","Меняет преобразование расстояния в балл; после изменения старые пороги нельзя сравнивать напрямую.","Слово вызова",0.01,2.0,0.01,"","live");
     n!(
         "dtw_band_size",
         "Полоса выравнивания DTW",
@@ -344,13 +531,15 @@ pub fn controls() -> Value {
         1,
         32,
         1,
-        ""
+        "",
+        "live"
     );
     b!(
         "gain_normalizer",
         "Нормализация в KWS",
         "Выравнивание усиления внутри детектора. Не изменяет цифровое усиление облачной речи.",
-        "Фильтры детектора"
+        "Фильтры детектора",
+        "live"
     );
     n!(
         "gain_min",
@@ -360,7 +549,8 @@ pub fn controls() -> Value {
         0.1,
         20.0,
         0.1,
-        "×"
+        "×",
+        "live"
     );
     n!(
         "gain_max",
@@ -370,10 +560,11 @@ pub fn controls() -> Value {
         0.1,
         20.0,
         0.1,
-        "×"
+        "×",
+        "live"
     );
-    out.push(json!({"key":"gain_ref","label":"Опорный RMS нормализации","help":"Авто использует RMS эталона. Число задаёт опорный уровень вручную.","group":"Фильтры детектора","kind":"optional_number","min":0.00001,"max":1.0,"step":0.00001,"unit":"RMS 0…1"}));
-    b!("band_pass","Полосовой фильтр KWS","Подавляет частоты вне диапазона только для детектора. Не является полноценным шумоподавлением.","Фильтры детектора");
+    out.push(json!({"key":"gain_ref","label":"Опорный RMS нормализации","help":"Авто использует RMS эталона. Число задаёт опорный уровень вручную.","group":"Фильтры детектора","kind":"optional_number","min":0.00001,"max":1.0,"step":0.00001,"unit":"RMS 0…1","apply_timing":"live"}));
+    b!("band_pass","Полосовой фильтр KWS","Подавляет частоты вне диапазона только для детектора. Не является полноценным шумоподавлением.","Фильтры детектора","live");
     n!(
         "band_low_hz",
         "Нижняя частота",
@@ -382,7 +573,8 @@ pub fn controls() -> Value {
         20,
         7900,
         10,
-        "Гц"
+        "Гц",
+        "live"
     );
     n!(
         "band_high_hz",
@@ -392,7 +584,8 @@ pub fn controls() -> Value {
         20,
         7900,
         10,
-        "Гц"
+        "Гц",
+        "live"
     );
     n!(
         "mic_gain",
@@ -402,7 +595,8 @@ pub fn controls() -> Value {
         0.1,
         20.0,
         0.1,
-        "×"
+        "×",
+        "live"
     );
     n!(
         "vad_threshold",
@@ -412,13 +606,15 @@ pub fn controls() -> Value {
         1,
         1000,
         1,
-        "RMS"
+        "RMS",
+        "live"
     );
     b!(
         "vad_noise_adaptation",
         "Адаптация к фону",
         "Порог VAD учитывает оценённый шум помещения.",
-        "Речь и фон"
+        "Речь и фон",
+        "live"
     );
     n!(
         "vad_noise_multiplier",
@@ -428,7 +624,8 @@ pub fn controls() -> Value {
         1,
         10,
         0.05,
-        "×"
+        "×",
+        "live"
     );
     n!(
         "vad_noise_offset",
@@ -438,7 +635,8 @@ pub fn controls() -> Value {
         0,
         1000,
         1,
-        "RMS"
+        "RMS",
+        "live"
     );
     n!(
         "vad_rise_alpha",
@@ -448,7 +646,8 @@ pub fn controls() -> Value {
         0.001,
         1,
         0.001,
-        ""
+        "",
+        "live"
     );
     n!(
         "vad_fall_alpha",
@@ -458,7 +657,8 @@ pub fn controls() -> Value {
         0.001,
         1,
         0.001,
-        ""
+        "",
+        "live"
     );
     n!(
         "vad_onset_frames",
@@ -468,7 +668,8 @@ pub fn controls() -> Value {
         1,
         100,
         1,
-        "чанков"
+        "чанков",
+        "live"
     );
     n!(
         "pre_roll_ms",
@@ -478,7 +679,8 @@ pub fn controls() -> Value {
         0,
         2000,
         10,
-        "мс"
+        "мс",
+        "next_capture"
     );
     n!(
         "initial_silence_timeout_ms",
@@ -488,7 +690,8 @@ pub fn controls() -> Value {
         500,
         15000,
         100,
-        "мс"
+        "мс",
+        "next_capture"
     );
     n!(
         "silence_timeout_ms",
@@ -498,7 +701,8 @@ pub fn controls() -> Value {
         200,
         10000,
         100,
-        "мс"
+        "мс",
+        "next_capture"
     );
     n!(
         "max_utterance_secs",
@@ -508,7 +712,8 @@ pub fn controls() -> Value {
         3,
         60,
         1,
-        "с"
+        "с",
+        "next_capture"
     );
     n!(
         "manual_activation_secs",
@@ -518,9 +723,10 @@ pub fn controls() -> Value {
         1,
         30,
         1,
-        "с"
+        "с",
+        "next_capture"
     );
-    n!("followup_timeout_secs","Продолжение без имени","Ноль — строгий вызов по имени каждый раз. Окно продолжения принимает только речь, не тишину.","Время и границы",0,15,1,"с");
+    n!("followup_timeout_secs","Продолжение без имени","Ноль — строгий вызов по имени каждый раз. Окно продолжения принимает только речь, не тишину.","Время и границы",0,15,1,"с","next_capture");
     n!(
         "echo_tail_ms",
         "Защита после ответа",
@@ -529,14 +735,16 @@ pub fn controls() -> Value {
         0,
         5000,
         50,
-        "мс"
+        "мс",
+        "next_capture"
     );
-    n!("startup_suppression_ms","Прогрев микрофона","Отбросить стартовый PCM-переходный процесс. Меняется для следующего старта, не запускает прогрев заново.","Время и границы",0,10000,100,"мс");
+    n!("startup_suppression_ms","Прогрев микрофона","Отбросить стартовый PCM-переходный процесс. Меняется для следующего старта, не запускает прогрев заново.","Время и границы",0,10000,100,"мс","next_start");
     b!(
         "wake_chime",
         "Короткий сигнал вызова",
         "Озвучить распознанный вызов. В бесшумной проверке не звучит.",
-        "Обратная связь"
+        "Обратная связь",
+        "live"
     );
     json!(out)
 }
@@ -575,4 +783,202 @@ pub fn model_identity(path: &Path) -> (Option<String>, Option<String>) {
         .and_then(|s| rustpotter::WakewordRef::load_from_file(s).ok())
         .map(|m| m.name);
     (name, Some(hash))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempTestFile(std::path::PathBuf);
+
+    impl TempTestFile {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("test_acoustic_{}.toml", uuid::Uuid::new_v4()));
+            let _ = std::fs::write(&path, "[wakeword]\n");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_dto_roundtrip_all_33_fields() {
+        let original = WakewordCalibrationConfig::default();
+        let dto: AcousticSettingsDto = original.clone().into();
+        assert!(dto.validate().is_ok());
+
+        let json_str = serde_json::to_string(&dto).expect("serialize DTO");
+        let decoded: AcousticSettingsDto =
+            serde_json::from_str(&json_str).expect("deserialize DTO");
+        assert_eq!(dto, decoded);
+
+        let config: WakewordCalibrationConfig = decoded.into();
+        assert_eq!(original, config);
+    }
+
+    #[test]
+    fn test_partial_json_rejected_without_silent_defaults() {
+        // F2 regression: Partial JSON without all 33 fields must fail deserialization.
+        let partial_json = r#"{"expected_revision": 0, "settings": {"threshold": 0.45}}"#;
+        let result: Result<ApplyPayload, _> = serde_json::from_str(partial_json);
+        assert!(
+            result.is_err(),
+            "Partial profile payload must be rejected, not filled with silent defaults"
+        );
+    }
+
+    #[test]
+    fn test_unknown_fields_rejected() {
+        let dto: AcousticSettingsDto = WakewordCalibrationConfig::default().into();
+        let mut value = serde_json::to_value(&dto).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown_field".to_string(), json!(123));
+
+        let result: Result<AcousticSettingsDto, _> = serde_json::from_value(value);
+        assert!(result.is_err(), "Unknown fields must be rejected");
+    }
+
+    #[test]
+    fn test_nan_and_infinite_floats_rejected() {
+        let dto: AcousticSettingsDto = WakewordCalibrationConfig::default().into();
+        let mut value = serde_json::to_value(&dto).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("threshold".to_string(), json!(null));
+        assert!(serde_json::from_value::<AcousticSettingsDto>(value).is_err());
+    }
+
+    #[test]
+    fn test_score_mode_canonicalization() {
+        let mut dto: AcousticSettingsDto = WakewordCalibrationConfig::default().into();
+        dto.score_mode = "  Average  ".to_string();
+        assert!(dto.validate().is_ok());
+        let config: WakewordCalibrationConfig = dto.into();
+        assert_eq!(config.score_mode, "avg");
+    }
+
+    #[test]
+    fn test_controls_schema_has_all_33_fields_with_apply_timing() {
+        let controls_val = controls();
+        let arr = controls_val.as_array().expect("controls is array");
+        assert_eq!(arr.len(), 33, "Exactly 33 controls expected");
+        for c in arr {
+            let key = c["key"].as_str().expect("key is string");
+            let timing = c["apply_timing"].as_str().expect("apply_timing is string");
+            assert!(
+                matches!(timing, "live" | "next_capture" | "next_start"),
+                "Control {key} has valid apply_timing ({timing})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_instance_id_mismatch_rejected() {
+        let (lab, mut rx) = AcousticLab::new(WakewordCalibrationConfig::default());
+        let snap = lab.snapshot();
+        let metrics = RuntimeMetrics {
+            ready: true,
+            ..Default::default()
+        };
+        lab.ready(WakewordCalibrationConfig::default(), metrics);
+
+        let temp = TempTestFile::new();
+        save_settings(temp.path(), &WakewordCalibrationConfig::default()).unwrap();
+
+        // Spawn mock loop to handle ACK
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                let _ = req.reply.send(());
+            }
+        });
+
+        let payload = ApplyPayload {
+            expected_revision: snap.revision,
+            expected_instance_id: Some("different-instance-uuid".to_string()),
+            settings: WakewordCalibrationConfig::default().into(),
+        };
+
+        let err = lab
+            .apply(temp.path(), payload)
+            .await
+            .expect_err("mismatched instance must fail");
+        assert!(
+            err.to_string().contains("Instance ID mismatch"),
+            "Error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_closed_ack_channel_clears_pending_and_reports_error() {
+        let (lab, mut rx) = AcousticLab::new(WakewordCalibrationConfig::default());
+        let snap = lab.snapshot();
+        let metrics = RuntimeMetrics {
+            ready: true,
+            ..Default::default()
+        };
+        lab.ready(WakewordCalibrationConfig::default(), metrics);
+
+        let temp = TempTestFile::new();
+        save_settings(temp.path(), &WakewordCalibrationConfig::default()).unwrap();
+
+        // Audio loop receives request but immediately drops reply channel without sending ACK
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                drop(req.reply);
+            }
+        });
+
+        let payload = ApplyPayload {
+            expected_revision: snap.revision,
+            expected_instance_id: Some(snap.runtime_instance_id),
+            settings: WakewordCalibrationConfig::default().into(),
+        };
+
+        let err = lab
+            .apply(temp.path(), payload)
+            .await
+            .expect_err("dropped channel must fail");
+        assert!(err.to_string().contains("closed ACK channel"));
+
+        // Pending must NOT remain stuck
+        let after = lab.snapshot();
+        assert!(!after.pending, "pending must be cleared on closed channel");
+        assert!(after.error.is_some(), "error must be recorded");
+    }
+
+    #[tokio::test]
+    async fn test_save_settings_preserves_other_toml_sections() {
+        let temp = TempTestFile::new();
+        let initial_toml = r#"
+[assistant]
+voice = "Puck"
+wakeword_enabled = true
+
+[device]
+led_pattern = "pulse"
+"#;
+        std::fs::write(temp.path(), initial_toml).unwrap();
+
+        let cfg = WakewordCalibrationConfig::default();
+        save_settings(temp.path(), &cfg).unwrap();
+
+        let content = std::fs::read_to_string(temp.path()).unwrap();
+        assert!(content.contains("[assistant]"));
+        assert!(content.contains("voice = \"Puck\""));
+        assert!(content.contains("[device]"));
+        assert!(content.contains("led_pattern = \"pulse\""));
+        assert!(content.contains("[wakeword]"));
+    }
 }

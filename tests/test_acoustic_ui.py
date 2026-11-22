@@ -37,7 +37,26 @@ class Element {
   async fire(type, extra = {}) {
     if (this.handlers[type]) return this.handlers[type]({target:this, preventDefault() {}, ...extra});
   }
-  reportValidity() { return true; }
+  checkValidity() {
+    if (this.type === 'number' && this.value !== '') {
+      const num = Number(this.value);
+      if (this.min !== undefined && num < Number(this.min) - 1e-6) return false;
+      if (this.max !== undefined && num > Number(this.max) + 1e-6) return false;
+      if (this.step && this.step !== 'any') {
+        const step = Number(this.step);
+        const remainder = Math.abs((num - (Number(this.min) || 0)) % step);
+        const eps = 1e-6;
+        if (remainder > eps && Math.abs(remainder - step) > eps) return false;
+      }
+    }
+    return true;
+  }
+  reportValidity() {
+    for (const node of nodes.values()) {
+      if (!node.checkValidity()) return false;
+    }
+    return true;
+  }
   click() { return this.fire('click'); }
   remove() {}
 }
@@ -93,6 +112,10 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     assert.equal(evaluate('validateProfile({schema:1,settings:fixture.applied},fixture.controls,fixture.defaults).gain_ref'), null);
     assert.equal(evaluate('settingsEqual({a:0.28},{a:0.2800000011920929})'), true, 'f32 float representation differences must compare equal');
     assert.equal(evaluate('valuesEqual(0.32, 0.3199999928474426)'), true, 'f32 float values must compare equal');
+    assert.equal(evaluate('valuesEqual(0.2, 0.20005, 1e-6)'), false, 'gain_ref step must not be swallowed');
+    assert.equal(evaluate('settingsEqual({gain_ref:0.2},{gain_ref:0.20005})'), false, 'gain_ref settings diff must be detected');
+    assert.equal(evaluate('validateSettings({threshold:0.7311000227928162, enabled:true, score_mode:"average", gain_ref:null}, fixture.controls, fixture.defaults).score_mode'), 'avg');
+    assert.equal(evaluate('validateSettings({threshold:0.7311000227928162, enabled:true, score_mode:"average", gain_ref:null}, fixture.controls, fixture.defaults).threshold'), 0.731);
     const invalid = [
       '{schema:2,settings:fixture.applied}',
       '{schema:1,settings:{...fixture.applied,threshold:0.9}}',
