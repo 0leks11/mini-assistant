@@ -52,6 +52,44 @@ pub struct AssistantConfig {
     /// Languages to understand: ["ru-RU", "en-US"]
     #[allow(dead_code)]
     pub languages: Vec<String>,
+    /// Peak similarity threshold for wake-word match (default: 0.38)
+    #[serde(default = "default_wakeword_threshold")]
+    pub wakeword_threshold: f32,
+    /// Average window threshold for wake-word match (default: 0.19)
+    #[serde(default = "default_wakeword_avg_threshold")]
+    pub wakeword_avg_threshold: f32,
+    /// Minimum consecutive positive scores (default: 4)
+    #[serde(default = "default_wakeword_min_scores")]
+    pub wakeword_min_scores: usize,
+    /// Eager mode: trigger immediately without waiting for silence countdown (default: true)
+    #[serde(default = "default_true")]
+    pub wakeword_eager: bool,
+    /// Wake-word scoring mode: "max" or "avg" (default: "max")
+    #[serde(default = "default_wakeword_score_mode")]
+    pub wakeword_score_mode: String,
+    /// Voice activity detection threshold / ambient noise gate (default: 45.0)
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+}
+
+fn default_wakeword_threshold() -> f32 {
+    0.38
+}
+
+fn default_wakeword_avg_threshold() -> f32 {
+    0.19
+}
+
+fn default_wakeword_min_scores() -> usize {
+    4
+}
+
+fn default_wakeword_score_mode() -> String {
+    "max".to_string()
+}
+
+fn default_vad_threshold() -> f32 {
+    45.0
 }
 
 fn default_led_color() -> String {

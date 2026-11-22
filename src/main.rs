@@ -1089,7 +1089,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or(45.0)
+                .unwrap_or(config.assistant.vad_threshold)
                 .clamp(20.0, 100.0);
             let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
                 .ok()
@@ -1112,12 +1112,12 @@ async fn main() -> Result<()> {
             let model_path = std::env::var_os("MINI_WAKEWORD_MODEL")
                 .map(std::path::PathBuf::from)
                 .or(config.assistant.wakeword_model.clone())
-                .unwrap_or_else(|| "/bkupgrade/data/opt/mini-assistant/keyword.rpw".into());
+                .unwrap_or_else(|| "/data/opt/mini-assistant/keyword.rpw".into());
             let activation: Box<dyn wakeword::WakeWordEngine> = if !wakeword_enabled {
                 info!("Acoustic wake-word is explicitly DISABLED (wakeword_enabled = false); speaker is deaf to all acoustic triggers");
                 Box::new(wakeword::keyword::DisabledKeyword)
             } else {
-                match wakeword::keyword::KeywordEngine::load(&model_path) {
+                match wakeword::keyword::KeywordEngine::load_with_config(&model_path, Some(&config.assistant)) {
                     Ok(engine) => {
                         info!("Local personal keyword detector loaded");
                         Box::new(engine)
@@ -1209,7 +1209,9 @@ async fn main() -> Result<()> {
                 let mut diagnostic_peak = 0.0_f64;
                 while let Some(chunk) = rx_raw_mic.recv().await {
                     if let Ok(new_path) = rx_reload_wakeword.try_recv() {
-                        match wakeword::keyword::KeywordEngine::load(&new_path) {
+                        let reloaded_cfg = crate::config::Config::load().ok();
+                        let asst_cfg = reloaded_cfg.as_ref().map(|c| &c.assistant);
+                        match wakeword::keyword::KeywordEngine::load_with_config(&new_path, asst_cfg) {
                             Ok(engine) => {
                                 info!(
                                     path = ?new_path,

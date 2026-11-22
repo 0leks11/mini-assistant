@@ -27,17 +27,19 @@ pub struct PersonalDetectorConfig {
     pub score_mode: ScoreMode,
     pub gain_normalizer_enabled: bool,
     pub band_pass_enabled: bool,
+    pub eager: bool,
 }
 
 impl Default for PersonalDetectorConfig {
     fn default() -> Self {
         Self {
-            threshold: 0.48,
-            avg_threshold: 0.25,
-            min_scores: 2,
+            threshold: 0.38,
+            avg_threshold: 0.19,
+            min_scores: 4,
             score_mode: ScoreMode::Max,
             gain_normalizer_enabled: true,
             band_pass_enabled: false,
+            eager: true,
         }
     }
 }
@@ -58,6 +60,7 @@ pub fn personal_reference_detector_with_config(
     config.detector.avg_threshold = detector_cfg.avg_threshold;
     config.detector.min_scores = detector_cfg.min_scores;
     config.detector.score_mode = detector_cfg.score_mode;
+    config.detector.eager = detector_cfg.eager;
     config.filters.gain_normalizer.enabled = detector_cfg.gain_normalizer_enabled;
     config.filters.band_pass.enabled = detector_cfg.band_pass_enabled;
     let mut detector = Rustpotter::new(&config)?;

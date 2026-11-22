@@ -15,32 +15,53 @@ pub struct KeywordEngine {
 
 impl KeywordEngine {
     pub fn load(path: &Path) -> Result<Self> {
+        let app_config = crate::config::Config::load().ok();
+        Self::load_with_config(path, app_config.as_ref().map(|c| &c.assistant))
+    }
+
+    pub fn load_with_config(
+        path: &Path,
+        assistant_cfg: Option<&crate::config::AssistantConfig>,
+    ) -> Result<Self> {
         let reference =
             WakewordRef::load_from_file(path.to_str().context("Invalid keyword reference path")?)
                 .map_err(anyhow::Error::msg)?;
+
+        let cfg_threshold = assistant_cfg.map(|c| c.wakeword_threshold).unwrap_or(0.38);
+        let cfg_avg_threshold = assistant_cfg.map(|c| c.wakeword_avg_threshold).unwrap_or(0.19);
+        let cfg_min_scores = assistant_cfg.map(|c| c.wakeword_min_scores).unwrap_or(4);
+        let cfg_eager = assistant_cfg.map(|c| c.wakeword_eager).unwrap_or(true);
+        let cfg_score_mode = assistant_cfg
+            .and_then(|c| parse_score_mode(&c.wakeword_score_mode))
+            .unwrap_or(ScoreMode::Max);
 
         let threshold = std::env::var("MINI_WAKEWORD_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(0.38);
+            .unwrap_or(cfg_threshold);
 
         let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.19);
+            .unwrap_or(cfg_avg_threshold);
 
         let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| (1..=20).contains(v))
-            .unwrap_or(4);
+            .unwrap_or(cfg_min_scores);
+
+        let eager = std::env::var("MINI_WAKEWORD_EAGER")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(cfg_eager);
 
         let score_mode = std::env::var("MINI_WAKEWORD_SCORE_MODE")
             .ok()
             .and_then(|v| parse_score_mode(&v))
-            .unwrap_or(ScoreMode::Max);
+            .unwrap_or(cfg_score_mode);
 
         let detector_cfg = PersonalDetectorConfig {
             threshold,
@@ -49,12 +70,14 @@ impl KeywordEngine {
             score_mode,
             gain_normalizer_enabled: true,
             band_pass_enabled: false,
+            eager,
         };
 
         info!(
             threshold,
             avg_threshold,
             min_scores,
+            eager,
             ?score_mode,
             "Loaded personal wake-word detector with calibrated parameters"
         );

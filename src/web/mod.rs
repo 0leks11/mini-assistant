@@ -1529,15 +1529,46 @@ pub fn update_config_led_color(config_path: &Path, new_color: &str) -> Result<()
     Ok(())
 }
 
-pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> {
+#[derive(Debug, Clone, Default)]
+pub struct WakewordConfigSettings<'a> {
+    pub name: Option<&'a str>,
+    pub model_path: Option<&'a str>,
+    pub threshold: Option<f32>,
+    pub avg_threshold: Option<f32>,
+    pub min_scores: Option<usize>,
+    pub eager: Option<bool>,
+    pub score_mode: Option<&'a str>,
+    pub vad_threshold: Option<f32>,
+}
+
+fn matches_toml_key(line: &str, key: &str) -> bool {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix(key) {
+        let after = rest.trim_start();
+        after.starts_with('=')
+    } else {
+        false
+    }
+}
+
+pub fn update_config_wakeword_settings(
+    config_path: &Path,
+    settings: &WakewordConfigSettings,
+) -> Result<()> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
     let mut updated = Vec::new();
     let mut in_assistant_section = false;
-    let mut replaced_name = false;
-    let mut replaced_wake_words = false;
 
-    let clean_name = new_name.trim();
+    let mut seen_name = false;
+    let mut seen_wake_words = false;
+    let mut seen_model = false;
+    let mut seen_threshold = false;
+    let mut seen_avg_threshold = false;
+    let mut seen_min_scores = false;
+    let mut seen_eager = false;
+    let mut seen_score_mode = false;
+    let mut seen_vad_threshold = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1548,40 +1579,124 @@ pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> 
         }
 
         if in_assistant_section {
-            if trimmed.starts_with("name") && trimmed.contains('=') && !replaced_name {
-                let indent = line
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .collect::<String>();
-                updated.push(format!("{}name = \"{}\"", indent, clean_name));
-                replaced_name = true;
-                continue;
-            }
-            if trimmed.starts_with("wake_words") && trimmed.contains('=') && !replaced_wake_words {
-                let indent = line
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .collect::<String>();
-                updated.push(format!("{}wake_words = [\"{}\"]", indent, clean_name.to_lowercase()));
-                replaced_wake_words = true;
-                continue;
+            let indent = line
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>();
+
+            if matches_toml_key(trimmed, "name") {
+                seen_name = true;
+                if let Some(new_name) = settings.name {
+                    updated.push(format!("{}name = \"{}\"", indent, new_name.trim()));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wake_words") {
+                seen_wake_words = true;
+                if let Some(new_name) = settings.name {
+                    updated.push(format!(
+                        "{}wake_words = [\"{}\"]",
+                        indent,
+                        new_name.trim().to_lowercase()
+                    ));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wakeword_model") {
+                seen_model = true;
+                if let Some(model_path) = settings.model_path {
+                    updated.push(format!("{}wakeword_model = \"{}\"", indent, model_path.trim()));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wakeword_threshold") {
+                seen_threshold = true;
+                if let Some(val) = settings.threshold {
+                    updated.push(format!("{}wakeword_threshold = {:.2}", indent, val));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wakeword_avg_threshold") {
+                seen_avg_threshold = true;
+                if let Some(val) = settings.avg_threshold {
+                    updated.push(format!("{}wakeword_avg_threshold = {:.2}", indent, val));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wakeword_min_scores") {
+                seen_min_scores = true;
+                if let Some(val) = settings.min_scores {
+                    updated.push(format!("{}wakeword_min_scores = {}", indent, val));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wakeword_eager") {
+                seen_eager = true;
+                if let Some(val) = settings.eager {
+                    updated.push(format!("{}wakeword_eager = {}", indent, val));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "wakeword_score_mode") {
+                seen_score_mode = true;
+                if let Some(val) = settings.score_mode {
+                    updated.push(format!("{}wakeword_score_mode = \"{}\"", indent, val.trim()));
+                    continue;
+                }
+            } else if matches_toml_key(trimmed, "vad_threshold") {
+                seen_vad_threshold = true;
+                if let Some(val) = settings.vad_threshold {
+                    updated.push(format!("{}vad_threshold = {:.1}", indent, val));
+                    continue;
+                }
             }
         }
 
         updated.push(line.to_string());
     }
 
-    if !replaced_name || !replaced_wake_words {
+    let mut missing_lines = Vec::new();
+
+    if !seen_name {
+        let name = settings.name.unwrap_or("Мини");
+        missing_lines.push(format!("name = \"{}\"", name.trim()));
+    }
+    if !seen_wake_words {
+        let name = settings.name.unwrap_or("мини");
+        missing_lines.push(format!("wake_words = [\"{}\"]", name.trim().to_lowercase()));
+    }
+    if !seen_model {
+        let path = settings
+            .model_path
+            .unwrap_or("/data/opt/mini-assistant/keyword.rpw");
+        missing_lines.push(format!("wakeword_model = \"{}\"", path));
+    }
+    if !seen_threshold {
+        let val = settings.threshold.unwrap_or(0.38);
+        missing_lines.push(format!("wakeword_threshold = {:.2}", val));
+    }
+    if !seen_avg_threshold {
+        let val = settings.avg_threshold.unwrap_or(0.19);
+        missing_lines.push(format!("wakeword_avg_threshold = {:.2}", val));
+    }
+    if !seen_min_scores {
+        let val = settings.min_scores.unwrap_or(4);
+        missing_lines.push(format!("wakeword_min_scores = {}", val));
+    }
+    if !seen_eager {
+        let val = settings.eager.unwrap_or(true);
+        missing_lines.push(format!("wakeword_eager = {}", val));
+    }
+    if !seen_score_mode {
+        let val = settings.score_mode.unwrap_or("max");
+        missing_lines.push(format!("wakeword_score_mode = \"{}\"", val));
+    }
+    if !seen_vad_threshold {
+        let val = settings.vad_threshold.unwrap_or(45.0);
+        missing_lines.push(format!("vad_threshold = {:.1}", val));
+    }
+
+    if !missing_lines.is_empty() {
         let mut final_lines = Vec::new();
         for line in updated.drain(..) {
             let is_assistant = line.trim() == "[assistant]";
             final_lines.push(line);
             if is_assistant {
-                if !replaced_name {
-                    final_lines.push(format!("name = \"{}\"", clean_name));
-                }
-                if !replaced_wake_words {
-                    final_lines.push(format!("wake_words = [\"{}\"]", clean_name.to_lowercase()));
+                for missing in &missing_lines {
+                    final_lines.push(missing.clone());
                 }
             }
         }
@@ -1590,6 +1705,38 @@ pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> 
 
     std::fs::write(config_path, updated.join("\n") + "\n")?;
     Ok(())
+}
+
+pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> {
+    update_config_wakeword_settings(
+        config_path,
+        &WakewordConfigSettings {
+            name: Some(new_name),
+            model_path: Some("/data/opt/mini-assistant/keyword.rpw"),
+            ..Default::default()
+        },
+    )
+}
+
+pub fn update_config_wakeword_calibration(
+    config_path: &Path,
+    threshold: f32,
+    avg_threshold: f32,
+    min_scores: usize,
+    eager: bool,
+    vad_threshold: f32,
+) -> Result<()> {
+    update_config_wakeword_settings(
+        config_path,
+        &WakewordConfigSettings {
+            threshold: Some(threshold),
+            avg_threshold: Some(avg_threshold),
+            min_scores: Some(min_scores),
+            eager: Some(eager),
+            vad_threshold: Some(vad_threshold),
+            ..Default::default()
+        },
+    )
 }
 
 pub struct SystemMetrics {
@@ -1825,7 +1972,43 @@ capture_device = "hw:0,2"
         let updated = std::fs::read_to_string(&cfg_file).unwrap();
         assert!(updated.contains("name = \"Джарвис\""));
         assert!(updated.contains("wake_words = [\"джарвис\"]"));
+        assert!(updated.contains("wakeword_model = \"/data/opt/mini-assistant/keyword.rpw\""));
+        assert!(updated.contains("wakeword_threshold = 0.38"));
+        assert!(updated.contains("wakeword_avg_threshold = 0.19"));
+        assert!(updated.contains("wakeword_min_scores = 4"));
+        assert!(updated.contains("wakeword_eager = true"));
+        assert!(updated.contains("vad_threshold = 45.0"));
         assert!(updated.contains("capture_device = \"hw:0,2\""));
+
+        std::fs::remove_file(&cfg_file).unwrap();
+    }
+
+    #[test]
+    fn test_update_config_wakeword_calibration() {
+        let temp_dir = std::env::temp_dir();
+        let cfg_file = temp_dir.join(format!("test_config_cal_{}.toml", uuid::Uuid::new_v4()));
+        let initial_toml = r#"
+[assistant]
+name = "Джарвис"
+wake_words = ["джарвис"]
+wakeword_threshold = 0.38
+wakeword_avg_threshold = 0.19
+wakeword_min_scores = 4
+wakeword_eager = true
+vad_threshold = 45.0
+
+[audio]
+capture_device = "hw:0,2"
+"#;
+        std::fs::write(&cfg_file, initial_toml).unwrap();
+
+        update_config_wakeword_calibration(&cfg_file, 0.42, 0.22, 5, false, 50.0).unwrap();
+        let updated = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(updated.contains("wakeword_threshold = 0.42"));
+        assert!(updated.contains("wakeword_avg_threshold = 0.22"));
+        assert!(updated.contains("wakeword_min_scores = 5"));
+        assert!(updated.contains("wakeword_eager = false"));
+        assert!(updated.contains("vad_threshold = 50.0"));
 
         std::fs::remove_file(&cfg_file).unwrap();
     }
