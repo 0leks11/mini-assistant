@@ -13,9 +13,12 @@ use crate::spotify::crypto::pkce_code_challenge;
 use crate::spotify::web_api::SpotifyApiClient;
 use crate::spotify::{MusicDucker, PlaybackState, SoloistClient};
 use crate::wakeword::enrollment::{decode_wav_pcm16, EnrollmentSession, HardwareRecorder};
+pub mod auth;
+use auth::{AuthManager, CalibrationLease, RequestIdentity, Scope};
+
 use anyhow::{Context, Result};
 use rustpotter::{WakewordLoad, WakewordRef, WakewordSave};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +56,7 @@ pub struct ControlCenterServer {
     wakeword_model_path: PathBuf,
     wakeword_enabled: bool,
     acoustic_lab: Option<Arc<crate::acoustics::AcousticLab>>,
+    auth_manager: Arc<AuthManager>,
 }
 
 impl ControlCenterServer {
@@ -81,7 +85,17 @@ impl ControlCenterServer {
             wakeword_model_path: PathBuf::from("/data/opt/mini-assistant/keyword.rpw"),
             wakeword_enabled: true,
             acoustic_lab: None,
+            auth_manager: Arc::new(AuthManager::default()),
         }
+    }
+
+    pub fn with_auth_manager(mut self, auth_manager: Arc<AuthManager>) -> Self {
+        self.auth_manager = auth_manager;
+        self
+    }
+
+    pub fn auth_manager(&self) -> Arc<AuthManager> {
+        self.auth_manager.clone()
     }
 
     pub fn with_acoustic_lab(mut self, lab: Arc<crate::acoustics::AcousticLab>) -> Self {
@@ -191,6 +205,7 @@ impl ControlCenterServer {
         let mut origin = None;
         let mut json_content = false;
         let mut if_match = None;
+        let mut auth_header = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
                 let k_trim = k.trim();
@@ -206,6 +221,8 @@ impl ControlCenterServer {
                     host = Some(v.trim().to_string());
                 } else if k_trim.eq_ignore_ascii_case("if-match") {
                     if_match = Some(v.trim().to_string());
+                } else if k_trim.eq_ignore_ascii_case("authorization") {
+                    auth_header = Some(v.trim().to_string());
                 }
             }
         }
@@ -248,6 +265,43 @@ impl ControlCenterServer {
             _ => self.redirect_uri.clone(),
         };
 
+        let same_origin = origin.as_ref().is_some_and(|o| {
+            host.as_ref()
+                .is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}"))
+        });
+
+        let identity = match self
+            .auth_manager
+            .authenticate(auth_header.as_deref(), same_origin)
+        {
+            Ok(ident) => ident,
+            Err(err) => {
+                return self
+                    .send_json_status(
+                        &mut stream,
+                        err.status_code(),
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": err.message()
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        if let Err((code, msg)) = self.auth_manager.authorize_route(&identity, method, path) {
+            return self
+                .send_json_status(
+                    &mut stream,
+                    code,
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": msg
+                    }),
+                )
+                .await;
+        }
+
         if method == "POST"
             && matches!(
                 path,
@@ -257,18 +311,21 @@ impl ControlCenterServer {
                     | "/api/v1/calibration/restore"
                     | "/api/v1/acoustics/test_session"
                     | "/api/v1/calibration/test_session"
+                    | "/api/v1/acoustics/tokens"
+                    | "/api/v1/calibration/tokens"
+                    | "/api/v1/acoustics/tokens/revoke"
+                    | "/api/v1/calibration/tokens/revoke"
+                    | "/api/v1/acoustics/lease/revoke"
+                    | "/api/v1/calibration/lease/revoke"
             )
         {
-            let same_origin = origin.as_ref().is_none_or(|o| {
-                host.as_ref()
-                    .is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}"))
-            });
-            let is_restore = path == "/api/v1/acoustics/restore"
-                || path == "/api/v1/calibration/restore"
-                || path == "/api/v1/acoustics/test_session"
-                || path == "/api/v1/calibration/test_session";
-            if !same_origin || (!is_restore && !json_content) {
-                return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require same-origin JSON"})).await;
+            let is_authorized_caller = same_origin
+                || identity.is_owner()
+                || matches!(identity, RequestIdentity::Calibration { .. });
+            let is_restore =
+                path == "/api/v1/acoustics/restore" || path == "/api/v1/calibration/restore";
+            if !is_authorized_caller || (!is_restore && !json_content) {
+                return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require JSON"})).await;
             }
             if body.len() > 16 * 1024 {
                 return self.send_json_status(&mut stream, "413 Content Too Large", &serde_json::json!({"status":"error","message":"Acoustic profile too large"})).await;
@@ -348,7 +405,7 @@ impl ControlCenterServer {
                 self.handle_api_get_calibration(&mut stream).await?;
             }
             ("POST", "/api/v1/acoustics") | ("POST", "/api/v1/calibration") => {
-                self.handle_api_post_calibration(&mut stream, body, if_match.as_deref())
+                self.handle_api_post_calibration(&mut stream, body, if_match.as_deref(), &identity)
                     .await?;
             }
             ("POST", "/api/v1/acoustics/restore") | ("POST", "/api/v1/calibration/restore") => {
@@ -361,6 +418,20 @@ impl ControlCenterServer {
             ("POST", "/api/v1/acoustics/test_session")
             | ("POST", "/api/v1/calibration/test_session") => {
                 self.handle_api_post_acoustic_test_session(&mut stream, body)
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/tokens") | ("POST", "/api/v1/calibration/tokens") => {
+                self.handle_api_post_acoustic_tokens(&mut stream, body)
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/tokens/revoke")
+            | ("POST", "/api/v1/calibration/tokens/revoke") => {
+                self.handle_api_post_acoustic_tokens_revoke(&mut stream, body)
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/lease/revoke")
+            | ("POST", "/api/v1/calibration/lease/revoke") => {
+                self.handle_api_post_acoustic_lease_revoke(&mut stream, body)
                     .await?;
             }
 
@@ -707,7 +778,22 @@ impl ControlCenterServer {
         stream: &mut TcpStream,
         body: &str,
         if_match: Option<&str>,
+        identity: &RequestIdentity,
     ) -> Result<()> {
+        if let RequestIdentity::Calibration { token, .. } = identity {
+            if let Err((code, msg)) = self.auth_manager.record_run(token) {
+                return self
+                    .send_json_status(
+                        stream,
+                        code,
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": msg
+                        }),
+                    )
+                    .await;
+            }
+        }
         let Some(lab) = &self.acoustic_lab else {
             return self
                 .send_json_status(
@@ -927,6 +1013,202 @@ impl ControlCenterServer {
             &serde_json::json!({
                 "status": "ok",
                 "test_session": payload.active,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_post_acoustic_tokens(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct CreateTokenRequest {
+            #[serde(default = "default_identity_id")]
+            identity_id: String,
+            #[serde(default = "default_ttl_secs")]
+            ttl_secs: u64,
+            #[serde(default)]
+            scopes: Vec<String>,
+            lease: Option<LeaseRequest>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LeaseRequest {
+            #[serde(default = "default_max_duration")]
+            max_duration_secs: u64,
+            #[serde(default = "default_max_vol")]
+            max_volume_pct: u8,
+            #[serde(default = "default_max_runs")]
+            max_runs: u32,
+        }
+        fn default_identity_id() -> String {
+            "calibration-agent".to_string()
+        }
+        fn default_ttl_secs() -> u64 {
+            3600
+        }
+        fn default_max_duration() -> u64 {
+            600
+        }
+        fn default_max_vol() -> u8 {
+            60
+        }
+        fn default_max_runs() -> u32 {
+            50
+        }
+
+        let req: CreateTokenRequest = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status":"error","message":format!("Invalid request body: {e}")}),
+                    )
+                    .await;
+            }
+        };
+
+        let mut scopes_set = HashSet::new();
+        if req.scopes.is_empty() {
+            scopes_set = Scope::all();
+        } else {
+            for s in &req.scopes {
+                match s.as_str() {
+                    "acoustics_read" => {
+                        scopes_set.insert(Scope::AcousticsRead);
+                    }
+                    "acoustics_write" => {
+                        scopes_set.insert(Scope::AcousticsWrite);
+                    }
+                    "profiles" => {
+                        scopes_set.insert(Scope::Profiles);
+                    }
+                    "samples" => {
+                        scopes_set.insert(Scope::Samples);
+                    }
+                    "jobs" => {
+                        scopes_set.insert(Scope::Jobs);
+                    }
+                    other => {
+                        return self
+                            .send_json_status(
+                                stream,
+                                "400 Bad Request",
+                                &serde_json::json!({"status":"error","message":format!("Unknown scope: {other}")}),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        let baseline_rev = self
+            .acoustic_lab
+            .as_ref()
+            .map(|l| l.snapshot().revision)
+            .unwrap_or(0);
+        let lease_req = req.lease.unwrap_or(LeaseRequest {
+            max_duration_secs: default_max_duration(),
+            max_volume_pct: default_max_vol(),
+            max_runs: default_max_runs(),
+        });
+        let lease = CalibrationLease {
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            baseline_revision: baseline_rev,
+            max_duration_secs: lease_req.max_duration_secs,
+            max_volume_pct: lease_req.max_volume_pct,
+            max_runs: lease_req.max_runs,
+            runs_count: 0,
+            active: true,
+        };
+
+        let ttl = Duration::from_secs(req.ttl_secs.clamp(60, 86400));
+        let (token_secret, cal_token) = self.auth_manager.issue_calibration_token(
+            req.identity_id.clone(),
+            ttl,
+            scopes_set,
+            lease.clone(),
+        );
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "token": token_secret,
+                "identity_id": req.identity_id,
+                "expires_in_secs": req.ttl_secs,
+                "scopes": cal_token.scopes,
+                "lease": lease,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_post_acoustic_tokens_revoke(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct RevokeTokenRequest {
+            token: String,
+        }
+        let req: RevokeTokenRequest = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status":"error","message":format!("Invalid request body: {e}")}),
+                    )
+                    .await;
+            }
+        };
+        let revoked = self.auth_manager.revoke_token(&req.token);
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "revoked": revoked,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_post_acoustic_lease_revoke(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct RevokeLeaseRequest {
+            lease_id: String,
+        }
+        let req: RevokeLeaseRequest = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status":"error","message":format!("Invalid request body: {e}")}),
+                    )
+                    .await;
+            }
+        };
+        let revoked = self.auth_manager.revoke_lease(&req.lease_id);
+        if let Some(ref lab) = self.acoustic_lab {
+            lab.set_test_session(false);
+        }
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "lease_revoked": revoked,
             }),
         )
         .await
@@ -2258,5 +2540,214 @@ capture_device = "hw:0,2"
         let encoded = urlencoding::encode(orig);
         let decoded = urlencoding::decode(&encoded);
         assert_eq!(orig, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_and_calibration_lifecycle() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (lab, _rx) =
+            crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
+        let auth_manager = Arc::new(crate::web::auth::AuthManager::new(Some(
+            "test-owner-token".to_string(),
+        )));
+        let server = Arc::new(
+            ControlCenterServer::new(
+                None,
+                "client_id".to_string(),
+                "http://127.0.0.1/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                ducker,
+            )
+            .with_acoustic_lab(lab.clone())
+            .with_auth_manager(auth_manager),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(300), stream.read(&mut buf)).await
+                {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+                    Ok(Err(_)) => break,
+                }
+            }
+            let res_str = String::from_utf8_lossy(&response).to_string();
+            let status_line = res_str.lines().next().unwrap_or("");
+            let status_code: u16 = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let json_body = res_str
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b.trim()).ok())
+                .unwrap_or(serde_json::Value::Null);
+            (status_code, json_body)
+        }
+
+        // 1. Issue calibration token as owner
+        let issue_body = serde_json::json!({
+            "identity_id": "test-agent",
+            "ttl_secs": 3600,
+            "scopes": ["acoustics_read", "acoustics_write", "profiles", "samples", "jobs"],
+            "lease": {
+                "baseline_revision": 1,
+                "max_duration_secs": 300,
+                "max_volume_pct": 50,
+                "max_runs": 5
+            }
+        })
+        .to_string();
+
+        let req = format!(
+            "POST /api/v1/acoustics/tokens HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-owner-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr,
+            issue_body.len(),
+            issue_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200, "Failed to issue token: {:?}", resp);
+        let token = resp["token"].as_str().unwrap().to_string();
+        let lease_id = resp["lease"]["lease_id"].as_str().unwrap().to_string();
+
+        // 2. Calibration token can access acoustic routes
+        let req = format!(
+            "GET /api/v1/acoustics HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            local_addr, token
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["status"], "ok");
+
+        let req = format!(
+            "GET /api/v1/acoustics/events HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            local_addr, token
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["status"], "ok");
+
+        let ts_body = serde_json::json!({"active": true}).to_string();
+        let req = format!(
+            "POST /api/v1/acoustics/test_session HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr,
+            token,
+            ts_body.len(),
+            ts_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["test_session"], true);
+        assert!(lab.snapshot().test_session);
+
+        // 3. Calibration token is forbidden (403) from administrative routes
+        let forbidden_routes = [
+            "/api/v1/system/restart",
+            "/api/v1/system/reboot",
+            "/api/v1/voice",
+            "/api/v1/volume",
+            "/api/v1/led",
+            "/api/spotify/play",
+            "/api/v1/wakeword/session/start",
+            "/api/v1/acoustics/tokens",
+        ];
+        for route in forbidden_routes {
+            let dummy = "{}";
+            let req = format!(
+                "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                route,
+                local_addr,
+                token,
+                dummy.len(),
+                dummy
+            );
+            let (code, resp) = send_req(local_addr, &req).await;
+            assert_eq!(
+                code, 403,
+                "Route {} should return 403 for calibration token, got {code} ({:?})",
+                route, resp
+            );
+            assert_eq!(resp["status"], "error");
+        }
+
+        // 4. Anonymous external client without authorization header is 401
+        let req = format!(
+            "GET /api/v1/acoustics/events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        let (code, _) = send_req(local_addr, &req).await;
+        assert_eq!(code, 401);
+
+        let req = format!(
+            "POST /api/v1/system/restart HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        let (code, _) = send_req(local_addr, &req).await;
+        assert_eq!(code, 401);
+
+        // 5. Empty bearer token is 401
+        let req = format!(
+            "GET /api/v1/acoustics/events HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer \r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 401);
+        assert_eq!(
+            resp["message"],
+            "Authorization header present but bearer token is missing or empty"
+        );
+
+        // 6. Revoke lease stops test session and revokes access
+        let revoke_body = serde_json::json!({"lease_id": lease_id}).to_string();
+        let req = format!(
+            "POST /api/v1/acoustics/lease/revoke HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-owner-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr,
+            revoke_body.len(),
+            revoke_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["lease_revoked"], true);
+
+        // Test session was automatically stopped on lease revocation
+        assert!(!lab.snapshot().test_session);
+
+        // Subsequent call with token fails with 403 LeaseRevoked
+        let req = format!(
+            "POST /api/v1/acoustics/test_session HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr,
+            token,
+            ts_body.len(),
+            ts_body
+        );
+        let (code, resp) = send_req(local_addr, &req).await;
+        assert_eq!(code, 403);
+        assert_eq!(
+            resp["message"],
+            "Calibration lease has been revoked or expired"
+        );
+
+        // Cleanup
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
     }
 }
