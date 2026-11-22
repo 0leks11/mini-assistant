@@ -18,6 +18,7 @@ struct Permit {
 struct State {
     sequence: TurnId,
     permit: Option<Permit>,
+    finished: Vec<TurnId>,
 }
 
 #[derive(Debug)]
@@ -128,7 +129,20 @@ impl TurnAuthorization {
             if state.permit.as_ref().is_some_and(|p| p.id == id) {
                 state.permit = None;
             }
+            if !state.finished.contains(&id) {
+                state.finished.push(id);
+                if state.finished.len() > 64 {
+                    state.finished.remove(0);
+                }
+            }
         }
+    }
+
+    pub fn is_finished(&self, id: TurnId) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state.finished.contains(&id) || (id != 0 && id < state.sequence.saturating_sub(64))
     }
 
     pub fn cancel(&self) {

@@ -417,6 +417,12 @@ impl AudioPlayback {
                                     if let Some(stdout) = child.stdout.take() {
                                         let epoch_mon = epoch;
                                         let resp_mon = resp_id;
+                                        let is_playing_mon = is_playing_for_worker.clone();
+                                        let has_active_mon = has_active_generation_for_worker.clone();
+                                        let active_resp_mon = active_response_for_worker.clone();
+                                        let epoch_mon_counter = cancellation_epoch_for_worker.clone();
+                                        let lifecycle_mon = lifecycle_for_worker.clone();
+                                        let child_mon = current_child_for_worker.clone();
                                         std::thread::spawn(move || {
                                             use std::io::BufRead;
                                             let reader = std::io::BufReader::new(stdout);
@@ -450,6 +456,20 @@ impl AudioPlayback {
                                                     }
                                                 }
                                             }
+                                            // When stdout reaches EOF, mini_pcm_sink has terminated
+                                            let mut slot = child_mon.lock().unwrap();
+                                            if let Some(mut c) = slot.take() {
+                                                let _ = c.wait();
+                                            }
+                                            finish_playback_response(
+                                                &lifecycle_mon,
+                                                &epoch_mon_counter,
+                                                &active_resp_mon,
+                                                &is_playing_mon,
+                                                &has_active_mon,
+                                                epoch_mon,
+                                                resp_mon,
+                                            );
                                         });
                                     }
                                     if let Some(mut stdin) = child.stdin.take() {
@@ -765,7 +785,20 @@ impl AudioPlayback {
 
     /// Check if audio playback is currently active (used to suppress speaker echo in mic).
     pub fn is_playing(&self) -> bool {
-        self.is_playing.load(Ordering::SeqCst)
+        if !self.is_playing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Ok(mut lock) = self.current_child.lock() {
+            if let Some(child) = lock.as_mut() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    *lock = None;
+                    self.is_playing.store(false, Ordering::SeqCst);
+                    self.has_active_generation.store(false, Ordering::SeqCst);
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Current cancellation epoch counter

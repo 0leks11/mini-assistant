@@ -27,45 +27,72 @@ impl KeywordEngine {
                 .map_err(anyhow::Error::msg)?;
 
         let def_cal = crate::config::WakewordCalibrationConfig::default();
-        let cal_ref = cal.unwrap_or(&def_cal);
 
-        let threshold = std::env::var("MINI_WAKEWORD_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(cal_ref.threshold);
+        let threshold = cal
+            .map(|c| c.threshold)
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
+            })
+            .unwrap_or(def_cal.threshold);
 
-        let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(cal_ref.avg_threshold);
+        let avg_threshold = cal
+            .map(|c| c.avg_threshold)
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            })
+            .unwrap_or(def_cal.avg_threshold);
 
-        let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| (1..=20).contains(v))
-            .unwrap_or(cal_ref.min_scores);
+        let min_scores = cal
+            .map(|c| c.min_scores)
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_MIN_SCORES")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| (1..=20).contains(v))
+            })
+            .unwrap_or(def_cal.min_scores);
 
-        let score_mode = std::env::var("MINI_WAKEWORD_SCORE_MODE")
-            .ok()
-            .and_then(|v| parse_score_mode(&v))
-            .unwrap_or_else(|| parse_score_mode(&cal_ref.score_mode).unwrap_or(ScoreMode::Max));
+        let score_mode = cal
+            .and_then(|c| parse_score_mode(&c.score_mode))
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_SCORE_MODE")
+                    .ok()
+                    .and_then(|v| parse_score_mode(&v))
+            })
+            .unwrap_or(ScoreMode::Max);
 
-        let eager = std::env::var("MINI_WAKEWORD_EAGER")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(cal_ref.eager);
+        let eager = cal
+            .map(|c| c.eager)
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_EAGER")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            })
+            .unwrap_or(def_cal.eager);
 
-        let gain_norm = std::env::var("MINI_WAKEWORD_GAIN_NORM")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(cal_ref.gain_normalizer);
+        let gain_norm = cal
+            .map(|c| c.gain_normalizer)
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_GAIN_NORM")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            })
+            .unwrap_or(def_cal.gain_normalizer);
 
-        let band_pass = std::env::var("MINI_WAKEWORD_BAND_PASS")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(cal_ref.band_pass);
+        let band_pass = cal
+            .map(|c| c.band_pass)
+            .or_else(|| {
+                std::env::var("MINI_WAKEWORD_BAND_PASS")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            })
+            .unwrap_or(def_cal.band_pass);
 
         let detector_cfg = PersonalDetectorConfig {
             threshold,

@@ -416,8 +416,13 @@ impl GeminiLiveClient {
 
 /// Wire activity boundaries preserve the identity of cancelled inputs until the
 /// server acknowledges their boundary. A new local permit cannot rename them.
+struct TurnRecord {
+    id: u64,
+    submitted_at: std::time::Instant,
+}
+
 #[derive(Default)]
-struct SessionTurns(Mutex<VecDeque<u64>>);
+struct SessionTurns(Mutex<VecDeque<TurnRecord>>);
 
 impl SessionTurns {
     fn submit(&self, id: u64) -> Result<()> {
@@ -425,24 +430,44 @@ impl SessionTurns {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("Turn ledger unavailable"))?;
-        anyhow::ensure!(
-            id != 0 && turns.len() < 8,
-            "Too many unacknowledged input turns"
-        );
-        anyhow::ensure!(!turns.contains(&id), "Input turn was already submitted");
-        turns.push_back(id);
+        anyhow::ensure!(id != 0, "Invalid turn id 0");
+        // Auto-prune turns older than 10 seconds without cloud response
+        let now = std::time::Instant::now();
+        turns.retain(|r| now.duration_since(r.submitted_at) < std::time::Duration::from_secs(10));
+        // If queue reaches 8 turns, evict the oldest unacknowledged turn to prevent dropping the WebSocket
+        while turns.len() >= 8 {
+            if let Some(evicted) = turns.pop_front() {
+                tracing::warn!(
+                    evicted_id = evicted.id,
+                    "Evicted oldest unacknowledged turn from SessionTurns to avoid WebSocket drop"
+                );
+            }
+        }
+        anyhow::ensure!(!turns.iter().any(|r| r.id == id), "Input turn was already submitted");
+        turns.push_back(TurnRecord {
+            id,
+            submitted_at: now,
+        });
         Ok(())
     }
 
     fn front(&self) -> Option<u64> {
-        self.0.lock().ok()?.front().copied()
+        self.0.lock().ok()?.front().map(|r| r.id)
+    }
+
+    fn prune_finished(&self, auth: Option<&TurnAuthorization>) {
+        if let Ok(mut turns) = self.0.lock() {
+            if let Some(auth) = auth {
+                turns.retain(|r| !auth.is_finished(r.id));
+            }
+            let now = std::time::Instant::now();
+            turns.retain(|r| now.duration_since(r.submitted_at) < std::time::Duration::from_secs(10));
+        }
     }
 
     fn acknowledge(&self, id: u64) {
         if let Ok(mut turns) = self.0.lock() {
-            if turns.front() == Some(&id) {
-                turns.pop_front();
-            }
+            turns.retain(|r| r.id != id);
         }
     }
 }
@@ -487,6 +512,7 @@ where
         tokio::select! {
             _ = ping.tick() => write.send(Message::Ping(Vec::new())).await?,
             _ = cancellation_poll.tick() => {
+                turns.prune_finished(authorization.as_deref());
                 if submitted_turn.is_some_and(|id| !authorization.as_ref().is_some_and(|a| a.is_current(id))) {
                     end_wire_activity(&mut write, &turns, &mut submitted_turn).await?;
                 }
@@ -604,6 +630,7 @@ where
             || resp.tool_call.is_some();
         if has_output && response_turn.is_none() && !discard_generation {
             skip_unbound_completion_after_interrupt = false;
+            turns.prune_finished(authorization.as_deref());
             if let Some(id) = turns.front() {
                 if response_complete {
                     response_id = response_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -725,6 +752,7 @@ where
                     skip_unbound_completion_after_interrupt = false;
                     continue;
                 }
+                turns.prune_finished(authorization.as_deref());
                 response_turn = turns.front();
                 response_epoch = cancellation_epoch.load(Ordering::SeqCst);
             }
@@ -1985,6 +2013,32 @@ mod tests {
         assert_eq!(auth.accepting_response(), Some(next));
         fixture.send(model_pcm(2));
         assert_eq!(fixture.audio().await.2, vec![2, 0]);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_finished_turn_is_pruned_and_does_not_block_next_turn() {
+        let auth = Arc::new(TurnAuthorization::new(std::time::Duration::from_secs(5)));
+        let turns = Arc::new(SessionTurns::default());
+        let old = authorize_input(&auth, &turns);
+        // Turn 1 times out without cloud speech: main.rs calls finish(old)
+        auth.finish(old);
+
+        // Turn 2 is started and authorized
+        let next = authorize_input(&auth, &turns);
+        let mut fixture = ReceiverFixture::new(
+            Some(auth.clone()),
+            turns.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        // Server sends speech for Turn 2!
+        fixture.send(model_pcm(2));
+        let actual = fixture.audio().await;
+        // Turn 2 audio MUST be accepted and delivered, not discarded by the ghost of Turn 1!
+        assert_eq!(actual.0, 0);
+        assert_eq!(actual.2, vec![2, 0]);
+        assert_eq!(auth.accepting_response(), Some(next));
         fixture.stop().await;
     }
 
