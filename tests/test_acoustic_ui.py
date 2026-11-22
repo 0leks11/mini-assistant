@@ -91,6 +91,8 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
   if (input.case === 'profiles') {
     assert.equal(evaluate('validateProfile({schema:1,settings:fixture.applied},fixture.controls,fixture.defaults).threshold'), 0.38);
     assert.equal(evaluate('validateProfile({schema:1,settings:fixture.applied},fixture.controls,fixture.defaults).gain_ref'), null);
+    assert.equal(evaluate('settingsEqual({a:0.28},{a:0.2800000011920929})'), true, 'f32 float representation differences must compare equal');
+    assert.equal(evaluate('valuesEqual(0.32, 0.3199999928474426)'), true, 'f32 float values must compare equal');
     const invalid = [
       '{schema:2,settings:fixture.applied}',
       '{schema:1,settings:{...fixture.applied,threshold:0.9}}',

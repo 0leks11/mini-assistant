@@ -172,10 +172,18 @@
 <script>
 "use strict";
 
+function valuesEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a === "number" && typeof b === "number") {
+    return Math.abs(a - b) < 1e-4;
+  }
+  return false;
+}
+
 function settingsEqual(a, b) {
   if (!a || !b) return a === b;
   const keys = Object.keys(a).sort();
-  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && a[key] === b[key]);
+  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && valuesEqual(a[key], b[key]));
 }
 
 function validateSettings(settings, controls, reference) {
@@ -269,7 +277,7 @@ function initAcousticLab() {
       el("form-status").textContent = "На устройстве есть неподтверждённые изменения";
       el("form-detail").textContent = "Дождитесь результата применения";
     } else if (changed) {
-      const count = Object.keys(draft).filter(key => draft[key] !== original[key]).length;
+      const count = Object.keys(draft).filter(key => !valuesEqual(draft[key], original[key])).length;
       el("form-status").textContent = "Изменений в форме: " + count;
       el("form-detail").textContent = "Работающий профиль пока не изменён";
     } else {
@@ -283,8 +291,8 @@ function initAcousticLab() {
       const value = latest?.applied?.[key];
       const saved = latest?.saved?.[key];
       const display = input => input === null ? "автоматически" : typeof input === "boolean" ? (input ? "вкл" : "выкл") : typeof input === "number" ? numberText(input, 5) : String(input ?? "—");
-      widget.meta.textContent = "Работает: " + display(value) + (value !== saved ? " · Сохранено: " + display(saved) : "");
-      widget.meta.classList.toggle("changed", draft?.[key] !== value);
+      widget.meta.textContent = "Работает: " + display(value) + (!valuesEqual(value, saved) ? " · Сохранено: " + display(saved) : "");
+      widget.meta.classList.toggle("changed", !valuesEqual(draft?.[key], value));
     }
   }
 
