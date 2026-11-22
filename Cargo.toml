@@ -48,7 +48,6 @@ thiserror = "2"
 
 # System / libc (for Linux termios and ioctl)
 libc = "0.2"
-socket2 = "0.6"
 
 # Logging
 tracing = "0.1"

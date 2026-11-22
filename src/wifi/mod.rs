@@ -3,6 +3,5 @@
 pub mod coordinator;
 pub mod dhcp;
 pub mod dns;
-pub mod mdns;
 pub mod portal;
 pub mod wpa;

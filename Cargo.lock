@@ -656,7 +656,6 @@ dependencies = [
  "rustpotter",
  "serde",
  "serde_json",
- "socket2",
  "thiserror 2.0.21",
  "time",
  "tokio",
