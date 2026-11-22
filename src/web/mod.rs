@@ -255,14 +255,18 @@ impl ControlCenterServer {
                     | "/api/v1/calibration"
                     | "/api/v1/acoustics/restore"
                     | "/api/v1/calibration/restore"
+                    | "/api/v1/acoustics/test_session"
+                    | "/api/v1/calibration/test_session"
             )
         {
             let same_origin = origin.as_ref().is_none_or(|o| {
                 host.as_ref()
                     .is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}"))
             });
-            let is_restore =
-                path == "/api/v1/acoustics/restore" || path == "/api/v1/calibration/restore";
+            let is_restore = path == "/api/v1/acoustics/restore"
+                || path == "/api/v1/calibration/restore"
+                || path == "/api/v1/acoustics/test_session"
+                || path == "/api/v1/calibration/test_session";
             if !same_origin || (!is_restore && !json_content) {
                 return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require same-origin JSON"})).await;
             }
@@ -349,6 +353,15 @@ impl ControlCenterServer {
             }
             ("POST", "/api/v1/acoustics/restore") | ("POST", "/api/v1/calibration/restore") => {
                 self.handle_api_restore_calibration(&mut stream).await?;
+            }
+            ("GET", "/api/v1/acoustics/events") | ("GET", "/api/v1/calibration/events") => {
+                self.handle_api_get_acoustic_events(&mut stream, query)
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/test_session")
+            | ("POST", "/api/v1/calibration/test_session") => {
+                self.handle_api_post_acoustic_test_session(&mut stream, body)
+                    .await?;
             }
 
             // Spotify OAuth PKCE Flow
@@ -836,6 +849,87 @@ impl ControlCenterServer {
                 .await
             }
         }
+    }
+
+    async fn handle_api_get_acoustic_events(
+        &self,
+        stream: &mut TcpStream,
+        query: Option<&str>,
+    ) -> Result<()> {
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await;
+        };
+        let mut since: u64 = 0;
+        let mut limit: usize = 50;
+        if let Some(q) = query {
+            for pair in q.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    match k {
+                        "since" => since = v.parse().unwrap_or(0),
+                        "limit" => limit = v.parse().unwrap_or(50),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let events = lab.events(since, limit);
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "since": since,
+                "limit": limit,
+                "events": events,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_post_acoustic_test_session(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await;
+        };
+        #[derive(serde::Deserialize)]
+        struct TestSessionPayload {
+            active: bool,
+        }
+        let payload: TestSessionPayload = match serde_json::from_str(body) {
+            Ok(p) => p,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status":"error","message":format!("Invalid JSON: {e}")}),
+                    )
+                    .await;
+            }
+        };
+        lab.set_test_session(payload.active);
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "test_session": payload.active,
+            }),
+        )
+        .await
     }
 
     fn resolve_config_path(&self) -> Option<std::path::PathBuf> {

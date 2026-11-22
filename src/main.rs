@@ -1157,7 +1157,21 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            let (tx_session_status, rx_session_status) = tokio::sync::oneshot::channel();
+            let (tx_session_status, rx_session_status) =
+                tokio::sync::oneshot::channel::<Arc<std::sync::atomic::AtomicU8>>();
+            let shared_session_status = Arc::new(std::sync::atomic::AtomicU8::new(
+                gemini::live_client::SessionStatus::Connecting as u8,
+            ));
+            let status_updater = shared_session_status.clone();
+            tokio::spawn(async move {
+                if let Ok(handle) = rx_session_status.await {
+                    loop {
+                        let val = handle.load(std::sync::atomic::Ordering::SeqCst);
+                        status_updater.store(val, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            });
             let mic_authorization = authorization.clone();
             let playback_for_mic = playback.clone();
             let alarm_for_mic = alarm_runner.as_ref().map(|runner| runner.player.clone());
@@ -1168,14 +1182,11 @@ async fn main() -> Result<()> {
             let is_gesture_for_mic = is_gesture_active.clone();
             let recorder_for_mic = hardware_recorder.clone();
             let led_color_for_mic = current_led_color_holder.clone();
+            let session_status_for_mic = shared_session_status.clone();
             tokio::spawn(async move {
                 use std::sync::atomic::Ordering;
                 use std::time::{Duration, Instant};
-                let Ok(session_status): Result<Arc<std::sync::atomic::AtomicU8>, _> =
-                    rx_session_status.await
-                else {
-                    return;
-                };
+                let session_status = session_status_for_mic;
                 // Controls issued during setup must not arm a future connection.
                 manual_arm.store(false, Ordering::SeqCst);
                 let mut active_turn = None;
@@ -1183,6 +1194,8 @@ async fn main() -> Result<()> {
                 let mut followup_until = Instant::now();
                 let mut acoustic_current = acoustic_settings.clone();
                 let mut acoustic_model_path = model_path.clone();
+                let mut cumulative_samples: u64 = 0;
+                let mut was_test_session = false;
                 let mut lab_metrics = acoustics::RuntimeMetrics {
                     model_loaded,
                     mode: "starting".into(),
@@ -1253,12 +1266,25 @@ async fn main() -> Result<()> {
                             ),
                         }
                     }
+                    cumulative_samples =
+                        cumulative_samples.saturating_add((chunk.len() / 2) as u64);
+                    let test_session_now = acoustic_lab.is_test_session();
+                    if test_session_now && !was_test_session {
+                        mic_authorization.cancel();
+                        playback_for_mic.interrupt();
+                        active_turn = None;
+                        gate.reset_gate();
+                    }
+                    was_test_session = test_session_now;
+
                     acoustics::apply_gain(&mut chunk, acoustic_current.mic_gain);
                     lab_metrics.pcm_rms = acoustics::pcm_rms(&chunk);
                     let (floor, level, _) = gate.vad_diagnostics();
                     lab_metrics.noise_floor = floor;
                     lab_metrics.vad_level = level;
-                    lab_metrics.mode = if acoustic_current.shadow_mode {
+                    lab_metrics.mode = if test_session_now {
+                        "test_session"
+                    } else if acoustic_current.shadow_mode {
                         "shadow"
                     } else if !acoustic_current.enabled {
                         "disabled"
@@ -1315,14 +1341,14 @@ async fn main() -> Result<()> {
                         session_status.load(Ordering::SeqCst),
                     );
                     let is_ready = session_state == gemini::live_client::SessionStatus::Ready;
-                    if session_state == gemini::live_client::SessionStatus::Stopped {
-                        gate.reset_gate();
+                    if session_state == gemini::live_client::SessionStatus::Stopped
+                        && active_turn.is_some()
+                    {
                         active_turn = None;
                         arm_until = now;
                         followup_until = now;
                         last_turn_seen = None;
                         manual_arm.store(false, Ordering::SeqCst);
-                        continue;
                     }
                     if cancel_input.swap(false, Ordering::SeqCst) {
                         arm_until = now;
@@ -1437,7 +1463,13 @@ async fn main() -> Result<()> {
                     let was_active = gate.is_active();
                     let frames = gate.process_frame(chunk);
                     let mut now_active = gate.is_active();
+
+                    let mut last_obs_score = 0.0_f32;
+                    let mut last_obs_avg_score = 0.0_f32;
+
                     if let Some(observation) = gate.take_keyword_observation() {
+                        last_obs_score = observation.score;
+                        last_obs_avg_score = observation.avg_score;
                         lab_metrics.candidate_count = lab_metrics.candidate_count.saturating_add(1);
                         lab_metrics.last_score =
                             observation.score.is_finite().then_some(observation.score);
@@ -1449,29 +1481,63 @@ async fn main() -> Result<()> {
                             lab_metrics.keyword_count = lab_metrics.keyword_count.saturating_add(1);
                         }
                     }
-                    if acoustic_current.shadow_mode {
+
+                    let in_shadow_or_test = acoustic_current.shadow_mode || test_session_now;
+
+                    if in_shadow_or_test {
                         if !was_active && now_active {
                             lab_metrics.shadow_count = lab_metrics.shadow_count.saturating_add(1);
+                            let reason = if test_session_now {
+                                "test_session"
+                            } else {
+                                "shadow_mode"
+                            };
+                            acoustic_lab.record_event(
+                                cumulative_samples,
+                                last_obs_score,
+                                last_obs_avg_score,
+                                true,
+                                false,
+                                Some(reason.to_string()),
+                            );
+                            gate.reset_gate();
                         }
-                        gate.reset_gate();
                         active_turn = None;
                         continue;
                     }
-                    if !was_active && now_active {
-                        // Immediately illuminate top LED ring upon wake-word detection
-                        if !led_is_on {
-                            led_is_on = true;
-                            set_led_active(true, &cur_color);
-                        }
 
+                    if !was_active && now_active {
                         // Prevent acoustic self-interruption: ONLY discard if the assistant's OWN TTS VOICE
                         // is currently playing or within echo decay. Music or alarms must NOT discard the wake-word!
                         if is_tts_playing || now < tts_echo_until {
                             lab_metrics.suppressed_count =
                                 lab_metrics.suppressed_count.saturating_add(1);
                             debug!("Discarded acoustic activation during assistant TTS speech/echo tail");
+                            acoustic_lab.record_event(
+                                cumulative_samples,
+                                last_obs_score,
+                                last_obs_avg_score,
+                                true,
+                                false,
+                                Some("tts_echo".to_string()),
+                            );
                             gate.reset_gate();
                             continue;
+                        }
+
+                        acoustic_lab.record_event(
+                            cumulative_samples,
+                            last_obs_score,
+                            last_obs_avg_score,
+                            true,
+                            true,
+                            None,
+                        );
+
+                        // Immediately illuminate top LED ring upon wake-word detection
+                        if !led_is_on {
+                            led_is_on = true;
+                            set_led_active(true, &cur_color);
                         }
 
                         mic_authorization.cancel();

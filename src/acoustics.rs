@@ -3,9 +3,11 @@ use crate::config::{Config, WakewordCalibrationConfig};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +31,19 @@ pub struct RuntimeMetrics {
     pub mode: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcousticEvent {
+    pub sequence: u64,
+    pub sample_offset: u64,
+    pub timestamp_ms: u64,
+    pub applied_revision: u64,
+    pub score: f32,
+    pub avg_score: f32,
+    pub raw_detected: bool,
+    pub gate_opened: bool,
+    pub suppression_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub runtime_instance_id: String,
@@ -39,7 +54,9 @@ pub struct Snapshot {
     pub saved: WakewordCalibrationConfig,
     pub pending: bool,
     pub error: Option<String>,
+    pub test_session: bool,
     pub runtime: RuntimeMetrics,
+    pub recent_events: Vec<AcousticEvent>,
 }
 
 /// One bounded request, acknowledged only by the audio loop that applied it.
@@ -194,6 +211,9 @@ pub struct AcousticLab {
     state: Mutex<Snapshot>,
     tx: mpsc::Sender<ApplyRequest>,
     writer: tokio::sync::Mutex<()>,
+    events: Mutex<VecDeque<AcousticEvent>>,
+    next_event_sequence: AtomicU64,
+    test_session_active: AtomicBool,
 }
 
 impl AcousticLab {
@@ -211,17 +231,89 @@ impl AcousticLab {
                     saved: initial,
                     pending: false,
                     error: None,
+                    test_session: false,
                     runtime: RuntimeMetrics::default(),
+                    recent_events: Vec::new(),
                 }),
                 tx,
                 writer: tokio::sync::Mutex::new(()),
+                events: Mutex::new(VecDeque::with_capacity(256)),
+                next_event_sequence: AtomicU64::new(1),
+                test_session_active: AtomicBool::new(false),
             }),
             rx,
         )
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        s.test_session = self.test_session_active.load(Ordering::SeqCst);
+        let q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        s.recent_events = q.iter().rev().take(20).cloned().collect();
+        s
+    }
+
+    pub fn record_event(
+        &self,
+        sample_offset: u64,
+        score: f32,
+        avg_score: f32,
+        raw_detected: bool,
+        gate_opened: bool,
+        suppression_reason: Option<String>,
+    ) -> AcousticEvent {
+        let seq = self.next_event_sequence.fetch_add(1, Ordering::SeqCst);
+        let applied_rev = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .applied_revision
+            .unwrap_or(0);
+        let event = AcousticEvent {
+            sequence: seq,
+            sample_offset,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            applied_revision: applied_rev,
+            score,
+            avg_score,
+            raw_detected,
+            gate_opened,
+            suppression_reason,
+        };
+        let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= 256 {
+            q.pop_front();
+        }
+        q.push_back(event.clone());
+        event
+    }
+
+    pub fn events(&self, since: u64, limit: usize) -> Vec<AcousticEvent> {
+        let q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let lim = limit.clamp(1, 256);
+        q.iter()
+            .filter(|e| e.sequence >= since)
+            .take(lim)
+            .cloned()
+            .collect()
+    }
+
+    pub fn clear_events(&self) {
+        let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        q.clear();
+    }
+
+    pub fn set_test_session(&self, active: bool) {
+        self.test_session_active.store(active, Ordering::SeqCst);
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.test_session = active;
+    }
+
+    pub fn is_test_session(&self) -> bool {
+        self.test_session_active.load(Ordering::SeqCst)
     }
 
     pub fn ready(&self, settings: WakewordCalibrationConfig, metrics: RuntimeMetrics) {
@@ -980,5 +1072,317 @@ led_pattern = "pulse"
         assert!(content.contains("[device]"));
         assert!(content.contains("led_pattern = \"pulse\""));
         assert!(content.contains("[wakeword]"));
+    }
+
+    #[test]
+    fn test_acoustic_event_recording_and_cursor_query() {
+        let (lab, _rx) = AcousticLab::new(WakewordCalibrationConfig::default());
+        let e1 = lab.record_event(512, 0.45, 0.40, false, false, None);
+        let e2 = lab.record_event(1024, 0.88, 0.82, true, false, Some("shadow_mode".into()));
+        let e3 = lab.record_event(2048, 0.91, 0.87, true, true, None);
+
+        assert_eq!(e1.sequence, 1);
+        assert_eq!(e2.sequence, 2);
+        assert_eq!(e3.sequence, 3);
+
+        let all = lab.events(1, 10);
+        assert_eq!(all.len(), 3);
+
+        let since_2 = lab.events(2, 10);
+        assert_eq!(since_2.len(), 2);
+        assert_eq!(since_2[0].sequence, 2);
+        assert_eq!(since_2[1].sequence, 3);
+
+        let limited = lab.events(1, 2);
+        assert_eq!(limited.len(), 2);
+
+        let snap = lab.snapshot();
+        assert_eq!(snap.recent_events.len(), 3);
+        assert_eq!(snap.recent_events[0].sequence, 3);
+    }
+
+    #[test]
+    fn test_test_session_toggle() {
+        let (lab, _rx) = AcousticLab::new(WakewordCalibrationConfig::default());
+        assert!(!lab.is_test_session());
+        assert!(!lab.snapshot().test_session);
+
+        lab.set_test_session(true);
+        assert!(lab.is_test_session());
+        assert!(lab.snapshot().test_session);
+
+        lab.set_test_session(false);
+        assert!(!lab.is_test_session());
+        assert!(!lab.snapshot().test_session);
+    }
+
+    /// Multi-chunk mock engine: requires 3 consecutive signal chunks to detect.
+    /// Simulates MFCC/DTW window accumulation across chunks (mimicking Rustpotter).
+    struct MultiChunkMockEngine {
+        required_chunks: usize,
+        accumulated: usize,
+        last_obs: Option<crate::wakeword::KeywordObservation>,
+    }
+
+    impl MultiChunkMockEngine {
+        fn new(required_chunks: usize) -> Self {
+            Self {
+                required_chunks,
+                accumulated: 0,
+                last_obs: None,
+            }
+        }
+    }
+
+    impl crate::wakeword::WakeWordEngine for MultiChunkMockEngine {
+        fn process(&mut self, pcm: &[u8]) -> bool {
+            let has_signal = pcm.iter().any(|&b| b != 0);
+            if has_signal {
+                self.accumulated += 1;
+                let detected = self.accumulated >= self.required_chunks;
+                self.last_obs = Some(crate::wakeword::KeywordObservation {
+                    score: if detected { 0.85 } else { 0.40 },
+                    avg_score: if detected { 0.80 } else { 0.35 },
+                    counter: self.accumulated,
+                    gain: 1.0,
+                    detected,
+                });
+                if detected {
+                    self.accumulated = 0; // reset upon detection, like Rustpotter
+                    return true;
+                }
+            } else {
+                self.accumulated = 0;
+                self.last_obs = None;
+            }
+            false
+        }
+
+        fn reset(&mut self) {
+            self.accumulated = 0;
+            self.last_obs = None;
+        }
+
+        fn take_observation(&mut self) -> Option<crate::wakeword::KeywordObservation> {
+            self.last_obs.take()
+        }
+    }
+
+    /// Helper simulating the production audio loop dispatch logic for a given PCM sequence.
+    fn run_audio_dispatch_simulation(
+        shadow_mode: bool,
+        test_session: bool,
+        cloud_ready: bool,
+        pcm_chunks: Vec<Vec<u8>>,
+    ) -> (RuntimeMetrics, Vec<AcousticEvent>, usize, usize) {
+        let (lab, _rx) = AcousticLab::new(WakewordCalibrationConfig::default());
+        if test_session {
+            lab.set_test_session(true);
+        }
+        let mut lab_metrics = RuntimeMetrics {
+            ready: true,
+            mode: if test_session {
+                "test_session".into()
+            } else if shadow_mode {
+                "shadow".into()
+            } else {
+                "listening".into()
+            },
+            ..Default::default()
+        };
+
+        let mut gate = crate::wakeword::InputGate::new(
+            Box::new(MultiChunkMockEngine::new(3)),
+            100,
+            200,
+            16000,
+            false,
+        );
+
+        let mut cumulative_samples: u64 = 0;
+        let mut cloud_frames_sent = 0;
+        let mut active_turns_opened = 0;
+        let mut was_test_session = false;
+
+        for chunk in pcm_chunks {
+            cumulative_samples += (chunk.len() / 2) as u64;
+            let test_session_now = lab.is_test_session();
+            if test_session_now && !was_test_session {
+                gate.reset_gate();
+            }
+            was_test_session = test_session_now;
+
+            let was_active = gate.is_active();
+            let frames = gate.process_frame(chunk.clone());
+            let now_active = gate.is_active();
+
+            let mut last_obs_score = 0.0_f32;
+            let mut last_obs_avg_score = 0.0_f32;
+
+            if let Some(observation) = gate.take_keyword_observation() {
+                last_obs_score = observation.score;
+                last_obs_avg_score = observation.avg_score;
+                lab_metrics.candidate_count += 1;
+                lab_metrics.last_score = Some(observation.score);
+                lab_metrics.last_avg_score = Some(observation.avg_score);
+                if observation.detected {
+                    lab_metrics.keyword_count += 1;
+                }
+            }
+
+            let in_shadow_or_test = shadow_mode || test_session_now;
+
+            if in_shadow_or_test {
+                if !was_active && now_active {
+                    lab_metrics.shadow_count += 1;
+                    let reason = if test_session_now {
+                        "test_session"
+                    } else {
+                        "shadow_mode"
+                    };
+                    lab.record_event(
+                        cumulative_samples,
+                        last_obs_score,
+                        last_obs_avg_score,
+                        true,
+                        false,
+                        Some(reason.to_string()),
+                    );
+                    gate.reset_gate();
+                }
+                continue;
+            }
+
+            if !was_active && now_active {
+                active_turns_opened += 1;
+                lab.record_event(
+                    cumulative_samples,
+                    last_obs_score,
+                    last_obs_avg_score,
+                    true,
+                    true,
+                    None,
+                );
+            }
+
+            if cloud_ready && gate.is_active() {
+                cloud_frames_sent += frames.len();
+            }
+        }
+
+        let events = lab.events(1, 100);
+        (lab_metrics, events, cloud_frames_sent, active_turns_opened)
+    }
+
+    #[test]
+    fn test_gate_criteria_shadow_preserves_history_and_matches_normal_mode() {
+        let silence_chunk = vec![0u8; 512];
+        let signal_chunk = vec![0x42u8; 512];
+
+        let stream = vec![
+            silence_chunk.clone(),
+            silence_chunk.clone(),
+            signal_chunk.clone(),
+            signal_chunk.clone(),
+            signal_chunk.clone(), // 3rd signal chunk: triggers detection!
+            silence_chunk.clone(),
+            silence_chunk.clone(),
+        ];
+
+        // 1. Normal mode (shadow=false, test_session=false, cloud_ready=true)
+        let (metrics_norm, events_norm, cloud_norm, turns_norm) =
+            run_audio_dispatch_simulation(false, false, true, stream.clone());
+
+        assert_eq!(
+            metrics_norm.keyword_count, 1,
+            "Normal mode must detect keyword"
+        );
+        assert_eq!(turns_norm, 1, "Normal mode must open a dialogue turn");
+        assert!(
+            cloud_norm > 0,
+            "Normal mode must send audio frames to cloud"
+        );
+        assert_eq!(events_norm.len(), 1);
+        assert!(events_norm[0].raw_detected);
+        assert!(events_norm[0].gate_opened);
+        assert_eq!(events_norm[0].suppression_reason, None);
+
+        // 2. Shadow mode (shadow=true, test_session=false, cloud_ready=true)
+        let (metrics_shad, events_shad, cloud_shad, turns_shad) =
+            run_audio_dispatch_simulation(true, false, true, stream.clone());
+
+        // GATE REQUIREMENT: Raw detections in shadow and normal mode MUST be identical!
+        assert_eq!(
+            metrics_shad.keyword_count, metrics_norm.keyword_count,
+            "Shadow mode raw detection count must match normal mode"
+        );
+        assert_eq!(
+            metrics_shad.shadow_count, 1,
+            "Shadow count must increment on detection"
+        );
+        // GATE REQUIREMENT: Shadow mode MUST NOT send cloud audio or open turns!
+        assert_eq!(
+            turns_shad, 0,
+            "Shadow mode must never open an active user turn"
+        );
+        assert_eq!(
+            cloud_shad, 0,
+            "Shadow mode must never send audio frames to cloud transport"
+        );
+        assert_eq!(events_shad.len(), 1);
+        assert!(events_shad[0].raw_detected);
+        assert!(!events_shad[0].gate_opened);
+        assert_eq!(
+            events_shad[0].suppression_reason,
+            Some("shadow_mode".to_string())
+        );
+
+        // 3. Test session mode (shadow=false, test_session=true, cloud_ready=true)
+        let (metrics_test, events_test, cloud_test, turns_test) =
+            run_audio_dispatch_simulation(false, true, true, stream.clone());
+        assert_eq!(metrics_test.keyword_count, 1);
+        assert_eq!(metrics_test.shadow_count, 1);
+        assert_eq!(turns_test, 0);
+        assert_eq!(cloud_test, 0);
+        assert_eq!(
+            events_test[0].suppression_reason,
+            Some("test_session".to_string())
+        );
+
+        // 4. Negative stream: pure silence must produce 0 detections in both modes
+        let silence_stream = vec![silence_chunk.clone(); 10];
+        let (neg_norm, _, _, _) =
+            run_audio_dispatch_simulation(false, false, true, silence_stream.clone());
+        let (neg_shad, _, _, _) =
+            run_audio_dispatch_simulation(true, false, true, silence_stream.clone());
+        assert_eq!(neg_norm.keyword_count, 0);
+        assert_eq!(neg_shad.keyword_count, 0);
+        assert_eq!(neg_shad.shadow_count, 0);
+    }
+
+    #[test]
+    fn test_cloud_stopped_does_not_block_local_shadow_observation() {
+        let silence_chunk = vec![0u8; 512];
+        let signal_chunk = vec![0x42u8; 512];
+        let stream = vec![
+            silence_chunk.clone(),
+            signal_chunk.clone(),
+            signal_chunk.clone(),
+            signal_chunk.clone(),
+            silence_chunk,
+        ];
+
+        // Cloud is Stopped / not ready (cloud_ready=false)
+        let (metrics, events, cloud_sent, turns) =
+            run_audio_dispatch_simulation(true, false, false, stream);
+        assert_eq!(metrics.keyword_count, 1, "Local matcher must still detect");
+        assert_eq!(metrics.shadow_count, 1, "Shadow count must still increment");
+        assert_eq!(cloud_sent, 0);
+        assert_eq!(turns, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].suppression_reason,
+            Some("shadow_mode".to_string())
+        );
     }
 }
