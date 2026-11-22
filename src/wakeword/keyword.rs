@@ -63,37 +63,44 @@ impl KeywordEngine {
             rustpotter::personal_reference_detector_with_config(reference, &detector_cfg)
                 .map_err(anyhow::Error::msg)?;
 
-        // Support compound wake-word ("Штучка-Интеллект") alongside primary "Штучка"
-        let compound_path = std::env::var_os("MINI_WAKEWORD_COMPOUND_MODEL")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                path.parent()
-                    .map(|p| p.join("alias-compound.rpw"))
-                    .unwrap_or_else(|| {
-                        std::path::PathBuf::from("/data/opt/mini-assistant/alias-compound.rpw")
-                    })
-            });
+        // Support optional compound wake-word ("Штучка-Интеллект") alongside primary wake-word
+        let compound_enabled = std::env::var("MINI_WAKEWORD_COMPOUND_ENABLED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || std::env::var_os("MINI_WAKEWORD_COMPOUND_MODEL").is_some();
 
-        if compound_path.exists() {
-            match WakewordRef::load_from_file(
-                compound_path
-                    .to_str()
-                    .context("Invalid compound reference path")?,
-            ) {
-                Ok(compound_ref) => {
-                    if let Err(e) = detector.add_wakeword_ref("shtuchka-intellect", compound_ref) {
-                        tracing::warn!(
-                            "Failed to add compound wake-word 'shtuchka-intellect': {e}"
-                        );
-                    } else {
-                        info!(
-                            path = ?compound_path,
-                            "Loaded compound wake-word 'shtuchka-intellect' into detector"
-                        );
+        if compound_enabled {
+            let compound_path = std::env::var_os("MINI_WAKEWORD_COMPOUND_MODEL")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    path.parent()
+                        .map(|p| p.join("alias-compound.rpw"))
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from("/data/opt/mini-assistant/alias-compound.rpw")
+                        })
+                });
+
+            if compound_path.exists() && compound_path != path {
+                match WakewordRef::load_from_file(
+                    compound_path
+                        .to_str()
+                        .context("Invalid compound reference path")?,
+                ) {
+                    Ok(compound_ref) => {
+                        if let Err(e) = detector.add_wakeword_ref("shtuchka-intellect", compound_ref) {
+                            tracing::warn!(
+                                "Failed to add compound wake-word 'shtuchka-intellect': {e}"
+                            );
+                        } else {
+                            info!(
+                                path = ?compound_path,
+                                "Loaded compound wake-word 'shtuchka-intellect' into detector"
+                            );
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load compound wake-word reference: {e}");
+                    Err(e) => {
+                        tracing::warn!("Could not load compound wake-word reference: {e}");
+                    }
                 }
             }
         }

@@ -104,7 +104,7 @@ impl HardwareRecorder {
                 sender: Some(tx),
             });
         }
-        match tokio::time::timeout(duration + Duration::from_secs(3), rx).await {
+        match tokio::time::timeout(duration + Duration::from_secs(5), rx).await {
             Ok(Ok(samples)) => {
                 tracing::info!(
                     samples_len = samples.len(),

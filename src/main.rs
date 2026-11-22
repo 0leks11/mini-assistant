@@ -1227,10 +1227,14 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    if recorder_for_mic.is_recording() {
-                        tracing::info!("main.rs: recorder_for_mic.is_recording() is TRUE, feeding chunk of {} bytes", chunk.len());
-                    }
+                    let is_enrolling = recorder_for_mic.is_recording();
                     recorder_for_mic.feed_pcm(&chunk);
+                    if is_enrolling {
+                        // While user is recording a wake-word sample, bypass heavy KWS
+                        // and Gemini gating so audio streams without backpressure or starvation.
+                        gate.reset_gate();
+                        continue;
+                    }
 
                     let now = Instant::now();
                     if diagnostics {
