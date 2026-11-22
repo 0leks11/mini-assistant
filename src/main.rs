@@ -1227,6 +1227,9 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    if recorder_for_mic.is_recording() {
+                        tracing::info!("main.rs: recorder_for_mic.is_recording() is TRUE, feeding chunk of {} bytes", chunk.len());
+                    }
                     recorder_for_mic.feed_pcm(&chunk);
 
                     let now = Instant::now();
