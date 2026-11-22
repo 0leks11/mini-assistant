@@ -23,7 +23,7 @@ def log(msg: str) -> None:
 
 
 class GptMiniAcousticClient:
-    def __init__(self, base_url: str, token: str, timeout: float = 10.0):
+    def __init__(self, base_url: str, token: str, timeout: float = 60.0):
         self.base_url = base_url.rstrip("/")
         self.token = token.strip()
         self.timeout = timeout
@@ -54,7 +54,7 @@ class GptMiniAcousticClient:
             url, data=body_bytes, headers=req_headers, method=method
         )
         try:
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 resp_bytes = resp.read()
                 if not resp_bytes:
                     return {"status": "ok"}
@@ -1249,7 +1249,9 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
 def main() -> None:
     base_url = os.environ.get("GPT_MINI_URL", "http://127.0.0.1:8080")
     token = os.environ.get("GPT_MINI_CALIBRATION_TOKEN", "")
-    client = GptMiniAcousticClient(base_url=base_url, token=token)
+    timeout_str = os.environ.get("GPT_MINI_TIMEOUT", "60.0")
+    timeout = float(timeout_str) if timeout_str else 60.0
+    client = GptMiniAcousticClient(base_url=base_url, token=token, timeout=timeout)
     log(f"Starting MCP stdio server targeting {base_url} (token present: {bool(token)})")
 
     for line in sys.stdin:
