@@ -1352,7 +1352,7 @@
       const recorder = audioContext.createScriptProcessor(bufferSize, 1, 1);
       const collectedSamples = [];
       let samplesCount = 0;
-      const targetSamples = 16000 * 2.5;
+      const targetSamples = 16000 * 3.8;
 
       recorder.onaudioprocess = (e) => {
         const input = e.inputBuffer.getChannelData(0);
@@ -1378,7 +1378,7 @@
           stream.getTracks().forEach(t => t.stop());
           finishPhoneRecording(collectedSamples);
         }
-      }, 2800);
+      }, 4100);
 
     } catch (err) {
       showToast("Ошибка микрофона телефона: " + err.message);

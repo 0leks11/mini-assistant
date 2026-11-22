@@ -18,7 +18,7 @@ use tracing::info;
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MIN_SAMPLES: usize = 4_800; // 300 ms
-pub const MAX_SAMPLES: usize = 48_000; // 3000 ms
+pub const MAX_SAMPLES: usize = 64_000; // 4000 ms
 pub const TARGET_STEPS: usize = 30;
 pub const MIN_STEPS: usize = 3;
 pub const MAX_TEMPLATES: usize = 8;
@@ -358,7 +358,7 @@ pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
     );
     ensure!(
         trimmed.len() <= MAX_SAMPLES,
-        "Запись слишком длинная ({:.1} с). Произносите только слово вызова (до 3 сек).",
+        "Запись слишком длинная ({:.1} с). Произносите только слово вызова (до 4 сек).",
         trimmed.len() as f64 / 16000.0
     );
 

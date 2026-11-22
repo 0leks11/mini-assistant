@@ -940,8 +940,8 @@ impl ControlCenterServer {
         let prev_color = self.current_led_color.read().await.clone();
         set_led_hardware("amber");
 
-        // Record 2.5 seconds of audio from Mini's hardware microphone
-        let record_res = recorder.record(Duration::from_millis(2500)).await;
+        // Record 3.8 seconds of audio from Mini's hardware microphone (accommodates compound words up to 5 syllables)
+        let record_res = recorder.record(Duration::from_millis(3800)).await;
 
         // Restore LED
         set_led_hardware(&prev_color);
