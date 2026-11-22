@@ -23,19 +23,19 @@ impl KeywordEngine {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            .unwrap_or(0.49);
+            .unwrap_or(0.38);
 
         let avg_threshold = std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.34);
+            .unwrap_or(0.19);
 
         let min_scores = std::env::var("MINI_WAKEWORD_MIN_SCORES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| (1..=20).contains(v))
-            .unwrap_or(12);
+            .unwrap_or(4);
 
         let score_mode = std::env::var("MINI_WAKEWORD_SCORE_MODE")
             .ok()
