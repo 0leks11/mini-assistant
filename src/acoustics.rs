@@ -292,7 +292,7 @@ pub fn save_settings(path: &Path, settings: &WakewordCalibrationConfig) -> Resul
 
 /// Soft gain at the shared mono PCM boundary, before enrollment, KWS and cloud.
 pub fn apply_gain(pcm: &mut [u8], gain: f32) {
-    for sample in pcm.chunks_exact_mut(2) {
+    for sample in pcm.as_chunks_mut::<2>().0 {
         let raw = i16::from_le_bytes([sample[0], sample[1]]);
         let scaled = (f32::from(raw) * gain)
             .round()
@@ -547,8 +547,10 @@ pub fn pcm_rms(pcm: &[u8]) -> f32 {
         return 0.0;
     }
     let sum: f64 = pcm
-        .chunks_exact(2)
-        .map(|v| f64::from(i16::from_le_bytes([v[0], v[1]])).powi(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| f64::from(i16::from_le_bytes(*v)).powi(2))
         .sum();
     (sum / count as f64).sqrt() as f32
 }

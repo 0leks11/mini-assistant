@@ -506,12 +506,12 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
 
     // 3. Centrality score: mean similarity to all other samples
     let mut centralities = vec![0.0f32; n];
-    for i in 0..n {
+    for (i, row) in matrix.iter().enumerate().take(n) {
         let mut sum = 0.0f32;
         let mut count = 0usize;
-        for j in 0..n {
+        for (j, &sim) in row.iter().enumerate().take(n) {
             if i != j {
-                sum += matrix[i][j];
+                sum += sim;
                 count += 1;
             }
         }

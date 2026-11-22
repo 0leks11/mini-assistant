@@ -277,12 +277,25 @@ fn save_reference(output: &Path, buffers: HashMap<String, Vec<u8>>) -> Result<Va
 }
 
 fn evaluate(reference_path: &Path, audio: &Path) -> Result<Value> {
+    evaluate_with_config(
+        reference_path,
+        audio,
+        &rustpotter::PersonalDetectorConfig::default(),
+    )
+}
+
+fn evaluate_with_config(
+    reference_path: &Path,
+    audio: &Path,
+    detector_config: &rustpotter::PersonalDetectorConfig,
+) -> Result<Value> {
     let reference =
         WakewordRef::load_from_file(reference_path.to_str().context("Invalid model path")?)
             .map_err(anyhow::Error::msg)?;
     let summary = reference_summary(&reference);
     let mut detector =
-        rustpotter::personal_reference_detector(reference).map_err(anyhow::Error::msg)?;
+        rustpotter::personal_reference_detector_with_config(reference, detector_config)
+            .map_err(anyhow::Error::msg)?;
     let bytes = read_bounded(audio, MAX_SOURCE_WAV_BYTES)?;
     let samples = decode_pcm(&bytes, 1, SAMPLE_RATE * 60)?;
     let samples_per_frame = detector.get_samples_per_frame();
@@ -663,12 +676,27 @@ mod tests {
                     .all(|offset| { offset.as_f64().unwrap() > padded_input_end_ms }));
             };
             check_offsets(&evaluated);
-            // End the WAV at the synthetic keyword's end. Non-eager detection
-            // completes during the synthetic tail, not at an alleged word boundary.
+            // Pin scheduling modes explicitly. The production default can be eager,
+            // so it must not be used to assert delayed countdown completion.
             let original = decode_pcm(&std::fs::read(&inputs[3])?, 1, 48000)?;
             let short = dir.join("short.wav");
             std::fs::write(&short, encode_pcm(&original[..26400])?)?;
-            let short_result = evaluate(&model, &short)?;
+            let eager = rustpotter::PersonalDetectorConfig {
+                eager: true,
+                ..Default::default()
+            };
+            let delayed = rustpotter::PersonalDetectorConfig {
+                eager: false,
+                ..Default::default()
+            };
+            let eager_short = evaluate_with_config(&model, &short, &eager)?;
+            assert!(eager_short["detections_in_audio"].as_u64().unwrap() > 0);
+            assert_eq!(eager_short["detections_in_synthetic_tail"], 0);
+            check_offsets(&eager_short);
+            // End the WAV at the synthetic keyword's end. Non-eager detection
+            // completes during the synthetic tail, not at an alleged word boundary.
+            let short_result = evaluate_with_config(&model, &short, &delayed)?;
+            assert_eq!(short_result["detections_in_audio"], 0);
             assert!(
                 short_result["detections_in_synthetic_tail"]
                     .as_u64()
@@ -685,6 +713,16 @@ mod tests {
                 silent_result["synthetic_tail_detection_offsets_ms"],
                 json!([])
             );
+            for settings in [&eager, &delayed] {
+                let silent_mode = evaluate_with_config(&model, &silence, settings)?;
+                assert_eq!(silent_mode["detections"], 0);
+                assert_eq!(silent_mode["detection_offsets_ms"], json!([]));
+                assert_eq!(
+                    silent_mode["synthetic_tail_detection_offsets_ms"],
+                    json!([])
+                );
+                check_offsets(&silent_mode);
+            }
             Ok(())
         })();
         std::fs::remove_dir_all(dir).unwrap();
