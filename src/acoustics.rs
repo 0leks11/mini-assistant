@@ -1,4 +1,5 @@
 //! Local acoustic settings and metadata. No microphone, provider or shell access.
+pub mod evaluator;
 pub mod jobs;
 pub mod profiles;
 pub mod samples;

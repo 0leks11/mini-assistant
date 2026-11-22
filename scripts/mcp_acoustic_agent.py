@@ -305,6 +305,33 @@ class GptMiniAcousticClient:
     def get_acoustic_job_events(self, job_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/v1/acoustics/jobs/{job_id}/events")
 
+    def get_acoustic_job_report(self, job_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/acoustics/jobs/{job_id}/report")
+
+    def evaluate_acoustic_candidate(
+        self,
+        settings: Optional[Dict[str, Any]] = None,
+        split: str = "calibration",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"split": split}
+        if settings is not None:
+            payload["settings"] = settings
+        return self._request("POST", "/api/v1/acoustics/evaluate", data=payload)
+
+    def search_acoustic_candidates(
+        self,
+        baseline: Optional[Dict[str, Any]] = None,
+        split: str = "calibration",
+        max_trials: int = 10,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "split": split,
+            "max_trials": max_trials,
+        }
+        if baseline is not None:
+            payload["baseline"] = baseline
+        return self._request("POST", "/api/v1/acoustics/search", data=payload)
+
 
 TOOLS = [
     {
@@ -703,6 +730,60 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "get_acoustic_job_report",
+        "description": "Fetch detailed measurement report for a completed acoustic job (linking stimulus, captured audio validity, recall, false alarms, sub-band frequency response, and timeline events).",
+        "inputSchema": {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "job_id": {"type": "string", "description": "Unique acoustic job ID"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "evaluate_acoustic_candidate",
+        "description": "Evaluate an acoustic configuration candidate on a fixed sample corpus (calibration/train/held_out), computing recall, miss rate, false alarms per hour, own-output leakage, duplicate triggers, and composite score.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "description": "Candidate acoustic settings (threshold, gain_ref, score_mode, band_pass, etc.)",
+                },
+                "split": {
+                    "type": "string",
+                    "enum": ["calibration", "train", "held_out"],
+                    "description": "Corpus split to evaluate against (default: calibration)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "search_acoustic_candidates",
+        "description": "Run bounded parameter grid/coordinate search (max 20 trials) on calibration corpus to find optimal threshold, gain_ref, score_mode, and band_pass settings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "baseline": {
+                    "type": "object",
+                    "description": "Optional baseline settings to search around",
+                },
+                "split": {
+                    "type": "string",
+                    "enum": ["calibration", "train"],
+                    "description": "Corpus split to optimize on (default: calibration)",
+                },
+                "max_trials": {
+                    "type": "integer",
+                    "description": "Maximum candidate evaluations to run (1-20, default 10)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -851,6 +932,19 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             )
         elif tool_name == "get_acoustic_job_events":
             result = client.get_acoustic_job_events(job_id=args.get("job_id", ""))
+        elif tool_name == "get_acoustic_job_report":
+            result = client.get_acoustic_job_report(job_id=args.get("job_id", ""))
+        elif tool_name == "evaluate_acoustic_candidate":
+            result = client.evaluate_acoustic_candidate(
+                settings=args.get("settings"),
+                split=args.get("split", "calibration"),
+            )
+        elif tool_name == "search_acoustic_candidates":
+            result = client.search_acoustic_candidates(
+                baseline=args.get("baseline"),
+                split=args.get("split", "calibration"),
+                max_trials=args.get("max_trials", 10),
+            )
         else:
             send_response(
                 {

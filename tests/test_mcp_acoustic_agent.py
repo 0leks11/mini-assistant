@@ -122,6 +122,9 @@ class TestMcpAcousticAgent(unittest.TestCase):
         self.assertIn("get_acoustic_job", tool_names)
         self.assertIn("cancel_acoustic_job", tool_names)
         self.assertIn("get_acoustic_job_events", tool_names)
+        self.assertIn("get_acoustic_job_report", tool_names)
+        self.assertIn("evaluate_acoustic_candidate", tool_names)
+        self.assertIn("search_acoustic_candidates", tool_names)
 
         # 3. Call get_acoustic_status
         proc.stdin.write(
@@ -234,6 +237,46 @@ class TestMcpAcousticAgent(unittest.TestCase):
         resp7 = json.loads(proc.stdout.readline())
         self.assertEqual(resp7["id"], 7)
         self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/jobs")
+
+        # 8. Call evaluate_acoustic_candidate
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "evaluate_acoustic_candidate",
+                        "arguments": {"split": "calibration"},
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp8 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp8["id"], 8)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/evaluate")
+
+        # 9. Call search_acoustic_candidates
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_acoustic_candidates",
+                        "arguments": {"max_trials": 5},
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp9 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp9["id"], 9)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/search")
 
         # Clean shutdown
         proc.stdin.close()

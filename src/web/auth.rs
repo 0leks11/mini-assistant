@@ -466,6 +466,32 @@ impl AuthManager {
             return Err(("403 Forbidden", "Forbidden: token lacks jobs scope"));
         }
 
+        // Acoustic evaluations and parameter search
+        let is_evaluation = (method == "POST")
+            && matches!(
+                path,
+                "/api/v1/acoustics/evaluate"
+                    | "/api/v1/calibration/evaluate"
+                    | "/api/v1/acoustics/search"
+                    | "/api/v1/calibration/search"
+            );
+
+        if is_evaluation {
+            if identity.has_scope(Scope::Jobs) || identity.has_scope(Scope::AcousticsWrite) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: evaluation and search require calibration identity or owner",
+                ));
+            }
+            return Err((
+                "403 Forbidden",
+                "Forbidden: token lacks jobs or acoustics_write scope",
+            ));
+        }
+
         // Static pages and public status
         if method == "GET"
             && matches!(

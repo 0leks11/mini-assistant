@@ -415,6 +415,7 @@ pub struct AcousticJobRunner {
     playback_sink: Arc<dyn AcousticPlaybackSink>,
     active_job: Arc<Mutex<Option<JobDetail>>>,
     history: Arc<Mutex<VecDeque<JobSummary>>>,
+    reports: Arc<Mutex<std::collections::HashMap<String, crate::acoustics::evaluator::JobReport>>>,
     cancel_flag: Arc<AtomicBool>,
     abort_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -433,6 +434,9 @@ impl AcousticJobRunner {
             playback_sink,
             active_job: Arc::new(Mutex::new(None)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_JOB_HISTORY))),
+            reports: Arc::new(Mutex::new(std::collections::HashMap::with_capacity(
+                MAX_JOB_HISTORY,
+            ))),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             abort_handle: Arc::new(Mutex::new(None)),
         })
@@ -501,6 +505,16 @@ impl AcousticJobRunner {
             }
         }
         None
+    }
+
+    pub fn get_report(&self, job_id: &str) -> Option<crate::acoustics::evaluator::JobReport> {
+        let guard = self.reports.lock().unwrap();
+        if let Some(rep) = guard.get(job_id) {
+            return Some(rep.clone());
+        }
+        drop(guard);
+        self.get_job(job_id)
+            .map(|detail| crate::acoustics::evaluator::generate_job_report(&detail, None))
     }
 
     /// Cancel active job idempotently. Stops playback, cancels recorder, marks job cancelled.
@@ -888,6 +902,16 @@ impl AcousticJobRunner {
             active.summary.kws_detections_count = kws_detections;
             active.summary.events_count = events.len();
             active.events = events;
+
+            let report =
+                crate::acoustics::evaluator::generate_job_report(&active, Some(&captured_samples));
+            {
+                let mut reps = self.reports.lock().unwrap();
+                if reps.len() >= MAX_JOB_HISTORY {
+                    reps.clear();
+                }
+                reps.insert(job_id.clone(), report);
+            }
 
             let mut hist = self.history.lock().unwrap();
             if hist.len() >= MAX_JOB_HISTORY {

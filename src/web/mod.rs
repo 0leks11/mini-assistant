@@ -680,6 +680,12 @@ impl ControlCenterServer {
                     } else {
                         self.send_not_found(&mut stream).await?;
                     }
+                } else if let Some(job_id) = sub.strip_suffix("/report") {
+                    if m == "GET" {
+                        self.handle_api_get_job_report(&mut stream, job_id).await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
                 } else if let Some(job_id) = sub.strip_suffix("/events") {
                     if m == "GET" {
                         self.handle_api_get_job_events(&mut stream, job_id).await?;
@@ -691,6 +697,14 @@ impl ControlCenterServer {
                 } else {
                     self.send_not_found(&mut stream).await?;
                 }
+            }
+
+            // Acoustic Evaluation & Search
+            ("POST", "/api/v1/acoustics/evaluate") | ("POST", "/api/v1/calibration/evaluate") => {
+                self.handle_api_evaluate(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/acoustics/search") | ("POST", "/api/v1/calibration/search") => {
+                self.handle_api_search(&mut stream, body).await?;
             }
 
             // Spotify OAuth PKCE Flow
@@ -2520,6 +2534,158 @@ impl ControlCenterServer {
                 }),
             )
             .await
+        }
+    }
+
+    async fn handle_api_get_job_report(&self, stream: &mut TcpStream, job_id: &str) -> Result<()> {
+        match self.job_runner.get_report(job_id) {
+            Some(report) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "report": report,
+                    }),
+                )
+                .await
+            }
+            None => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Report for job '{job_id}' not found")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_evaluate(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct EvaluateReq {
+            #[serde(default)]
+            settings: Option<crate::acoustics::AcousticSettingsDto>,
+            #[serde(default)]
+            split: Option<String>,
+        }
+
+        let req: EvaluateReq = serde_json::from_str(body).unwrap_or(EvaluateReq {
+            settings: None,
+            split: None,
+        });
+
+        let split = match req.split.as_deref() {
+            Some("train") => crate::acoustics::samples::SampleSplit::Train,
+            Some("held_out") | Some("heldout") => crate::acoustics::samples::SampleSplit::HeldOut,
+            _ => crate::acoustics::samples::SampleSplit::Calibration,
+        };
+
+        let baseline_config = if let Some(ref lab) = self.acoustic_lab {
+            lab.snapshot().saved
+        } else {
+            crate::config::WakewordCalibrationConfig::default()
+        };
+
+        let config = if let Some(dto) = req.settings {
+            dto.into()
+        } else {
+            baseline_config
+        };
+
+        let evaluator = crate::acoustics::evaluator::AcousticEvaluator::new(
+            self.samples_store.clone(),
+            Some(self.wakeword_model_path.clone()),
+        );
+
+        match evaluator.evaluate_candidate(&config, split) {
+            Ok(report) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "evaluation": report,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Evaluation failed: {e}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_search(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct SearchReq {
+            #[serde(default)]
+            baseline: Option<crate::acoustics::AcousticSettingsDto>,
+            #[serde(default)]
+            split: Option<String>,
+            #[serde(default)]
+            max_trials: Option<usize>,
+        }
+
+        let req: SearchReq = serde_json::from_str(body).unwrap_or(SearchReq {
+            baseline: None,
+            split: None,
+            max_trials: None,
+        });
+
+        let split = match req.split.as_deref() {
+            Some("train") => crate::acoustics::samples::SampleSplit::Train,
+            Some("held_out") | Some("heldout") => crate::acoustics::samples::SampleSplit::HeldOut,
+            _ => crate::acoustics::samples::SampleSplit::Calibration,
+        };
+
+        let baseline_config = if let Some(dto) = req.baseline {
+            dto.into()
+        } else if let Some(ref lab) = self.acoustic_lab {
+            lab.snapshot().saved
+        } else {
+            crate::config::WakewordCalibrationConfig::default()
+        };
+
+        let max_trials = req.max_trials.unwrap_or(10);
+
+        let evaluator = Arc::new(crate::acoustics::evaluator::AcousticEvaluator::new(
+            self.samples_store.clone(),
+            Some(self.wakeword_model_path.clone()),
+        ));
+        let searcher = crate::acoustics::evaluator::AcousticSearcher::new(evaluator);
+
+        match searcher.search(&baseline_config, split, max_trials) {
+            Ok(report) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "search": report,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Search failed: {e}")
+                    }),
+                )
+                .await
+            }
         }
     }
 
@@ -4727,6 +4893,191 @@ capture_device = "hw:0,2"
         let anon_req = format!(
             "POST /api/v1/acoustics/jobs HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             local_addr, valid_body.len(), valid_body
+        );
+        let (code, _) = send_req(local_addr, &anon_req).await;
+        assert_eq!(code, 401);
+
+        // Cleanup
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_http_acoustic_evaluations_and_reports() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("mini_test_eval_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let auth_manager = Arc::new(AuthManager::new(Some("test_owner_secret".to_string())));
+        let (_token_secret, cal_token) = auth_manager.issue_calibration_token(
+            "test_eval_agent".into(),
+            std::time::Duration::from_secs(3600),
+            std::collections::HashSet::from([
+                Scope::Jobs,
+                Scope::Samples,
+                Scope::AcousticsRead,
+                Scope::AcousticsWrite,
+            ]),
+            crate::web::auth::CalibrationLease::default(),
+        );
+        let token = &cal_token.token;
+
+        let samples_store =
+            Arc::new(crate::acoustics::samples::SamplesStore::new(temp_dir.clone()).unwrap());
+        let (lab, _rx) =
+            crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        let mock_sink = Arc::new(crate::acoustics::jobs::MockPlaybackSink::new(false));
+        let job_runner = crate::acoustics::jobs::AcousticJobRunner::new(
+            samples_store.clone(),
+            lab.clone(),
+            None,
+            mock_sink.clone(),
+        );
+
+        let server = Arc::new(
+            ControlCenterServer::new(
+                None,
+                "dummy_client".to_string(),
+                "http://localhost/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                Arc::new(crate::spotify::ducking::MusicDucker::new()),
+            )
+            .with_auth_manager(auth_manager)
+            .with_samples_store(samples_store)
+            .with_acoustic_lab(lab)
+            .with_job_runner(job_runner),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let s = String::from_utf8_lossy(&buf);
+            let code = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let json_body = s
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b.trim()).ok())
+                .unwrap_or(serde_json::Value::Null);
+            (code, json_body)
+        }
+
+        // 1. Upload a calibration sample
+        let pcm = vec![3000i16; 8000];
+        let wav = crate::acoustics::samples::encode_wav_pcm16_mono(&pcm).unwrap();
+        use base64::Engine;
+        let b64 = base64::prelude::BASE64_STANDARD.encode(&wav);
+        let sample_body = serde_json::json!({
+            "name": "eval_pos_sample",
+            "label": "positive",
+            "split": "calibration",
+            "wav_base64": b64
+        })
+        .to_string();
+        let req_smp = format!(
+            "POST /api/v1/acoustics/samples HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, sample_body.len(), sample_body
+        );
+        let (code, _smp_resp) = send_req(local_addr, &req_smp).await;
+        assert_eq!(code, 200);
+
+        // 2. POST /api/v1/acoustics/evaluate
+        let eval_body = serde_json::json!({
+            "split": "calibration"
+        })
+        .to_string();
+        let req_eval = format!(
+            "POST /api/v1/acoustics/evaluate HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, eval_body.len(), eval_body
+        );
+        let (code, eval_resp) = send_req(local_addr, &req_eval).await;
+        assert_eq!(code, 200);
+        assert_eq!(eval_resp["status"], "ok");
+        assert_eq!(eval_resp["evaluation"]["total_samples"], 1);
+        assert_eq!(eval_resp["evaluation"]["positive_samples"], 1);
+
+        // 3. POST /api/v1/acoustics/search
+        let search_body = serde_json::json!({
+            "split": "calibration",
+            "max_trials": 4
+        })
+        .to_string();
+        let req_srch = format!(
+            "POST /api/v1/acoustics/search HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, search_body.len(), search_body
+        );
+        let (code, srch_resp) = send_req(local_addr, &req_srch).await;
+        assert_eq!(code, 200);
+        assert_eq!(srch_resp["status"], "ok");
+        assert_eq!(srch_resp["search"]["total_trials"], 4);
+        assert_eq!(
+            srch_resp["search"]["ranked_candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+
+        // 4. Start job and get its report
+        let job_body = serde_json::json!({
+            "name": "job_for_report",
+            "stimulus_origin": "ambient",
+            "output_route": "none",
+            "stimulus": {
+                "type": "silence",
+                "duration_ms": 200
+            },
+            "pre_roll_ms": 100,
+            "post_roll_ms": 100,
+            "volume_pct": 0
+        })
+        .to_string();
+        let req_job = format!(
+            "POST /api/v1/acoustics/jobs HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, job_body.len(), job_body
+        );
+        let (code, job_resp) = send_req(local_addr, &req_job).await;
+        assert_eq!(code, 201);
+        let job_id = job_resp["job"]["job_id"].as_str().unwrap().to_string();
+
+        // Wait for job to finish
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let req_rep = format!(
+            "GET /api/v1/acoustics/jobs/{}/report HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            job_id, local_addr, token
+        );
+        let (code, rep_resp) = send_req(local_addr, &req_rep).await;
+        assert_eq!(code, 200);
+        assert_eq!(rep_resp["status"], "ok");
+        assert_eq!(rep_resp["report"]["job_id"], job_id);
+
+        // 5. Anonymous evaluate request -> 401 Unauthorized
+        let anon_req = format!(
+            "POST /api/v1/acoustics/evaluate HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, eval_body.len(), eval_body
         );
         let (code, _) = send_req(local_addr, &anon_req).await;
         assert_eq!(code, 401);
