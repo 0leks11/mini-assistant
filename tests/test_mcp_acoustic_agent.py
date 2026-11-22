@@ -117,6 +117,11 @@ class TestMcpAcousticAgent(unittest.TestCase):
         self.assertIn("update_sample", tool_names)
         self.assertIn("archive_sample", tool_names)
         self.assertIn("delete_sample", tool_names)
+        self.assertIn("list_acoustic_jobs", tool_names)
+        self.assertIn("start_acoustic_job", tool_names)
+        self.assertIn("get_acoustic_job", tool_names)
+        self.assertIn("cancel_acoustic_job", tool_names)
+        self.assertIn("get_acoustic_job_events", tool_names)
 
         # 3. Call get_acoustic_status
         proc.stdin.write(
@@ -176,6 +181,59 @@ class TestMcpAcousticAgent(unittest.TestCase):
         resp5 = json.loads(proc.stdout.readline())
         self.assertEqual(resp5["id"], 5)
         self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/samples?split=train")
+
+        # 6. Call start_acoustic_job
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_acoustic_job",
+                        "arguments": {
+                            "stimulus_origin": "own_output",
+                            "output_route": "built_in",
+                            "stimulus": {
+                                "type": "chirp_sweep",
+                                "start_hz": 200.0,
+                                "end_hz": 2000.0,
+                                "duration_ms": 500,
+                                "volume_dbfs": -12.0,
+                            },
+                            "pre_roll_ms": 200,
+                            "post_roll_ms": 300,
+                            "volume_pct": 50,
+                            "name": "mcp_test_sweep",
+                        },
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp6 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp6["id"], 6)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/jobs")
+        self.assertIn('"stimulus_origin": "own_output"', self.mock_server.last_body)
+        self.assertIn('"mcp_test_sweep"', self.mock_server.last_body)
+
+        # 7. Call list_acoustic_jobs
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {"name": "list_acoustic_jobs"},
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp7 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp7["id"], 7)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/jobs")
 
         # Clean shutdown
         proc.stdin.close()

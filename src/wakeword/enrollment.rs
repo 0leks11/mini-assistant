@@ -52,6 +52,13 @@ impl HardwareRecorder {
         self.state.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
+    /// Cancels any active hardware recording, dropping the sender and resetting state.
+    pub fn cancel(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            *guard = None;
+        }
+    }
+
     /// Taps into incoming PCM chunks from the hardware microphone.
     /// Non-blocking check: if no recording is requested, returns immediately.
     pub fn feed_pcm(&self, chunk: &[u8]) {
@@ -112,7 +119,7 @@ impl HardwareRecorder {
                 );
                 Ok(samples)
             }
-            Ok(Err(_)) => bail!("Hardware recording channel closed unexpectedly"),
+            Ok(Err(_)) => bail!("Hardware recording cancelled or channel closed"),
             Err(_) => {
                 let mut guard = self
                     .state

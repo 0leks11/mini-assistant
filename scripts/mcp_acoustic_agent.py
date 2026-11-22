@@ -267,6 +267,44 @@ class GptMiniAcousticClient:
     def delete_sample(self, sample_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/api/v1/acoustics/samples/{sample_id}")
 
+    def list_acoustic_jobs(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/acoustics/jobs")
+
+    def start_acoustic_job(
+        self,
+        stimulus_origin: str,
+        output_route: str,
+        stimulus: Dict[str, Any],
+        pre_roll_ms: int = 500,
+        post_roll_ms: int = 1000,
+        volume_pct: int = 40,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "stimulus_origin": stimulus_origin,
+            "output_route": output_route,
+            "stimulus": stimulus,
+            "pre_roll_ms": pre_roll_ms,
+            "post_roll_ms": post_roll_ms,
+            "volume_pct": volume_pct,
+        }
+        if name is not None:
+            payload["name"] = name
+        return self._request("POST", "/api/v1/acoustics/jobs", data=payload)
+
+    def get_acoustic_job(self, job_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/acoustics/jobs/{job_id}")
+
+    def cancel_acoustic_job(
+        self, job_id: str, reason: str = "Cancelled by agent"
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST", f"/api/v1/acoustics/jobs/{job_id}/cancel", data={"reason": reason}
+        )
+
+    def get_acoustic_job_events(self, job_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/acoustics/jobs/{job_id}/events")
+
 
 TOOLS = [
     {
@@ -578,6 +616,93 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "list_acoustic_jobs",
+        "description": "List current active acoustic job (if running) and recent job history on GPT Mini.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "start_acoustic_job",
+        "description": "Start a synchronized acoustic test job: captures pre-roll background, emits stimulus, drains playback, and captures reverberation tail. Only 1 job can be active at a time.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["stimulus_origin", "output_route", "stimulus"],
+            "properties": {
+                "stimulus_origin": {
+                    "type": "string",
+                    "enum": ["external_user_position", "own_output", "ambient"],
+                    "description": "Origin of sound stimulus: external speaker (at 2m user position), own speaker (barge-in / self-interruption test), or ambient noise",
+                },
+                "output_route": {
+                    "type": "string",
+                    "enum": ["built_in", "aux_out", "none"],
+                    "description": "Output route: built_in speaker, aux_out (3.5mm line jack), or none",
+                },
+                "stimulus": {
+                    "type": "object",
+                    "description": "Stimulus signal: sample ({type: 'sample', sample_id: '...'}), chirp_sweep ({type: 'chirp_sweep', start_hz: 200, end_hz: 2000, duration_ms: 1000, volume_dbfs: -12.0}), or silence ({type: 'silence', duration_ms: 1000})",
+                },
+                "pre_roll_ms": {
+                    "type": "integer",
+                    "description": "Duration of microphone capture before playback starts (100-2000 ms, default 500)",
+                },
+                "post_roll_ms": {
+                    "type": "integer",
+                    "description": "Duration of reverberation tail capture after playback finishes (100-5000 ms, default 1000)",
+                },
+                "volume_pct": {
+                    "type": "integer",
+                    "description": "Volume percentage for playback (0-80%, default 40)",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional friendly job name",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_acoustic_job",
+        "description": "Fetch status, timestamps, captured audio metrics, and KWS detection count for an acoustic job.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "job_id": {"type": "string", "description": "Unique acoustic job ID"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "cancel_acoustic_job",
+        "description": "Immediately cancel a running acoustic job, stopping audio playback and microphone capture.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "job_id": {"type": "string", "description": "Unique acoustic job ID to cancel"},
+                "reason": {"type": "string", "description": "Optional cancellation reason"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_acoustic_job_events",
+        "description": "Get raw KWS observation and detection events occurred during a specific acoustic job.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "job_id": {"type": "string", "description": "Unique acoustic job ID"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -705,6 +830,27 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             result = client.archive_sample(sample_id=args.get("sample_id", ""))
         elif tool_name == "delete_sample":
             result = client.delete_sample(sample_id=args.get("sample_id", ""))
+        elif tool_name == "list_acoustic_jobs":
+            result = client.list_acoustic_jobs()
+        elif tool_name == "start_acoustic_job":
+            result = client.start_acoustic_job(
+                stimulus_origin=args.get("stimulus_origin", ""),
+                output_route=args.get("output_route", ""),
+                stimulus=args.get("stimulus", {}),
+                pre_roll_ms=args.get("pre_roll_ms", 500),
+                post_roll_ms=args.get("post_roll_ms", 1000),
+                volume_pct=args.get("volume_pct", 40),
+                name=args.get("name"),
+            )
+        elif tool_name == "get_acoustic_job":
+            result = client.get_acoustic_job(job_id=args.get("job_id", ""))
+        elif tool_name == "cancel_acoustic_job":
+            result = client.cancel_acoustic_job(
+                job_id=args.get("job_id", ""),
+                reason=args.get("reason", "Cancelled by agent"),
+            )
+        elif tool_name == "get_acoustic_job_events":
+            result = client.get_acoustic_job_events(job_id=args.get("job_id", ""))
         else:
             send_response(
                 {

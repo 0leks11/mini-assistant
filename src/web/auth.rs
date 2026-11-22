@@ -427,6 +427,45 @@ impl AuthManager {
             return Err(("403 Forbidden", "Forbidden: token lacks samples scope"));
         }
 
+        // Acoustic jobs read endpoints (list, details, events)
+        let is_job_read = (method == "GET")
+            && (path.starts_with("/api/v1/acoustics/jobs")
+                || path.starts_with("/api/v1/calibration/jobs"));
+
+        if is_job_read {
+            if identity.has_scope(Scope::Jobs) || identity.has_scope(Scope::AcousticsRead) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: reading jobs requires calibration identity or owner",
+                ));
+            }
+            return Err((
+                "403 Forbidden",
+                "Forbidden: token lacks jobs or acoustics_read scope",
+            ));
+        }
+
+        // Acoustic jobs mutation endpoints (start, cancel)
+        let is_job_write = (method == "POST")
+            && (path.starts_with("/api/v1/acoustics/jobs")
+                || path.starts_with("/api/v1/calibration/jobs"));
+
+        if is_job_write {
+            if identity.has_scope(Scope::Jobs) {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: job actions require calibration identity with jobs scope",
+                ));
+            }
+            return Err(("403 Forbidden", "Forbidden: token lacks jobs scope"));
+        }
+
         // Static pages and public status
         if method == "GET"
             && matches!(

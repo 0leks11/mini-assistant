@@ -570,6 +570,18 @@ async fn main() -> Result<()> {
                 wakeword_enabled,
             )
             .with_acoustic_lab(acoustic_lab.clone());
+
+            let playback_sink = Arc::new(acoustics::jobs::RealPlaybackSink::new(
+                playback.clone(),
+                false, // AUX route is unverified until hardware test
+            ));
+            let job_runner = acoustics::jobs::AcousticJobRunner::new(
+                web_server.samples_store(),
+                acoustic_lab.clone(),
+                Some(hardware_recorder.clone()),
+                playback_sink,
+            );
+            let web_server = web_server.with_job_runner(job_runner);
             let current_led_color_holder = web_server.current_led_color();
 
             // 4d2. Start VL53L0 proximity relative gesture volume task with visual & acoustic click indicators
