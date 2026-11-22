@@ -1,5 +1,8 @@
 # Build artifacts
 /target/
+**/target/
+__pycache__/
+*.pyc
 mini_pcm_sink
 mini_pcm_source
 

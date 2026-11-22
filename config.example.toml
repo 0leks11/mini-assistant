@@ -61,3 +61,42 @@ url = "http://192.168.1.113:8123"        # Raspberry Pi address
 # dns_port = 53
 # portal_port = 80
 
+# Acoustic Lab: persisted settings take priority over legacy MINI_* env tuning.
+# Defaults are starting values, not a claim of acoustic acceptance in your room.
+[wakeword]
+enabled = true
+shadow_mode = false                      # local detection only; no cloud turns/chime/tools
+threshold = 0.38                         # conditional detector score, NOT probability/percent
+avg_threshold = 0.19                     # score against averaged MFCC features
+min_scores = 4                          # positive scores within detector countdown
+score_mode = "max"                       # max, avg, median, p25, p50, p75, p80, p90, p95
+eager = true
+score_ref = 0.22
+dtw_band_size = 5
+
+gain_normalizer = true                   # software filter on KWS input, not hardware gain
+gain_min = 0.1
+gain_max = 6.0
+# gain_ref = 0.003                       # normalized RMS (0,1]; omit for enrolled RMS
+band_pass = false
+band_low_hz = 80.0
+band_high_hz = 7500.0
+
+vad_threshold = 45.0                     # raw PCM RMS; cannot activate idle wake-word gate
+vad_noise_adaptation = true
+vad_noise_multiplier = 1.15
+vad_noise_offset = 10.0
+vad_rise_alpha = 0.02
+vad_fall_alpha = 0.10
+vad_onset_frames = 3
+mic_gain = 1.0                           # gain on authorized cloud PCM AFTER local detection
+
+pre_roll_ms = 400
+silence_timeout_ms = 1100
+initial_silence_timeout_ms = 1800
+max_utterance_secs = 8
+echo_tail_ms = 800
+startup_suppression_ms = 2000
+manual_activation_secs = 8
+followup_timeout_secs = 0                # zero requires a new wake-word for each turn
+wake_chime = false

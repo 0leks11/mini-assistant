@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="same-origin">
+  <title>GPT Mini — Акустическая лаборатория</title>
+  <style>
+    :root { --bg:#0b1018; --surface:#141d29; --surface2:#101722; --line:#29384b; --text:#edf2f9; --muted:#9cacc0; --accent:#88b7ff; --green:#76d9b0; --amber:#f0c17b; --red:#ff9caa; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; scroll-padding-top:24px; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,input,select { font:inherit; }
+    button,a,input,select { -webkit-tap-highlight-color:transparent; }
+    a { color:var(--accent); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    button { min-height:44px; border:1px solid var(--line); border-radius:10px; background:#1c2a3d; color:var(--text); padding:9px 14px; cursor:pointer; }
+    button:hover:not(:disabled) { border-color:var(--accent); background:#24374e; }
+    button:disabled { opacity:.45; cursor:default; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#0d203d; font-weight:700; }
+    :focus-visible { outline:3px solid var(--accent); outline-offset:4px; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:clamp(26px,4vw,36px); letter-spacing:-.8px; line-height:1.2; margin:12px 0; }
+    h2 { font-size:20px; letter-spacing:-.3px; }
+    h3 { font-size:15px; }
+    small,.muted { color:var(--muted); }
+    .shell { max-width:1200px; padding:28px 24px 130px; margin:auto; }
+    .topline { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; font-size:13px; }
+    .brand { color:var(--text); font-weight:700; letter-spacing:.4px; }
+    .intro { max-width:760px; color:var(--muted); }
+    .compact-monitor { display:none; }
+    .badge { display:inline-flex; align-items:center; gap:7px; background:#202a38; color:var(--muted); border:1px solid var(--line); border-radius:30px; padding:5px 11px; font-size:12px; white-space:nowrap; }
+    .badge::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
+    .badge[data-tone=good] { color:var(--green); }
+    .badge[data-tone=warn] { color:var(--amber); }
+    .badge[data-tone=bad] { color:var(--red); }
+    .layout { display:grid; grid-template-columns:minmax(0,1fr) 310px; gap:24px; align-items:start; margin-top:24px; }
+    .workspace { min-width:0; }
+    .card { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:22px; margin-bottom:18px; }
+    .card-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:6px; }
+    .section-desc { color:var(--muted); font-size:13px; margin-bottom:20px; }
+    .tabs { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:18px; }
+    .tabs a { color:var(--muted); padding:7px 12px; border:1px solid var(--line); border-radius:24px; font-size:13px; }
+    .tabs a:hover { color:var(--text); border-color:var(--accent); text-decoration:none; }
+    .control { padding:18px 0; border-top:1px solid var(--line); }
+    .control:first-child { padding-top:0; border-top:0; }
+    .control-label { display:flex; justify-content:space-between; align-items:center; gap:14px; }
+    .control-label label { font-weight:600; }
+    .control-help { margin-top:6px; color:var(--muted); font-size:12px; max-width:590px; }
+    .control-tools { display:flex; gap:12px; align-items:center; margin-top:13px; }
+    input[type=number],select { color:var(--text); background:var(--surface2); border:1px solid #3b4d65; border-radius:8px; padding:9px 10px; min-height:44px; }
+    input[type=number] { width:108px; flex:0 0 108px; }
+    input[type=number]:invalid { border-color:var(--red); }
+    input[type=range] { width:100%; min-width:60px; height:28px; accent-color:var(--accent); cursor:pointer; }
+    select { max-width:100%; width:100%; }
+    .unit { color:var(--muted); font-size:12px; flex:0 0 auto; }
+    .switch { display:inline-flex; align-items:center; gap:9px; cursor:pointer; font-size:13px; color:var(--muted); }
+    .switch input { width:21px; height:21px; accent-color:var(--accent); margin:0; cursor:pointer; }
+    .range-limits { display:flex; justify-content:space-between; margin:4px 120px 0 0; color:var(--muted); font-size:11px; }
+    .field-meta { margin-top:9px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+    .field-meta.changed { color:var(--amber); }
+    .notice { border:1px solid #5d503c; background:#29241b; color:#f5d49e; border-radius:10px; padding:12px 14px; font-size:13px; margin-bottom:16px; }
+    .notice[data-tone=bad] { background:#301d27; border-color:#68404c; color:var(--red); }
+    .notice[data-tone=good] { background:#162b28; border-color:#33594e; color:var(--green); }
+    [hidden] { display:none !important; }
+    .monitor { position:sticky; top:20px; }
+    .monitor .card { padding:18px; }
+    .monitor-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:16px; }
+    .model-name { font-size:20px; font-weight:650; overflow-wrap:anywhere; margin:5px 0 15px; }
+    .meter-label { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-top:13px; }
+    .meter-label output { color:var(--text); font-variant-numeric:tabular-nums; }
+    meter { display:block; width:100%; height:12px; margin:4px 0; accent-color:var(--accent); }
+    .facts { display:grid; grid-template-columns:1fr auto; gap:8px 15px; font-size:12px; margin:18px 0 0; }
+    .facts dt { color:var(--muted); }
+    .facts dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; max-width:150px; }
+    .counter-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .counter { padding:12px; background:var(--surface2); border:1px solid var(--line); border-radius:10px; }
+    .counter output { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+    .counter span { display:block; font-size:11px; color:var(--muted); }
+    .side-note { color:var(--muted); font-size:12px; margin-top:14px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+    .toolbar button { font-size:13px; }
+    .capability { padding:11px 0; border-top:1px solid var(--line); font-size:13px; }
+    .capability:first-child { border:0; padding-top:0; }
+    .capability strong { display:block; font-size:12px; color:var(--muted); font-weight:500; }
+    .capability small { display:block; margin-top:4px; font-size:11px; }
+    .actions { position:fixed; z-index:10; left:0; right:0; bottom:0; background:rgba(11,16,24,.96); border-top:1px solid var(--line); backdrop-filter:blur(12px); }
+    .action-inner { max-width:1200px; margin:auto; padding:14px 24px; display:flex; align-items:center; justify-content:space-between; gap:18px; }
+    .action-status { min-width:0; font-size:13px; }
+    .action-status strong { display:block; font-weight:600; }
+    .action-status span { color:var(--muted); font-size:12px; }
+    .action-buttons { display:flex; gap:9px; flex:0 0 auto; }
+    .empty { color:var(--muted); padding:26px 0; }
+    .spinner { display:inline-block; width:13px; height:13px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .8s linear infinite; margin-right:7px; vertical-align:-2px; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } .spinner { animation:none; } }
+    @media (max-width:880px) { .layout { grid-template-columns:1fr; } .monitor { position:static; display:grid; grid-template-columns:1fr 1fr; gap:16px; } .monitor .card { margin:0; } .monitor .card:last-child { grid-column:1/-1; } .compact-monitor { display:flex; justify-content:space-between; gap:12px; position:sticky; top:0; z-index:8; margin-top:18px; padding:10px 13px; border:1px solid var(--line); border-radius:10px; background:rgba(20,29,41,.97); font-size:12px; } .compact-monitor span { color:var(--muted); } .compact-monitor output { display:block; color:var(--text); font-variant-numeric:tabular-nums; } }
+    @media (max-width:540px) { .shell { padding:20px 14px 150px; } .layout { gap:10px; margin-top:18px; } .card { padding:17px; } .monitor { display:block; } .monitor .card { margin-bottom:14px; } .control-tools { gap:9px; } input[type=number] { width:90px; flex-basis:90px; } .range-limits { margin-right:104px; } .action-inner { padding:12px 14px; flex-wrap:wrap; gap:9px; } .action-buttons { width:100%; } .action-buttons button { flex:1; } .action-status { width:100%; } .topline { font-size:12px; } }
+    @media print { body { background:white; color:black; } .shell { padding:0; } .actions,.tabs,.toolbar,button,.topline a { display:none; } .layout { display:block; } .card { background:white; border-color:#aaa; break-inside:avoid; } .monitor { position:static; } input,select { color:black !important; background:white !important; } .control-help,.section-desc,small,.muted { color:#444; } }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header>
+    <div class="topline"><a href="/">← Центр управления</a><span class="brand">GPT Mini / Акустика</span><span class="badge" id="connection-badge">Подключение…</span></div>
+    <h1>Акустическая лаборатория</h1>
+    <p class="intro">Слово вызова, фильтры и границы голосовой реплики — в одном профиле. Изменяйте параметры, сравнивайте отклик и сохраняйте подходящий вариант.</p>
+  </header>
+  <div class="compact-monitor" aria-label="Краткие живые показатели"><span>Микрофон<output id="compact-rms">—</output></span><span>Балл KWS<output id="compact-score">—</output></span><span>Связь<output id="compact-state">Подключение…</output></span></div>
+  <div class="layout">
+    <div class="workspace">
+      <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="conflict" class="notice" hidden>На GPT Mini уже применён другой профиль. Ваши изменения сохранены в форме. Вернитесь к работающему профилю, затем внесите их заново.</div>
+      <nav class="tabs" id="sections-nav" aria-label="Разделы акустических настроек"></nav>
+      <form id="settings-form" novalidate>
+        <div id="controls"><div class="card empty">Получаем параметры и допустимые диапазоны с GPT Mini…</div></div>
+      </form>
+      <section class="card" aria-labelledby="profiles-title">
+        <h2 id="profiles-title">Профили для сравнения</h2>
+        <p class="section-desc">Экспорт содержит только акустические параметры. Импорт и значения по умолчанию меняют форму — на колонку они попадут только после «Применить».</p>
+        <div class="toolbar">
+          <button type="button" id="export-btn" disabled>Скачать профиль</button>
+          <button type="button" id="import-btn" disabled>Загрузить профиль</button>
+          <button type="button" id="defaults-btn" disabled>Значения по умолчанию</button>
+          <button type="button" id="print-btn" disabled>Печать настроек</button>
+        </div>
+        <input type="file" id="profile-file" accept="application/json,.json" hidden>
+        <p class="side-note">Значения по умолчанию — исходная точка, а не обещание лучшего распознавания. Подходящий профиль проверяется и на обращениях, и на обычном фоне.</p>
+      </section>
+      <section class="card" aria-labelledby="capabilities-title">
+        <h2 id="capabilities-title">Аудиотракт и фиксированные ограничения</h2>
+        <p class="section-desc">Здесь видны параметры, которые этот экран не меняет, и причины ограничений.</p>
+        <div id="capabilities" class="empty">Загрузка…</div>
+      </section>
+    </div>
+    <aside class="monitor" aria-label="Живые показатели">
+      <section class="card">
+        <div class="monitor-head"><h2>Сейчас на Mini</h2><span id="runtime-badge" class="badge">Ожидание</span></div>
+        <small>Активная акустическая модель</small><p id="model-name" class="model-name">—</p>
+        <div class="meter-label"><label for="rms-meter">Уровень микрофона</label><output id="rms-value">—</output></div><meter id="rms-meter" min="0" max="1000" value="0"></meter>
+        <div class="meter-label"><label for="score-meter">Балл кандидата</label><output id="score-value">—</output></div><meter id="score-meter" min="0" max="0.75" value="0"></meter>
+        <dl class="facts">
+          <dt>Усреднённый шаблон</dt><dd id="avg-value">—</dd>
+          <dt>Оценка шумового фона</dt><dd id="noise-value">—</dd>
+          <dt>Текущий порог VAD</dt><dd id="vad-value">—</dd>
+          <dt>Режим</dt><dd id="mode-value">—</dd>
+          <dt>Применённая ревизия</dt><dd id="revision-value">—</dd>
+          <dt>Обновление</dt><dd id="updated-value">—</dd>
+        </dl>
+        <p class="side-note">Балл — внутренняя мера сходства, не вероятность и не процент. VAD определяет речь внутри открытой реплики; он не заменяет слово вызова.</p>
+      </section>
+      <section class="card">
+        <h2 style="margin-bottom:14px">События сеанса</h2>
+        <div class="counter-grid">
+          <div class="counter"><output id="candidate-count">—</output><span>Кандидаты KWS</span></div>
+          <div class="counter"><output id="keyword-count">—</output><span>Слово распознано</span></div>
+          <div class="counter"><output id="opened-count">—</output><span>Диалоги открыты</span></div>
+          <div class="counter"><output id="suppressed-count">—</output><span>Активации отклонены</span></div>
+          <div class="counter"><output id="shadow-count">—</output><span>Теневые срабатывания</span></div>
+        </div>
+        <p class="side-note">Счётчики показывают работу текущего процесса, а не точность распознавания. Для оценки отметьте, где вы действительно произносили слово.</p>
+      </section>
+      <section class="card">
+        <h3>Порядок настройки</h3>
+        <p class="side-note">Сохраните исходный профиль. Меняйте одну группу параметров за раз. В теневом режиме проверяйте обращения и бытовой фон, затем сравнивайте результаты. Этот экран не запускает запись аудио.</p>
+      </section>
+    </aside>
+  </div>
+</main>
+<footer class="actions"><div class="action-inner"><div class="action-status" aria-live="polite"><strong id="form-status">Загрузка параметров…</strong><span id="form-detail">Ничего не изменено</span></div><div class="action-buttons"><button type="button" id="revert-btn" disabled>Вернуть работающие</button><button type="submit" form="settings-form" class="primary" id="apply-btn" disabled>Применить</button></div></div></footer>
+<script>
+"use strict";
+
+function settingsEqual(a, b) {
+  if (!a || !b) return a === b;
+  const keys = Object.keys(a).sort();
+  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && a[key] === b[key]);
+}
+
+function validateSettings(settings, controls, reference) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error("В профиле должен быть объект settings.");
+  const keys = Object.keys(reference);
+  if (Object.keys(settings).length !== keys.length || keys.some(key => !Object.hasOwn(settings, key))) throw new Error("Набор параметров профиля не соответствует этой версии GPT Mini.");
+  const byKey = new Map(controls.map(control => [control.key, control]));
+  const result = {};
+  for (const key of keys) {
+    const control = byKey.get(key);
+    const value = settings[key];
+    if (!control) throw new Error("В профиле есть неподдерживаемый параметр: " + key);
+    if (control.kind === "boolean") {
+      if (typeof value !== "boolean") throw new Error(control.label + ": требуется переключатель true/false.");
+    } else if (control.kind === "select") {
+      if (typeof value !== "string" || !control.options.some(option => option.value === value)) throw new Error(control.label + ": неизвестный вариант.");
+    } else if (control.kind === "number" || control.kind === "optional_number") {
+      if (!(control.kind === "optional_number" && value === null)) {
+        if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(control.label + ": требуется конечное число.");
+        if ((Number.isFinite(control.min) && value < control.min) || (Number.isFinite(control.max) && value > control.max)) throw new Error(control.label + ": значение вне допустимого диапазона.");
+        if (control.step >= 1 && Number.isInteger(control.step) && !Number.isInteger(value)) throw new Error(control.label + ": требуется целое число.");
+      }
+    } else throw new Error("Неизвестный тип параметра: " + key);
+    result[key] = value;
+  }
+  return result;
+}
+
+function validateProfile(profile, controls, reference) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || profile.schema !== 1) throw new Error("Ожидается акустический профиль формата schema: 1.");
+  if (Object.keys(profile).some(key => key !== "schema" && key !== "settings")) throw new Error("Профиль содержит неизвестные разделы.");
+  return validateSettings(profile.settings, controls, reference);
+}
+
+function numberText(value, decimals = 3) {
+  return typeof value === "number" && Number.isFinite(value) ? String(Number(value.toFixed(decimals))) : "—";
+}
+
+function initAcousticLab() {
+  const el = id => document.getElementById(id);
+  let latest = null;
+  let draft = null;
+  let original = null;
+  let baseRevision = null;
+  let busy = false;
+  let fetching = false;
+  let online = false;
+  let lastError = "";
+  let pollTimer = null;
+  let schemaSignature = "";
+  const widgets = new Map();
+  const clone = value => JSON.parse(JSON.stringify(value));
+  const dirty = () => draft !== null && !settingsEqual(draft, original);
+  const groupInfo = {
+    kws:["Слово вызова", "Баллы сходства, стратегия сравнения и подтверждение обращения."],
+    activation:["Режим активации", "Условия локальной активации и режим проверки."],
+    filters:["Фильтры и усиление", "Выравнивание уровня и ограничение частот перед сопоставлением."],
+    voice:["Речь и окружающий шум", "Порог VAD и адаптация к шумовому фону после активации."],
+    vad:["Речь и окружающий шум", "Порог VAD и адаптация к шумовому фону после активации."],
+    timing:["Время и границы реплики", "Паузы, предзапись и ограничения продолжительности."],
+    diagnostics:["Диагностика и обратная связь", "Локальный режим проверки и отклик устройства."]
+  };
+
+  function message(text, tone = "warn") {
+    el("message").textContent = text;
+    el("message").dataset.tone = tone;
+    el("message").hidden = !text;
+  }
+
+  function setBadge(id, text, tone) { el(id).textContent = text; el(id).dataset.tone = tone; }
+
+  function updateActions() {
+    const changed = dirty();
+    const conflict = changed && latest && latest.revision !== baseRevision;
+    el("conflict").hidden = !conflict;
+    el("apply-btn").disabled = busy || !online || !draft || !changed || !!conflict || !!latest.pending || !latest.runtime?.ready;
+    el("revert-btn").disabled = busy || !latest?.applied || (!changed && baseRevision === latest.revision);
+    for (const id of ["export-btn","import-btn","defaults-btn","print-btn"]) el(id).disabled = busy || !draft;
+    for (const widget of widgets.values()) widget.disabled(busy);
+    el("apply-btn").textContent = busy ? "Применяем…" : "Применить";
+    if (busy) {
+      el("form-status").textContent = "Ожидаем подтверждение от GPT Mini";
+      el("form-detail").textContent = "Профиль будет отмечен применённым после ответа устройства";
+    } else if (!online) {
+      el("form-status").textContent = draft ? "Связь прервана · изменения в форме сохранены" : "Нет связи с GPT Mini";
+      el("form-detail").textContent = "Проверяем подключение автоматически";
+    } else if (conflict) {
+      el("form-status").textContent = "Работающий профиль изменился";
+      el("form-detail").textContent = "Верните работающие значения перед следующей настройкой";
+    } else if (latest?.pending) {
+      el("form-status").textContent = "На устройстве есть неподтверждённые изменения";
+      el("form-detail").textContent = "Дождитесь результата применения";
+    } else if (changed) {
+      const count = Object.keys(draft).filter(key => draft[key] !== original[key]).length;
+      el("form-status").textContent = "Изменений в форме: " + count;
+      el("form-detail").textContent = "Работающий профиль пока не изменён";
+    } else {
+      el("form-status").textContent = latest?.runtime?.ready ? "Работающий профиль · ревизия " + latest.revision : "Аудиоцикл пока не готов";
+      el("form-detail").textContent = latest?.saved && latest?.applied && !settingsEqual(latest.saved, latest.applied) ? "Сохранённые и применённые значения различаются" : "Нет неприменённых изменений";
+    }
+  }
+
+  function refreshFieldMeta() {
+    for (const [key, widget] of widgets) {
+      const value = latest?.applied?.[key];
+      const saved = latest?.saved?.[key];
+      const display = input => input === null ? "автоматически" : typeof input === "boolean" ? (input ? "вкл" : "выкл") : typeof input === "number" ? numberText(input, 5) : String(input ?? "—");
+      widget.meta.textContent = "Работает: " + display(value) + (value !== saved ? " · Сохранено: " + display(saved) : "");
+      widget.meta.classList.toggle("changed", draft?.[key] !== value);
+    }
+  }
+
+  function editValue(key, value) { draft[key] = value; refreshFieldMeta(); updateActions(); }
+
+  function buildControl(control) {
+    const box = document.createElement("div"); box.className = "control";
+    const head = document.createElement("div"); head.className = "control-label";
+    const label = document.createElement("label"); label.textContent = control.label; label.htmlFor = "setting-" + control.key;
+    const help = document.createElement("p"); help.className = "control-help"; help.id = "help-" + control.key; help.textContent = control.help || "";
+    const meta = document.createElement("p"); meta.className = "field-meta";
+    head.append(label); box.append(head, help);
+    const inputs = [];
+    let sync = () => {};
+    let disabled = flag => inputs.forEach(input => { input.disabled = flag; });
+    if (control.kind === "boolean") {
+      const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.id = label.htmlFor; toggle.setAttribute("aria-describedby", help.id);
+      const switchLabel = document.createElement("label"); switchLabel.className = "switch"; switchLabel.htmlFor = toggle.id;
+      const state = document.createElement("span"); switchLabel.append(toggle, state); head.append(switchLabel); inputs.push(toggle);
+      sync = value => { toggle.checked = !!value; state.textContent = value ? "Включено" : "Выключено"; };
+      toggle.addEventListener("change", () => { sync(toggle.checked); editValue(control.key, toggle.checked); });
+    } else if (control.kind === "select") {
+      const tools = document.createElement("div"); tools.className = "control-tools";
+      const select = document.createElement("select"); select.id = label.htmlFor; select.setAttribute("aria-describedby", help.id);
+      for (const option of control.options || []) { const item = document.createElement("option"); item.value = option.value; item.textContent = option.label; select.append(item); }
+      select.addEventListener("change", () => editValue(control.key, select.value)); tools.append(select); box.append(tools); inputs.push(select);
+      sync = value => { select.value = value; };
+    } else {
+      const tools = document.createElement("div"); tools.className = "control-tools";
+      const range = document.createElement("input"); range.type = "range"; range.setAttribute("aria-label", control.label); range.setAttribute("aria-describedby", help.id);
+      const number = document.createElement("input"); number.type = "number"; number.id = label.htmlFor; number.required = true; number.setAttribute("aria-describedby", help.id); number.inputMode = control.step < 1 ? "decimal" : "numeric";
+      for (const input of [range, number]) { for (const attr of ["min","max","step"]) if (control[attr] !== undefined) input.setAttribute(attr, control[attr]); inputs.push(input); }
+      const unit = document.createElement("span"); unit.className = "unit"; unit.textContent = control.unit || "";
+      tools.append(range, number); if (control.unit) tools.append(unit); box.append(tools);
+      const limits = document.createElement("div"); limits.className = "range-limits";
+      const low = document.createElement("span"); low.textContent = numberText(control.min, 5); const high = document.createElement("span"); high.textContent = numberText(control.max, 5); limits.append(low, high); box.append(limits);
+      let automatic = null;
+      if (control.kind === "optional_number") {
+        const autoLabel = document.createElement("label"); autoLabel.className = "switch"; autoLabel.style.marginTop = "12px";
+        automatic = document.createElement("input"); automatic.type = "checkbox";
+        const autoText = document.createElement("span"); autoText.textContent = "Автоматически по акустической модели";
+        autoLabel.append(automatic, autoText); box.append(autoLabel); inputs.push(automatic);
+        automatic.addEventListener("change", () => { const value = automatic.checked ? null : Number(number.value); sync(value); editValue(control.key, value); });
+      }
+      sync = value => {
+        const isAuto = value === null && automatic;
+        if (automatic) automatic.checked = !!isAuto;
+        if (!isAuto) { number.value = value; range.value = value; }
+        else if (number.value === "") { number.value = control.min ?? 1; range.value = number.value; }
+        number.disabled = busy || !!isAuto; range.disabled = busy || !!isAuto;
+      };
+      range.addEventListener("input", () => { number.value = range.value; editValue(control.key, Number(range.value)); });
+      number.addEventListener("input", () => { const value = number.value === "" ? NaN : Number(number.value); if (Number.isFinite(value)) range.value = value; editValue(control.key, value); });
+      disabled = flag => { if (automatic) automatic.disabled = flag; number.disabled = flag || !!automatic?.checked; range.disabled = flag || !!automatic?.checked; };
+    }
+    box.append(meta); widgets.set(control.key, {sync, disabled, meta}); return box;
+  }
+
+  function buildForm(controls) {
+    widgets.clear(); el("controls").replaceChildren(); el("sections-nav").replaceChildren();
+    const groups = new Map();
+    for (const control of controls) {
+      const key = control.group || "diagnostics";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(control);
+    }
+    let index = 0;
+    for (const [group, members] of groups) {
+      const info = groupInfo[group] || [group, "Параметры этой группы применяются вместе с профилем."];
+      const section = document.createElement("section"); section.className = "card"; section.id = "group-" + (++index);
+      const title = document.createElement("h2"); title.textContent = info[0]; title.id = section.id + "-title"; section.setAttribute("aria-labelledby", title.id);
+      const desc = document.createElement("p"); desc.className = "section-desc"; desc.textContent = info[1];
+      const fields = document.createElement("div"); members.forEach(control => fields.append(buildControl(control))); section.append(title, desc, fields); el("controls").append(section);
+      const anchor = document.createElement("a"); anchor.href = "#" + section.id; anchor.textContent = info[0]; el("sections-nav").append(anchor);
+    }
+  }
+
+  function fillForm(settings, revision, setOriginal = true) {
+    draft = clone(settings); baseRevision = revision;
+    if (setOriginal) original = clone(settings);
+    for (const [key, widget] of widgets) widget.sync(draft[key]);
+    refreshFieldMeta(); updateActions();
+  }
+
+  function runtimeView(data) {
+    const runtime = data.runtime || {};
+    setBadge("runtime-badge", runtime.ready ? (runtime.model_loaded ? "Готова" : "Без модели") : "Не готова", runtime.ready && runtime.model_loaded ? "good" : "warn");
+    el("model-name").textContent = runtime.model_name || (runtime.model_loaded ? "Модель загружена" : "Модель не загружена");
+    el("rms-value").textContent = numberText(runtime.pcm_rms, 1) + (Number.isFinite(runtime.pcm_rms) ? " RMS" : "");
+    el("compact-rms").textContent = el("rms-value").textContent;
+    el("rms-meter").value = Number.isFinite(runtime.pcm_rms) ? runtime.pcm_rms : 0;
+    el("score-value").textContent = numberText(runtime.last_score, 4);
+    el("compact-score").textContent = el("score-value").textContent;
+    el("score-meter").value = Number.isFinite(runtime.last_score) ? runtime.last_score : 0;
+    el("avg-value").textContent = numberText(runtime.last_avg_score, 4);
+    el("noise-value").textContent = numberText(runtime.noise_floor, 1);
+    el("vad-value").textContent = numberText(runtime.vad_level, 1);
+    el("mode-value").textContent = runtime.mode || "—";
+    el("revision-value").textContent = String(data.revision);
+    el("updated-value").textContent = new Date().toLocaleTimeString("ru-RU");
+    for (const key of ["candidate","keyword","opened","suppressed","shadow"]) el(key + "-count").textContent = Number.isFinite(runtime[key + "_count"]) ? String(runtime[key + "_count"]) : "—";
+    el("capabilities").className = ""; el("capabilities").replaceChildren();
+    for (const capability of data.capabilities || []) {
+      const row = document.createElement("div"); row.className = "capability";
+      const label = document.createElement("strong"); label.textContent = capability.label;
+      const value = document.createElement("span"); value.textContent = String(capability.value ?? "—");
+      const reason = document.createElement("small"); reason.textContent = capability.reason || "Фиксировано для текущего аудиотракта";
+      row.append(label, value, reason); el("capabilities").append(row);
+    }
+    if (!(data.capabilities || []).length) el("capabilities").textContent = "Устройство не передало сведения об ограничениях.";
+  }
+
+  function acceptSnapshot(data) {
+    if (!data || data.status !== "ok" || !Array.isArray(data.controls) || !data.defaults || !Number.isSafeInteger(data.revision)) throw new Error("GPT Mini вернула неподдерживаемый ответ лаборатории.");
+    const wasDirty = dirty();
+    const signature = JSON.stringify(data.controls);
+    if (schemaSignature && signature !== schemaSignature && wasDirty) throw new Error("Схема параметров изменилась. Сохраните профиль и обновите страницу.");
+    const needsBuild = signature !== schemaSignature;
+    latest = data;
+    online = true;
+    if (needsBuild) { buildForm(data.controls); schemaSignature = signature; }
+    if (!draft || (!wasDirty && !busy)) fillForm(data.applied || data.saved || data.defaults, data.revision);
+    else refreshFieldMeta();
+    runtimeView(data);
+    setBadge("connection-badge", "На связи", "good");
+    el("compact-state").textContent = "На связи · r" + data.revision;
+    if (data.error) { lastError = String(data.error); message(lastError, "bad"); }
+    else if (lastError) { lastError = ""; message(""); }
+    updateActions();
+  }
+
+  async function request(url, options) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(url, {...options, cache:"no-store", credentials:"same-origin", signal:controller.signal});
+      let data;
+      try { data = await response.json(); } catch (_) { throw new Error("GPT Mini вернула ответ без JSON (HTTP " + response.status + ")."); }
+      if (!response.ok) {
+        if (data.snapshot) acceptSnapshot(data.snapshot);
+        const error = new Error(data.message || data.error || "Запрос не выполнен (HTTP " + response.status + ").");
+        error.status = response.status;
+        throw error;
+      }
+      return data;
+    } finally { clearTimeout(timeout); }
+  }
+
+  async function poll() {
+    if (document.hidden || busy || fetching) return;
+    fetching = true;
+    try { acceptSnapshot(await request("/api/v1/acoustics")); }
+    catch (error) { online = false; lastError = error.message; setBadge("connection-badge", "Нет связи", "bad"); el("compact-state").textContent = "Нет связи"; message(lastError, "bad"); updateActions(); }
+    finally { fetching = false; }
+  }
+
+  async function apply(event) {
+    event.preventDefault();
+    if (busy || !latest || !dirty()) return;
+    if (!el("settings-form").reportValidity()) return;
+    let settings;
+    try { settings = validateSettings(draft, latest.controls, latest.defaults); }
+    catch (error) { message(error.message, "bad"); return; }
+    busy = true; updateActions(); message("");
+    try {
+      const response = await request("/api/v1/acoustics", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({expected_revision:baseRevision, settings})});
+      acceptSnapshot(response);
+      if (response.pending || !settingsEqual(response.applied, settings) || !settingsEqual(response.saved, settings) || response.error) throw new Error("Применение или сохранение ещё не подтверждено. Проверьте работающие значения.");
+      busy = false;
+      fillForm(response.applied, response.revision);
+      message("Профиль сохранён и применён на GPT Mini. Ревизия " + response.revision + ".", "good");
+    } catch (error) {
+      message(error.message, "bad");
+    } finally { busy = false; updateActions(); }
+  }
+
+  function downloadProfile() {
+    try {
+      const settings = validateSettings(draft, latest.controls, latest.defaults);
+      const blob = new Blob([JSON.stringify({schema:1, settings}, null, 2) + "\n"], {type:"application/json"});
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a"); anchor.href = url; anchor.download = "gpt-mini-acoustic-profile.json"; document.body.append(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      message(dirty() ? "Скачан профиль из формы. На GPT Mini он ещё не применён." : "Скачан работающий акустический профиль.", "good");
+    } catch (error) { message(error.message, "bad"); }
+  }
+
+  el("settings-form").addEventListener("submit", apply);
+  el("export-btn").addEventListener("click", downloadProfile);
+  el("import-btn").addEventListener("click", () => el("profile-file").click());
+  el("profile-file").addEventListener("change", async event => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      if (file.size > 32768) throw new Error("Профиль слишком большой. Допустимо до 32 КБ.");
+      const settings = validateProfile(JSON.parse(await file.text()), latest.controls, latest.defaults);
+      fillForm(settings, baseRevision, false);
+      message("Профиль загружен в форму. Проверьте значения и нажмите «Применить».");
+    } catch (error) { message(error instanceof SyntaxError ? "Файл не является корректным JSON-профилем." : error.message, "bad"); }
+    finally { event.target.value = ""; }
+  });
+  el("defaults-btn").addEventListener("click", () => { fillForm(latest.defaults, baseRevision, false); message("В форме установлены значения по умолчанию. Они ещё не применены."); });
+  el("revert-btn").addEventListener("click", () => { fillForm(latest.applied, latest.revision); message("В форму возвращены работающие значения. На устройстве ничего не изменено.", "good"); });
+  el("print-btn").addEventListener("click", () => window.print());
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
+  window.addEventListener("beforeunload", event => { if (dirty() || busy) { event.preventDefault(); event.returnValue = ""; } });
+  window.addEventListener("pagehide", () => { if (pollTimer !== null) clearInterval(pollTimer); });
+  window.addEventListener("pageshow", event => { if (event.persisted) { pollTimer = setInterval(poll, 1000); poll(); } });
+  poll(); pollTimer = setInterval(poll, 1000);
+}
+
+window.addEventListener("DOMContentLoaded", initAcousticLab);
+</script>
+</body>
+</html>

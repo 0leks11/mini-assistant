@@ -1,3 +1,4 @@
+pub mod acoustics;
 pub mod alarms;
 pub mod audio;
 pub mod bluetooth;

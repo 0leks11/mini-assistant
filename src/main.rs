@@ -1,3 +1,4 @@
+pub mod acoustics;
 use anyhow::{Context, Result};
 use config::VoiceProvider;
 use serde_json::json;
@@ -57,6 +58,12 @@ impl VoiceClient {
             Self::Openai(client) => client.stop().await,
         }
     }
+}
+
+fn acoustic_engine(path: &std::path::Path, settings: &config::WakewordCalibrationConfig) -> Result<Box<dyn wakeword::WakeWordEngine>> {
+    settings.validate()?;
+    if !settings.enabled { return Ok(Box::new(wakeword::keyword::DisabledKeyword)); }
+    Ok(Box::new(wakeword::keyword::KeywordEngine::load_with_calibration(path, Some(settings))?))
 }
 
 fn parse_cli_args_from<I, T>(iter: I) -> Result<CliAction>
@@ -516,8 +523,8 @@ async fn main() -> Result<()> {
             let hardware_recorder = wakeword::enrollment::HardwareRecorder::new();
             let (tx_reload_wakeword, mut rx_reload_wakeword) =
                 tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
-            let (tx_calibration, mut rx_calibration) =
-                tokio::sync::mpsc::channel::<crate::config::WakewordCalibrationConfig>(10);
+            let acoustic_settings = acoustics::effective_settings(&config)?;
+            let (acoustic_lab, mut rx_calibration) = acoustics::AcousticLab::new(acoustic_settings.clone());
 
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
@@ -534,10 +541,7 @@ async fn main() -> Result<()> {
                         None
                     }
                 });
-            let wakeword_enabled = std::env::var("MINI_WAKEWORD_ENABLED")
-                .ok()
-                .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(config.assistant.wakeword_enabled);
+            let wakeword_enabled = acoustic_settings.enabled;
             let web_server = web::ControlCenterServer::new(
                 cfg_path_buf,
                 srv_client_id,
@@ -554,7 +558,7 @@ async fn main() -> Result<()> {
                 model_path.clone(),
                 wakeword_enabled,
             )
-            .with_calibration_tx(tx_calibration);
+            .with_acoustic_lab(acoustic_lab.clone());
             let current_led_color_holder = web_server.current_led_color();
 
             // 4d2. Start VL53L0 proximity relative gesture volume task with visual & acoustic click indicators
@@ -1092,57 +1096,22 @@ async fn main() -> Result<()> {
             let (tx_speaker, mut rx_speaker) = mpsc::channel::<(u64, u64, Vec<u8>)>(100);
 
             // Local keyword grants a turn; energy only detects speech within it.
-            let vad_threshold = std::env::var("MINI_VAD_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .filter(|v| v.is_finite() && (1.0..=1000.0).contains(v))
-                .unwrap_or_else(|| config.wakeword.as_ref().map(|w| w.vad_threshold).unwrap_or(45.0))
-                .clamp(20.0, 100.0);
-            let silence_timeout_ms = std::env::var("MINI_SILENCE_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| (200..=10000).contains(v))
-                .unwrap_or(1100);
-            let initial_silence_timeout_ms = std::env::var("MINI_INITIAL_SILENCE_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| (500..=15000).contains(v))
-                .unwrap_or(1800);
-            let wake_chime_enabled = std::env::var("MINI_WAKE_CHIME")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(config.assistant.wake_chime);
-            let mic_gain = std::env::var("MINI_MIC_GAIN")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .filter(|v| v.is_finite() && (0.1..=20.0).contains(v))
-                .unwrap_or(1.0);
             let model_path = std::env::var_os("MINI_WAKEWORD_MODEL")
                 .map(std::path::PathBuf::from)
                 .or(config.assistant.wakeword_model.clone())
                 .unwrap_or_else(|| "/data/opt/mini-assistant/keyword.rpw".into());
-            let activation: Box<dyn wakeword::WakeWordEngine> = if !wakeword_enabled {
-                info!("Acoustic wake-word is explicitly DISABLED (wakeword_enabled = false); speaker is deaf to all acoustic triggers");
-                Box::new(wakeword::keyword::DisabledKeyword)
-            } else {
-                match wakeword::keyword::KeywordEngine::load_with_calibration(&model_path, config.wakeword.as_ref()) {
-                    Ok(engine) => {
-                        info!("Local personal keyword detector loaded");
-                        Box::new(engine)
-                    }
-                    Err(_) => {
-                        warn!("No valid local keyword enrollment: acoustic activation DISABLED; explicit SIGUSR1 control only");
-                        Box::new(wakeword::keyword::DisabledKeyword)
-                    }
+            let (activation, model_loaded) = match acoustic_engine(&model_path, &acoustic_settings) {
+                Ok(engine) => (engine, acoustic_settings.enabled),
+                Err(_) => {
+                    warn!("No valid local keyword enrollment: acoustic activation disabled");
+                    (Box::new(wakeword::keyword::DisabledKeyword) as Box<dyn wakeword::WakeWordEngine>, false)
                 }
             };
             let mut gate = wakeword::InputGate::with_activation_and_initial_timeout(
-                activation,
-                vad_threshold,
-                400,
-                initial_silence_timeout_ms,
-                silence_timeout_ms,
-                16000,
+                activation, acoustic_settings.vad_threshold, acoustic_settings.pre_roll_ms,
+                acoustic_settings.initial_silence_timeout_ms, acoustic_settings.silence_timeout_ms, 16000,
             );
+            gate.apply_acoustic_settings(&acoustic_settings);
             let manual_arm = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let cancel_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
             #[cfg(unix)]
@@ -1192,67 +1161,81 @@ async fn main() -> Result<()> {
                 let mut active_turn = None;
                 let mut arm_until = Instant::now();
                 let mut followup_until = Instant::now();
-                let followup_timeout_secs = std::env::var("MINI_FOLLOWUP_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| (0..=60).contains(v))
-                    .unwrap_or(0);
-                let max_utterance_secs = std::env::var("MINI_MAX_UTTERANCE_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| (3..=30).contains(v))
-                    .unwrap_or(8);
+                let mut acoustic_current = acoustic_settings.clone();
+                let mut acoustic_model_path = model_path.clone();
+                let mut lab_metrics = acoustics::RuntimeMetrics {
+                    model_loaded,
+                    mode: "starting".into(),
+                    ..Default::default()
+                };
+                let (name, hash) = acoustics::model_identity(&acoustic_model_path);
+                lab_metrics.model_name = name;
+                lab_metrics.model_sha256 = hash;
+                let mut lab_ready = false;
+                let mut metrics_since = Instant::now();
                 let mut tts_echo_until = Instant::now() + Duration::from_secs(1);
                 let mut utterance_started = Instant::now();
                 let mut last_turn_seen: Option<u64> = None;
                 let mut led_is_on = false;
                 // Hardware capture has a measured startup DC transient. Discard two
                 // seconds by PCM duration, independently of network setup latency.
-                let mut warmup_bytes: usize = 16000 * 2 * 2;
+                let mut warmup_bytes: usize = acoustic_current.startup_suppression_ms as usize * 32;
                 // Opt-in structural diagnostics: no audio, words or tool arguments.
                 let diagnostics = std::env::var("MINI_DIAGNOSTICS").is_ok_and(|v| v == "1");
                 let mut diagnostic_since = Instant::now();
                 let mut diagnostic_chunks = 0u64;
                 let mut diagnostic_peak = 0.0_f64;
-                while let Some(chunk) = rx_raw_mic.recv().await {
+                while let Some(mut chunk) = rx_raw_mic.recv().await {
+                    if !lab_ready {
+                        lab_metrics.ready = true;
+                        acoustic_lab.ready(acoustic_current.clone(), lab_metrics.clone());
+                        lab_ready = true;
+                    }
                     if let Ok(new_path) = rx_reload_wakeword.try_recv() {
-                        let reloaded_cfg = crate::config::Config::load().ok();
-                        let cal_cfg = reloaded_cfg.as_ref().and_then(|c| c.wakeword.as_ref());
-                        match wakeword::keyword::KeywordEngine::load_with_calibration(&new_path, cal_cfg) {
+                        match acoustic_engine(&new_path, &acoustic_current) {
                             Ok(engine) => {
-                                info!(
-                                    path = ?new_path,
-                                    "Hot-reloaded personal wake-word engine into InputGate"
-                                );
-                                gate.reload_engine(Box::new(engine));
-                                if let Some(c) = cal_cfg {
-                                    gate.update_vad_threshold(c.vad_threshold);
-                                }
+                                mic_authorization.cancel();
+                                playback_for_mic.interrupt();
+                                active_turn = None;
+                                gate.reload_engine(engine);
+                                gate.apply_acoustic_settings(&acoustic_current);
+                                acoustic_model_path = new_path;
+                                lab_metrics.model_loaded = acoustic_current.enabled;
+                                let (name, hash) = acoustics::model_identity(&acoustic_model_path);
+                                lab_metrics.model_name = name;
+                                lab_metrics.model_sha256 = hash;
                             }
-                            Err(e) => {
-                                warn!(
-                                    path = ?new_path,
-                                    error = %e,
-                                    "Failed to load new wake-word engine for hot-reload"
-                                );
-                            }
+                            Err(_) => warn!("Failed to reload local acoustic model; previous model retained"),
                         }
                     }
-
-                    if let Ok(cal) = rx_calibration.try_recv() {
-                        gate.update_calibration(&cal.to_detector_config());
-                        gate.update_vad_threshold(cal.vad_threshold);
-                        info!(
-                            threshold = cal.threshold,
-                            avg_threshold = cal.avg_threshold,
-                            min_scores = cal.min_scores,
-                            vad_threshold = cal.vad_threshold,
-                            gain_norm = cal.gain_normalizer,
-                            band_pass = cal.band_pass,
-                            "Hot-applied updated acoustic calibration to InputGate"
-                        );
+                    if let Ok(request) = rx_calibration.try_recv() {
+                        match acoustic_engine(&acoustic_model_path, &request.settings) {
+                            Ok(engine) => {
+                                mic_authorization.cancel();
+                                playback_for_mic.interrupt();
+                                active_turn = None;
+                                last_turn_seen = None;
+                                arm_until = Instant::now();
+                                followup_until = Instant::now();
+                                gate.reload_engine(engine);
+                                gate.apply_acoustic_settings(&request.settings);
+                                acoustic_current = request.settings.clone();
+                                lab_metrics.model_loaded = acoustic_current.enabled;
+                                acoustic_lab.acknowledge(request, None);
+                            }
+                            Err(_) => acoustic_lab.acknowledge(request, Some("Local model unavailable; profile saved but not applied".into())),
+                        }
                     }
-
+                    acoustics::apply_gain(&mut chunk, acoustic_current.mic_gain);
+                    lab_metrics.pcm_rms = acoustics::pcm_rms(&chunk);
+                    let (floor, level, _) = gate.vad_diagnostics();
+                    lab_metrics.noise_floor = floor;
+                    lab_metrics.vad_level = level;
+                    lab_metrics.mode = if acoustic_current.shadow_mode { "shadow" } else if !acoustic_current.enabled { "disabled" } else if warmup_bytes > 0 { "warmup" } else if gate.is_active() { "streaming" } else { "listening" }.into();
+                    if metrics_since.elapsed() >= Duration::from_millis(250) {
+                        acoustic_lab.metrics(lab_metrics.clone());
+                        metrics_since = Instant::now();
+                    }
                     let is_enrolling = recorder_for_mic.is_recording();
                     recorder_for_mic.feed_pcm(&chunk);
                     if is_enrolling {
@@ -1324,7 +1307,7 @@ async fn main() -> Result<()> {
                         });
                         gate.reset_gate();
                         active_turn = None;
-                        arm_until = now + Duration::from_secs(8);
+                        arm_until = now + Duration::from_secs(acoustic_current.manual_activation_secs);
                         followup_until = now;
                     }
                     if warmup_bytes > 0 {
@@ -1354,11 +1337,11 @@ async fn main() -> Result<()> {
                                 );
                                 followup_until = now;
                                 gate.set_manual_armed(false);
-                            } else if followup_timeout_secs > 0 {
-                                followup_until = now + Duration::from_secs(followup_timeout_secs);
+                            } else if acoustic_current.followup_timeout_secs > 0 {
+                                followup_until = now + Duration::from_secs(acoustic_current.followup_timeout_secs);
                                 info!(
                                     finished_turn = finished_id,
-                                    timeout_secs = followup_timeout_secs,
+                                    timeout_secs = acoustic_current.followup_timeout_secs,
                                     "Conversational follow-up window opened: listening for continuation without wakeword"
                                 );
                             } else {
@@ -1372,7 +1355,7 @@ async fn main() -> Result<()> {
                     }
 
                     if is_tts_playing {
-                        tts_echo_until = now + Duration::from_millis(800);
+                        tts_echo_until = now + Duration::from_millis(acoustic_current.echo_tail_ms);
                         gate.sanitize_pre_roll();
                     } else if now < tts_echo_until {
                         gate.sanitize_pre_roll();
@@ -1414,6 +1397,20 @@ async fn main() -> Result<()> {
                     let was_active = gate.is_active();
                     let frames = gate.process_frame(chunk);
                     let mut now_active = gate.is_active();
+                    if let Some(observation) = gate.take_keyword_observation() {
+                        lab_metrics.candidate_count = lab_metrics.candidate_count.saturating_add(1);
+                        lab_metrics.last_score = observation.score.is_finite().then_some(observation.score);
+                        lab_metrics.last_avg_score = observation.avg_score.is_finite().then_some(observation.avg_score);
+                        if observation.detected {
+                            lab_metrics.keyword_count = lab_metrics.keyword_count.saturating_add(1);
+                        }
+                    }
+                    if acoustic_current.shadow_mode {
+                        if !was_active && now_active { lab_metrics.shadow_count = lab_metrics.shadow_count.saturating_add(1); }
+                        gate.reset_gate();
+                        active_turn = None;
+                        continue;
+                    }
                     if !was_active && now_active {
                         // Immediately illuminate top LED ring upon wake-word detection
                         if !led_is_on {
@@ -1424,6 +1421,7 @@ async fn main() -> Result<()> {
                         // Prevent acoustic self-interruption: ONLY discard if the assistant's OWN TTS VOICE
                         // is currently playing or within echo decay. Music or alarms must NOT discard the wake-word!
                         if is_tts_playing || now < tts_echo_until {
+                            lab_metrics.suppressed_count = lab_metrics.suppressed_count.saturating_add(1);
                             debug!("Discarded acoustic activation during assistant TTS speech/echo tail");
                             gate.reset_gate();
                             continue;
@@ -1439,7 +1437,7 @@ async fn main() -> Result<()> {
                         }
 
                         // Optional acoustic earcon: soft confirmation chime if enabled
-                        if wake_chime_enabled {
+                        if acoustic_current.wake_chime {
                             let playback = playback_for_mic.clone();
                             tokio::spawn(async move {
                                 let chime_pcm = alarms::sound::generate_wake_chime();
@@ -1508,9 +1506,10 @@ async fn main() -> Result<()> {
                         utterance_started = now;
                         arm_until = now;
                         followup_until = now;
+                        lab_metrics.opened_count = lab_metrics.opened_count.saturating_add(1);
                         info!("Explicit local activation: user turn opened");
                     }
-                    let max_utterance_dur = Duration::from_secs(max_utterance_secs);
+                    let max_utterance_dur = Duration::from_secs(acoustic_current.max_utterance_secs);
                     if now_active && now.duration_since(utterance_started) >= max_utterance_dur
                     {
                         info!(
@@ -1668,7 +1667,7 @@ async fn main() -> Result<()> {
                         device: config.audio.capture_device.clone(),
                         channel_mode: mic_channel_mode,
                         bit_shift: 16,
-                        gain: mic_gain,
+                        gain: 1.0,
                         custom_arecord_path: None,
                     };
                     match audio::AlsaCapture::start(alsa_cfg, tx_raw_mic) {

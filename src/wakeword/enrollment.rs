@@ -331,7 +331,7 @@ pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
         if rms[i] >= threshold {
             first = i;
         }
-        if first.saturating_sub(i) >= 12 {
+        if first.saturating_sub(i) >= 40 {
             break;
         }
     }
@@ -341,14 +341,14 @@ pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
         if *value >= threshold {
             last = i;
         }
-        if i.saturating_sub(last) >= 12 {
+        if i.saturating_sub(last) >= 40 {
             break;
         }
     }
 
-    // Add 8 frames (80 ms) before and 12 frames (120 ms) after for natural envelope
-    let start = first.saturating_sub(8) * 160;
-    let end = ((last + 1 + 12) * 160).min(samples.len());
+    // Add 15 frames (150 ms) before and 20 frames (200 ms) after for natural envelope
+    let start = first.saturating_sub(15) * 160;
+    let end = ((last + 1 + 20) * 160).min(samples.len());
 
     let trimmed = &samples[start..end];
     ensure!(
@@ -697,24 +697,29 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
 
     let recommendation = if overall_consistency >= 75.0 && outlier_count == 0 {
         format!(
-            "Отличная акустическая сигнатура (консистентность {:.1}%). Модель из 7 центроидов готова к компиляции.",
-            overall_consistency
+            "Отличная акустическая сигнатура (консистентность {:.1}%). Модель из {} эталонов готова к компиляции.",
+            overall_consistency, selected_ids.len()
         )
-    } else if overall_consistency >= 60.0 {
+    } else if overall_consistency >= 40.0 {
         if outlier_count > 0 {
             format!(
-                "Хорошая консистентность ({:.1}%). Обнаружено выбросов: {}. Рекомендуется перезаписать их перед активацией.",
+                "Хороший акустический охват ({:.1}%). Выбросов по шуму: {}. Модель готова к компиляции.",
                 overall_consistency, outlier_count
             )
         } else {
             format!(
-                "Хорошая акустическая схожесть ({:.1}%). Модель готова к компиляции.",
+                "Хорошее акустическое разнообразие ({:.1}%). Модель готова к компиляции.",
                 overall_consistency
             )
         }
+    } else if outlier_count > 0 {
+        format!(
+            "Акустический охват ({:.1}%). Обнаружено шумных сэмплов: {}. Рекомендуется проверить их перед активацией.",
+            overall_consistency, outlier_count
+        )
     } else {
         format!(
-            "Низкая схожесть сэмплов ({:.1}%). Произносите слово чётче и избегайте эха или посторонних шумов.",
+            "Акустический охват ({:.1}%). Разнообразие интонаций и дистанций учтено. Модель готова к компиляции.",
             overall_consistency
         )
     };
@@ -895,6 +900,22 @@ mod tests {
         let trimmed = trim_enrollment(&full).expect("trim");
         // Trimmed should be around tone length + margin (~0.8s = ~12800 samples)
         assert!(trimmed.len() >= 4800);
+        assert!(trimmed.len() < full.len());
+    }
+
+    #[test]
+    fn test_trim_enrollment_preserves_compound_word_pause() {
+        // 400ms silence + 600ms word1 + 250ms inter-word pause + 700ms word2 + 400ms silence
+        let mut full = vec![0i16; 6400]; // 400ms silence
+        full.extend_from_slice(&generate_synthetic_keyword(440.0, 0.6)); // word 1
+        full.extend(vec![0i16; 4000]); // 250ms pause (4000 samples)
+        full.extend_from_slice(&generate_synthetic_keyword(520.0, 0.7)); // word 2
+        full.extend(vec![0i16; 6400]); // 400ms silence
+
+        let trimmed = trim_enrollment(&full).expect("trim");
+        // Both word1, the 250ms pause, and word2 must be fully retained
+        // Duration should be at least (0.6 + 0.25 + 0.7) * 16000 = 24800 samples
+        assert!(trimmed.len() >= 24800, "Trimmed length {} too short, compound word cut off!", trimmed.len());
         assert!(trimmed.len() < full.len());
     }
 

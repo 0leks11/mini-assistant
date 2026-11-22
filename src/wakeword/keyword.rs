@@ -1,7 +1,7 @@
 //! Local personal keyword matching. Never falls back to energy activation.
-use super::WakeWordEngine;
+use super::{KeywordObservation, WakeWordEngine};
 use anyhow::{Context, Result};
-use rustpotter::{PersonalDetectorConfig, Rustpotter, ScoreMode, WakewordLoad, WakewordRef};
+use rustpotter::{PersonalDetectorConfig, Rustpotter, WakewordLoad, WakewordRef};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Mutex;
@@ -11,9 +11,11 @@ pub struct KeywordEngine {
     detector: Mutex<Option<Rustpotter>>,
     pending: VecDeque<u8>,
     frame_bytes: usize,
+    last_observation: Option<KeywordObservation>,
 }
 
 impl KeywordEngine {
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_with_calibration(path, None)
     }
@@ -26,92 +28,16 @@ impl KeywordEngine {
             WakewordRef::load_from_file(path.to_str().context("Invalid keyword reference path")?)
                 .map_err(anyhow::Error::msg)?;
 
-        let def_cal = crate::config::WakewordCalibrationConfig::default();
-
-        let threshold = cal
-            .map(|c| c.threshold)
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_THRESHOLD")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|v| v.is_finite() && (0.1..=1.0).contains(v))
-            })
-            .unwrap_or(def_cal.threshold);
-
-        let avg_threshold = cal
-            .map(|c| c.avg_threshold)
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_AVG_THRESHOLD")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            })
-            .unwrap_or(def_cal.avg_threshold);
-
-        let min_scores = cal
-            .map(|c| c.min_scores)
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_MIN_SCORES")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|v| (1..=20).contains(v))
-            })
-            .unwrap_or(def_cal.min_scores);
-
-        let score_mode = cal
-            .and_then(|c| parse_score_mode(&c.score_mode))
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_SCORE_MODE")
-                    .ok()
-                    .and_then(|v| parse_score_mode(&v))
-            })
-            .unwrap_or(ScoreMode::Max);
-
-        let eager = cal
-            .map(|c| c.eager)
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_EAGER")
-                    .ok()
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            })
-            .unwrap_or(def_cal.eager);
-
-        let gain_norm = cal
-            .map(|c| c.gain_normalizer)
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_GAIN_NORM")
-                    .ok()
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            })
-            .unwrap_or(def_cal.gain_normalizer);
-
-        let band_pass = cal
-            .map(|c| c.band_pass)
-            .or_else(|| {
-                std::env::var("MINI_WAKEWORD_BAND_PASS")
-                    .ok()
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            })
-            .unwrap_or(def_cal.band_pass);
-
-        let detector_cfg = PersonalDetectorConfig {
-            threshold,
-            avg_threshold,
-            min_scores,
-            score_mode,
-            gain_normalizer_enabled: gain_norm,
-            band_pass_enabled: band_pass,
-            eager,
-        };
-
+        let calibration = resolve_detector_calibration(cal, |key| std::env::var(key).ok())?;
+        let detector_cfg = calibration.to_detector_config();
         info!(
-            threshold,
-            avg_threshold,
-            min_scores,
-            ?score_mode,
-            eager,
-            gain_norm,
-            band_pass,
+            threshold = detector_cfg.threshold,
+            avg_threshold = detector_cfg.avg_threshold,
+            min_scores = detector_cfg.min_scores,
+            score_mode = ?detector_cfg.score_mode,
+            eager = detector_cfg.eager,
+            gain_norm = detector_cfg.gain_normalizer_enabled,
+            band_pass = detector_cfg.band_pass_enabled,
             "Loaded personal wake-word detector with calibrated parameters"
         );
 
@@ -143,7 +69,9 @@ impl KeywordEngine {
                         .context("Invalid compound reference path")?,
                 ) {
                     Ok(compound_ref) => {
-                        if let Err(e) = detector.add_wakeword_ref("shtuchka-intellect", compound_ref) {
+                        if let Err(e) =
+                            detector.add_wakeword_ref("shtuchka-intellect", compound_ref)
+                        {
                             tracing::warn!(
                                 "Failed to add compound wake-word 'shtuchka-intellect': {e}"
                             );
@@ -169,25 +97,69 @@ impl KeywordEngine {
             detector: Mutex::new(Some(detector)),
             pending: VecDeque::new(),
             frame_bytes,
+            last_observation: None,
         })
     }
 }
 
-pub fn parse_score_mode(s: &str) -> Option<ScoreMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "max" => Some(ScoreMode::Max),
-        "median" | "p50" => Some(ScoreMode::Median),
-        "average" | "avg" => Some(ScoreMode::Average),
-        "p75" => Some(ScoreMode::P75),
-        "p80" => Some(ScoreMode::P80),
-        "p90" => Some(ScoreMode::P90),
-        "p95" => Some(ScoreMode::P95),
-        _ => None,
+/// Explicit settings are authoritative. Legacy environment settings are read only
+/// when no persisted acoustic profile exists.
+fn resolve_detector_calibration(
+    saved: Option<&crate::config::WakewordCalibrationConfig>,
+    mut env: impl FnMut(&str) -> Option<String>,
+) -> Result<crate::config::WakewordCalibrationConfig> {
+    if let Some(saved) = saved {
+        saved.validate()?;
+        return Ok(saved.clone());
     }
+    let mut settings = crate::config::WakewordCalibrationConfig::default();
+    for key in [
+        "MINI_WAKEWORD_THRESHOLD",
+        "MINI_WAKEWORD_AVG_THRESHOLD",
+        "MINI_WAKEWORD_MIN_SCORES",
+        "MINI_WAKEWORD_SCORE_MODE",
+        "MINI_WAKEWORD_EAGER",
+        "MINI_WAKEWORD_GAIN_NORM",
+        "MINI_WAKEWORD_BAND_PASS",
+    ] {
+        let Some(value) = env(key) else { continue };
+        match key {
+            "MINI_WAKEWORD_THRESHOLD" => {
+                settings.threshold = value.parse().context("Invalid legacy keyword threshold")?
+            }
+            "MINI_WAKEWORD_AVG_THRESHOLD" => {
+                settings.avg_threshold = value
+                    .parse()
+                    .context("Invalid legacy keyword average threshold")?
+            }
+            "MINI_WAKEWORD_MIN_SCORES" => {
+                settings.min_scores = value
+                    .parse()
+                    .context("Invalid legacy keyword score count")?
+            }
+            "MINI_WAKEWORD_SCORE_MODE" => settings.score_mode = value,
+            _ => {
+                let flag = match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" => true,
+                    "0" | "false" => false,
+                    _ => anyhow::bail!("Invalid legacy keyword boolean"),
+                };
+                match key {
+                    "MINI_WAKEWORD_EAGER" => settings.eager = flag,
+                    "MINI_WAKEWORD_GAIN_NORM" => settings.gain_normalizer = flag,
+                    _ => settings.band_pass = flag,
+                }
+            }
+        }
+    }
+    settings.validate()?;
+    Ok(settings)
 }
 
 impl WakeWordEngine for KeywordEngine {
     fn update_calibration(&mut self, cfg: &PersonalDetectorConfig) {
+        self.pending.clear();
+        self.last_observation = None;
         if let Ok(Some(d)) = self.detector.get_mut() {
             d.update_personal_config(cfg);
             info!(
@@ -224,8 +196,24 @@ impl WakeWordEngine for KeywordEngine {
                     gain = detection.gain,
                     "Wake-word detected! Opening voice pipeline"
                 );
+                self.last_observation = Some(KeywordObservation {
+                    score: detection.score,
+                    avg_score: detection.avg_score,
+                    counter: detection.counter,
+                    gain: detection.gain,
+                    detected: true,
+                });
                 detected = true;
             } else if let Some(candidate) = detector.take_last_candidate() {
+                if !detected {
+                    self.last_observation = Some(KeywordObservation {
+                        score: candidate.score,
+                        avg_score: candidate.avg_score,
+                        counter: candidate.counter,
+                        gain: candidate.gain,
+                        detected: false,
+                    });
+                }
                 if candidate.score > 0.40 {
                     debug!(
                         name = %candidate.name,
@@ -240,8 +228,13 @@ impl WakeWordEngine for KeywordEngine {
         detected
     }
 
+    fn take_observation(&mut self) -> Option<KeywordObservation> {
+        self.last_observation.take()
+    }
+
     fn reset(&mut self) {
         self.pending.clear();
+        self.last_observation = None;
         if let Ok(Some(d)) = self.detector.get_mut() {
             d.reset();
         }
@@ -285,5 +278,41 @@ mod tests {
         }
         keyword.reset();
         assert!(!keyword.process(&loud));
+    }
+
+    #[test]
+    fn persisted_acoustics_ignore_legacy_environment_overrides() {
+        let saved = crate::config::WakewordCalibrationConfig {
+            threshold: 0.57,
+            min_scores: 11,
+            ..Default::default()
+        };
+        let effective = resolve_detector_calibration(Some(&saved), |_| {
+            panic!("Legacy environment must not be consulted for a persisted profile")
+        })
+        .unwrap();
+        assert_eq!(effective, saved);
+        let legacy = resolve_detector_calibration(None, |key| match key {
+            "MINI_WAKEWORD_THRESHOLD" => Some("0.42".into()),
+            "MINI_WAKEWORD_MIN_SCORES" => Some("9".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(legacy.threshold, 0.42);
+        assert_eq!(legacy.min_scores, 9);
+    }
+
+    #[test]
+    fn legacy_acoustics_do_not_silently_accept_invalid_values() {
+        for invalid in ["NaN", "inf", "-1", "0.9", "garbage"] {
+            assert!(resolve_detector_calibration(None, |key| {
+                (key == "MINI_WAKEWORD_THRESHOLD").then(|| invalid.into())
+            })
+            .is_err());
+        }
+        assert!(resolve_detector_calibration(None, |key| {
+            (key == "MINI_WAKEWORD_EAGER").then(|| "maybe".into())
+        })
+        .is_err());
     }
 }

@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info, warn};
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+const ACOUSTIC_LAB_HTML: &str = include_str!("acoustic_lab.html");
 const SPOTIFY_SCOPES: &str =
     "user-read-playback-state user-modify-playback-state user-read-currently-playing streaming user-read-email user-read-private";
 
@@ -51,7 +52,7 @@ pub struct ControlCenterServer {
     wakeword_reload_tx: Option<mpsc::UnboundedSender<PathBuf>>,
     wakeword_model_path: PathBuf,
     wakeword_enabled: bool,
-    calibration_tx: Option<mpsc::Sender<crate::config::WakewordCalibrationConfig>>,
+    acoustic_lab: Option<Arc<crate::acoustics::AcousticLab>>,
 }
 
 impl ControlCenterServer {
@@ -79,15 +80,12 @@ impl ControlCenterServer {
             wakeword_reload_tx: None,
             wakeword_model_path: PathBuf::from("/data/opt/mini-assistant/keyword.rpw"),
             wakeword_enabled: true,
-            calibration_tx: None,
+            acoustic_lab: None,
         }
     }
 
-    pub fn with_calibration_tx(
-        mut self,
-        tx: mpsc::Sender<crate::config::WakewordCalibrationConfig>,
-    ) -> Self {
-        self.calibration_tx = Some(tx);
+    pub fn with_acoustic_lab(mut self, lab: Arc<crate::acoustics::AcousticLab>) -> Self {
+        self.acoustic_lab = Some(lab);
         self
     }
 
@@ -190,10 +188,16 @@ impl ControlCenterServer {
 
         let mut content_length = 0usize;
         let mut host = None;
+        let mut origin = None;
+        let mut json_content = false;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
                 let k_trim = k.trim();
-                if k_trim.eq_ignore_ascii_case("content-length") {
+                if k_trim.eq_ignore_ascii_case("origin") {
+                    origin = Some(v.trim().to_string());
+                } else if k_trim.eq_ignore_ascii_case("content-type") {
+                    json_content = v.trim().split(';').next() == Some("application/json");
+                } else if k_trim.eq_ignore_ascii_case("content-length") {
                     if let Ok(len) = v.trim().parse::<usize>() {
                         content_length = len.min(512 * 1024);
                     }
@@ -241,6 +245,15 @@ impl ControlCenterServer {
             _ => self.redirect_uri.clone(),
         };
 
+        if method == "POST" && matches!(path, "/api/v1/acoustics" | "/api/v1/calibration") {
+            let same_origin = origin.as_ref().is_none_or(|o| host.as_ref().is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}")));
+            if !same_origin || !json_content {
+                return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require same-origin JSON"})).await;
+            }
+            if body.len() > 16 * 1024 {
+                return self.send_json_status(&mut stream, "413 Content Too Large", &serde_json::json!({"status":"error","message":"Acoustic profile too large"})).await;
+            }
+        }
         match (method, path) {
             // Dashboard UI
             ("GET", "/") | ("GET", "/index.html") | ("GET", "/setup") => {
@@ -251,6 +264,10 @@ impl ControlCenterServer {
                     DASHBOARD_HTML.as_bytes(),
                 )
                 .await?;
+            }
+
+            ("GET", "/acoustics") | ("GET", "/acoustics/") => {
+                self.send_response(&mut stream,"200 OK","text/html; charset=utf-8",ACOUSTIC_LAB_HTML.as_bytes()).await?;
             }
 
             // REST API v1
@@ -302,10 +319,10 @@ impl ControlCenterServer {
             | ("GET", "/api/v1/wakeword/session/analysis") => {
                 self.handle_api_wakeword_analysis(&mut stream).await?;
             }
-            ("GET", "/api/v1/calibration") => {
+            ("GET", "/api/v1/acoustics") | ("GET", "/api/v1/calibration") => {
                 self.handle_api_get_calibration(&mut stream).await?;
             }
-            ("POST", "/api/v1/calibration") => {
+            ("POST", "/api/v1/acoustics") | ("POST", "/api/v1/calibration") => {
                 self.handle_api_post_calibration(&mut stream, body).await?;
             }
 
@@ -628,78 +645,34 @@ impl ControlCenterServer {
         Ok(())
     }
 
-    pub fn read_current_calibration(&self) -> crate::config::WakewordCalibrationConfig {
-        if let Some(path) = self.resolve_config_path() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str::<crate::config::Config>(&content) {
-                    if let Some(cal) = cfg.wakeword {
-                        return cal;
-                    }
-                }
-            }
-        }
-        crate::config::WakewordCalibrationConfig::default()
-    }
-
     async fn handle_api_get_calibration(&self, stream: &mut TcpStream) -> Result<()> {
-        let cal = self.read_current_calibration();
-        let resp = serde_json::json!({
-            "status": "ok",
-            "threshold": cal.threshold,
-            "avg_threshold": cal.avg_threshold,
-            "min_scores": cal.min_scores,
-            "score_mode": cal.score_mode,
-            "eager": cal.eager,
-            "vad_threshold": cal.vad_threshold,
-            "gain_normalizer": cal.gain_normalizer,
-            "band_pass": cal.band_pass,
-        });
-        self.send_json(stream, &resp).await
+        match &self.acoustic_lab {
+            Some(lab) => self.send_json(stream, &lab.response()).await,
+            None => self.send_json_status(stream, "503 Service Unavailable", &serde_json::json!({"status":"error","message":"Audio loop is unavailable"})).await,
+        }
     }
 
     async fn handle_api_post_calibration(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
-        let mut cal: crate::config::WakewordCalibrationConfig = serde_json::from_str(body)
-            .context("Invalid calibration JSON body")?;
-
-        cal.threshold = cal.threshold.clamp(0.10, 0.90);
-        cal.avg_threshold = cal.avg_threshold.clamp(0.05, 0.50);
-        cal.min_scores = cal.min_scores.clamp(1, 10);
-        cal.vad_threshold = cal.vad_threshold.clamp(10.0, 200.0);
-        if cal.score_mode != "avg" && cal.score_mode != "max" {
-            cal.score_mode = "max".to_string();
+        let Some(lab) = &self.acoustic_lab else {
+            return self.send_json_status(stream,"503 Service Unavailable", &serde_json::json!({"status":"error","message":"Audio loop is unavailable"})).await;
+        };
+        let payload: crate::acoustics::ApplyPayload = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(_) => return self.send_json_status(stream,"400 Bad Request",&serde_json::json!({"status":"error","message":"Expected {expected_revision, settings} acoustic profile"})).await,
+        };
+        if let Err(e) = payload.settings.validate() {
+            return self.send_json_status(stream,"400 Bad Request",&serde_json::json!({"status":"error","message":e.to_string()})).await;
         }
-
-        if let Some(path) = self.resolve_config_path() {
-            if let Err(e) = update_config_calibration(&path, &cal) {
-                warn!("Failed to persist calibration to {:?}: {}", path, e);
-            } else {
-                info!("Persisted updated wakeword calibration to {:?}", path);
-            }
+        if payload.expected_revision != lab.snapshot().revision || lab.snapshot().pending {
+            return self.send_json_status(stream,"409 Conflict",&serde_json::json!({"status":"error","message":"Профиль изменился или ожидает применения. Обновите статус.","snapshot":lab.response()})).await;
         }
-
-        if let Some(ref tx) = self.calibration_tx {
-            if let Err(e) = tx.send(cal.clone()).await {
-                warn!("Failed to dispatch calibration update to audio loop: {}", e);
-            } else {
-                info!("Dispatched hot calibration update to InputGate");
-            }
+        let Some(path) = self.resolve_config_path() else {
+            return self.send_json_status(stream,"503 Service Unavailable",&serde_json::json!({"status":"error","message":"Config path is unavailable; nothing saved"})).await;
+        };
+        match lab.apply(&path,payload).await {
+            Ok(_) => self.send_json(stream,&lab.response()).await,
+            Err(e) => self.send_json_status(stream,"503 Service Unavailable",&serde_json::json!({"status":"error","message":e.to_string(),"snapshot":lab.response()})).await,
         }
-
-        let resp = serde_json::json!({
-            "status": "ok",
-            "message": "Параметры калибровки успешно применены",
-            "calibration": {
-                "threshold": cal.threshold,
-                "avg_threshold": cal.avg_threshold,
-                "min_scores": cal.min_scores,
-                "score_mode": cal.score_mode,
-                "eager": cal.eager,
-                "vad_threshold": cal.vad_threshold,
-                "gain_normalizer": cal.gain_normalizer,
-                "band_pass": cal.band_pass,
-            }
-        });
-        self.send_json(stream, &resp).await
     }
 
     fn resolve_config_path(&self) -> Option<std::path::PathBuf> {
@@ -1682,156 +1655,9 @@ pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn update_config_calibration(
-    config_path: &Path,
-    cal: &crate::config::WakewordCalibrationConfig,
-) -> Result<()> {
-    let content = if config_path.exists() {
-        std::fs::read_to_string(config_path)
-            .with_context(|| format!("Failed to read config file at {:?}", config_path))?
-    } else {
-        String::new()
-    };
-
-    let mut updated = Vec::new();
-    let mut in_wakeword_section = false;
-    let mut has_wakeword_section = false;
-
-    let mut found_threshold = false;
-    let mut found_avg_threshold = false;
-    let mut found_min_scores = false;
-    let mut found_score_mode = false;
-    let mut found_eager = false;
-    let mut found_vad_threshold = false;
-    let mut found_gain_normalizer = false;
-    let mut found_band_pass = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_wakeword_section {
-                // Leaving [wakeword] section, insert missing keys
-                if !found_threshold {
-                    updated.push(format!("threshold = {:.2}", cal.threshold));
-                    found_threshold = true;
-                }
-                if !found_avg_threshold {
-                    updated.push(format!("avg_threshold = {:.2}", cal.avg_threshold));
-                    found_avg_threshold = true;
-                }
-                if !found_min_scores {
-                    updated.push(format!("min_scores = {}", cal.min_scores));
-                    found_min_scores = true;
-                }
-                if !found_score_mode {
-                    updated.push(format!("score_mode = \"{}\"", cal.score_mode));
-                    found_score_mode = true;
-                }
-                if !found_eager {
-                    updated.push(format!("eager = {}", cal.eager));
-                    found_eager = true;
-                }
-                if !found_vad_threshold {
-                    updated.push(format!("vad_threshold = {:.1}", cal.vad_threshold));
-                    found_vad_threshold = true;
-                }
-                if !found_gain_normalizer {
-                    updated.push(format!("gain_normalizer = {}", cal.gain_normalizer));
-                    found_gain_normalizer = true;
-                }
-                if !found_band_pass {
-                    updated.push(format!("band_pass = {}", cal.band_pass));
-                    found_band_pass = true;
-                }
-            }
-            in_wakeword_section = trimmed == "[wakeword]";
-            if in_wakeword_section {
-                has_wakeword_section = true;
-            }
-            updated.push(line.to_string());
-            continue;
-        }
-
-        if in_wakeword_section {
-            if trimmed.starts_with("threshold") && trimmed.contains('=') && !trimmed.starts_with("avg_") {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}threshold = {:.2}", indent, cal.threshold));
-                found_threshold = true;
-                continue;
-            }
-            if trimmed.starts_with("avg_threshold") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}avg_threshold = {:.2}", indent, cal.avg_threshold));
-                found_avg_threshold = true;
-                continue;
-            }
-            if trimmed.starts_with("min_scores") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}min_scores = {}", indent, cal.min_scores));
-                found_min_scores = true;
-                continue;
-            }
-            if trimmed.starts_with("score_mode") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}score_mode = \"{}\"", indent, cal.score_mode));
-                found_score_mode = true;
-                continue;
-            }
-            if trimmed.starts_with("eager") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}eager = {}", indent, cal.eager));
-                found_eager = true;
-                continue;
-            }
-            if trimmed.starts_with("vad_threshold") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}vad_threshold = {:.1}", indent, cal.vad_threshold));
-                found_vad_threshold = true;
-                continue;
-            }
-            if trimmed.starts_with("gain_normalizer") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}gain_normalizer = {}", indent, cal.gain_normalizer));
-                found_gain_normalizer = true;
-                continue;
-            }
-            if trimmed.starts_with("band_pass") && trimmed.contains('=') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                updated.push(format!("{}band_pass = {}", indent, cal.band_pass));
-                found_band_pass = true;
-                continue;
-            }
-        }
-
-        updated.push(line.to_string());
-    }
-
-    if in_wakeword_section {
-        if !found_threshold { updated.push(format!("threshold = {:.2}", cal.threshold)); }
-        if !found_avg_threshold { updated.push(format!("avg_threshold = {:.2}", cal.avg_threshold)); }
-        if !found_min_scores { updated.push(format!("min_scores = {}", cal.min_scores)); }
-        if !found_score_mode { updated.push(format!("score_mode = \"{}\"", cal.score_mode)); }
-        if !found_eager { updated.push(format!("eager = {}", cal.eager)); }
-        if !found_vad_threshold { updated.push(format!("vad_threshold = {:.1}", cal.vad_threshold)); }
-        if !found_gain_normalizer { updated.push(format!("gain_normalizer = {}", cal.gain_normalizer)); }
-        if !found_band_pass { updated.push(format!("band_pass = {}", cal.band_pass)); }
-    } else if !has_wakeword_section {
-        if !updated.is_empty() && !updated.last().map(|s| s.trim().is_empty()).unwrap_or(false) {
-            updated.push(String::new());
-        }
-        updated.push("[wakeword]".to_string());
-        updated.push(format!("threshold = {:.2}", cal.threshold));
-        updated.push(format!("avg_threshold = {:.2}", cal.avg_threshold));
-        updated.push(format!("min_scores = {}", cal.min_scores));
-        updated.push(format!("score_mode = \"{}\"", cal.score_mode));
-        updated.push(format!("eager = {}", cal.eager));
-        updated.push(format!("vad_threshold = {:.1}", cal.vad_threshold));
-        updated.push(format!("gain_normalizer = {}", cal.gain_normalizer));
-        updated.push(format!("band_pass = {}", cal.band_pass));
-    }
-
-    std::fs::write(config_path, updated.join("\n") + "\n")?;
-    Ok(())
+#[cfg(test)]
+pub fn update_config_calibration(config_path: &Path, cal: &crate::config::WakewordCalibrationConfig) -> Result<()> {
+    crate::acoustics::save_settings(config_path, cal)
 }
 
 pub struct SystemMetrics {
@@ -2095,20 +1921,15 @@ capture_device = "hw:0,2"
             vad_threshold: 50.0,
             gain_normalizer: true,
             band_pass: true,
+            ..Default::default()
         };
 
         update_config_calibration(&cfg_file, &cal).unwrap();
         let updated = std::fs::read_to_string(&cfg_file).unwrap();
-        assert!(updated.contains("[wakeword]"));
-        assert!(updated.contains("threshold = 0.42"));
-        assert!(updated.contains("avg_threshold = 0.22"));
-        assert!(updated.contains("min_scores = 5"));
-        assert!(updated.contains("score_mode = \"avg\""));
-        assert!(updated.contains("eager = true"));
-        assert!(updated.contains("vad_threshold = 50.0"));
-        assert!(updated.contains("gain_normalizer = true"));
-        assert!(updated.contains("band_pass = true"));
-        assert!(updated.contains("capture_device = \"hw:0,2\""));
+        let parsed: toml::Value = toml::from_str(&updated).unwrap();
+        let restored: crate::config::WakewordCalibrationConfig = parsed["wakeword"].clone().try_into().unwrap();
+        assert_eq!(restored,cal);
+        assert_eq!(parsed["audio"]["capture_device"].as_str(),Some("hw:0,2"));
 
         std::fs::remove_file(&cfg_file).unwrap();
     }

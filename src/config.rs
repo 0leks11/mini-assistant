@@ -328,24 +328,45 @@ impl Default for WifiConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+/// User-adjustable acoustic parameters. Scores are detector units, not probabilities.
+/// Missing fields retain backwards-compatible defaults; invalid values are rejected.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct WakewordCalibrationConfig {
-    #[serde(default = "default_ww_threshold")]
     pub threshold: f32,
-    #[serde(default = "default_ww_avg_threshold")]
     pub avg_threshold: f32,
-    #[serde(default = "default_ww_min_scores")]
     pub min_scores: usize,
-    #[serde(default = "default_ww_score_mode")]
     pub score_mode: String,
-    #[serde(default = "default_true")]
     pub eager: bool,
-    #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
-    #[serde(default = "default_true")]
     pub gain_normalizer: bool,
-    #[serde(default = "default_false")]
     pub band_pass: bool,
+    pub enabled: bool,
+    pub shadow_mode: bool,
+    /// Applied after local detection, to the authorized cloud audio only.
+    pub mic_gain: f32,
+    pub pre_roll_ms: u32,
+    pub silence_timeout_ms: u32,
+    pub initial_silence_timeout_ms: u32,
+    pub max_utterance_secs: u64,
+    pub echo_tail_ms: u64,
+    pub startup_suppression_ms: u32,
+    pub manual_activation_secs: u64,
+    pub wake_chime: bool,
+    pub followup_timeout_secs: u64,
+    pub vad_noise_adaptation: bool,
+    pub vad_noise_multiplier: f32,
+    pub vad_noise_offset: f32,
+    pub vad_rise_alpha: f32,
+    pub vad_fall_alpha: f32,
+    pub vad_onset_frames: usize,
+    pub gain_min: f32,
+    pub gain_max: f32,
+    pub gain_ref: Option<f32>,
+    pub band_low_hz: f32,
+    pub band_high_hz: f32,
+    pub score_ref: f32,
+    pub dtw_band_size: u16,
 }
 
 impl Default for WakewordCalibrationConfig {
@@ -359,20 +380,153 @@ impl Default for WakewordCalibrationConfig {
             vad_threshold: default_vad_threshold(),
             gain_normalizer: true,
             band_pass: false,
+            enabled: true,
+            shadow_mode: false,
+            mic_gain: 1.0,
+            pre_roll_ms: 400,
+            silence_timeout_ms: 1100,
+            initial_silence_timeout_ms: 1800,
+            max_utterance_secs: 8,
+            echo_tail_ms: 800,
+            startup_suppression_ms: 2000,
+            manual_activation_secs: 8,
+            wake_chime: false,
+            followup_timeout_secs: 0,
+            vad_noise_adaptation: true,
+            vad_noise_multiplier: 1.15,
+            vad_noise_offset: 10.0,
+            vad_rise_alpha: 0.02,
+            vad_fall_alpha: 0.10,
+            vad_onset_frames: 3,
+            gain_min: 0.1,
+            gain_max: 6.0,
+            gain_ref: None,
+            band_low_hz: 80.0,
+            band_high_hz: 7500.0,
+            score_ref: 0.22,
+            dtw_band_size: 5,
         }
     }
 }
 
 impl WakewordCalibrationConfig {
+    /// Validate the complete settings at the configuration/API boundary.
+    /// No setting is silently clamped; an error leaves the running settings intact.
+    pub fn validate(&self) -> Result<()> {
+        fn finite_range(name: &str, value: f32, min: f32, max: f32) -> Result<()> {
+            anyhow::ensure!(
+                value.is_finite() && (min..=max).contains(&value),
+                "{name} must be finite and within {min}..={max}"
+            );
+            Ok(())
+        }
+        finite_range("threshold", self.threshold, 0.0, 0.7311)?;
+        finite_range("avg_threshold", self.avg_threshold, 0.0, 0.7311)?;
+        finite_range("vad_threshold", self.vad_threshold, 1.0, 1000.0)?;
+        finite_range("mic_gain", self.mic_gain, 0.1, 20.0)?;
+        finite_range("vad_noise_multiplier", self.vad_noise_multiplier, 1.0, 10.0)?;
+        finite_range("vad_noise_offset", self.vad_noise_offset, 0.0, 1000.0)?;
+        finite_range(
+            "vad_rise_alpha",
+            self.vad_rise_alpha,
+            f32::MIN_POSITIVE,
+            1.0,
+        )?;
+        finite_range(
+            "vad_fall_alpha",
+            self.vad_fall_alpha,
+            f32::MIN_POSITIVE,
+            1.0,
+        )?;
+        finite_range("gain_min", self.gain_min, 0.1, 20.0)?;
+        finite_range("gain_max", self.gain_max, 0.1, 20.0)?;
+        anyhow::ensure!(
+            self.gain_min <= self.gain_max,
+            "gain_min must not exceed gain_max"
+        );
+        if let Some(gain_ref) = self.gain_ref {
+            finite_range("gain_ref", gain_ref, f32::MIN_POSITIVE, 1.0)?;
+        }
+        finite_range("band_low_hz", self.band_low_hz, 20.0, 7900.0)?;
+        finite_range("band_high_hz", self.band_high_hz, 20.0, 7900.0)?;
+        anyhow::ensure!(
+            self.band_low_hz < self.band_high_hz,
+            "band_low_hz must be below band_high_hz"
+        );
+        finite_range("score_ref", self.score_ref, 0.01, 2.0)?;
+        anyhow::ensure!(
+            (1..=100).contains(&self.min_scores),
+            "min_scores must be within 1..=100"
+        );
+        anyhow::ensure!(
+            (1..=100).contains(&self.vad_onset_frames),
+            "vad_onset_frames must be within 1..=100"
+        );
+        anyhow::ensure!(
+            self.pre_roll_ms <= 2000,
+            "pre_roll_ms must be within 0..=2000"
+        );
+        anyhow::ensure!(
+            (200..=10000).contains(&self.silence_timeout_ms),
+            "silence_timeout_ms must be within 200..=10000"
+        );
+        anyhow::ensure!(
+            (500..=15000).contains(&self.initial_silence_timeout_ms),
+            "initial_silence_timeout_ms must be within 500..=15000"
+        );
+        anyhow::ensure!(
+            (3..=60).contains(&self.max_utterance_secs),
+            "max_utterance_secs must be within 3..=60"
+        );
+        anyhow::ensure!(
+            self.echo_tail_ms <= 5000,
+            "echo_tail_ms must be within 0..=5000"
+        );
+        anyhow::ensure!(
+            self.startup_suppression_ms <= 10000,
+            "startup_suppression_ms must be within 0..=10000"
+        );
+        anyhow::ensure!(
+            (1..=30).contains(&self.manual_activation_secs),
+            "manual_activation_secs must be within 1..=30"
+        );
+        anyhow::ensure!(
+            self.followup_timeout_secs <= 15,
+            "followup_timeout_secs must be within 0..=15"
+        );
+        anyhow::ensure!(
+            (1..=32).contains(&self.dtw_band_size),
+            "dtw_band_size must be within 1..=32"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.score_mode.trim().to_ascii_lowercase().as_str(),
+                "max"
+                    | "avg"
+                    | "average"
+                    | "median"
+                    | "p25"
+                    | "p50"
+                    | "p75"
+                    | "p80"
+                    | "p90"
+                    | "p95"
+            ),
+            "Unknown score_mode"
+        );
+        Ok(())
+    }
+
+    /// Convert validated settings to the local personal-reference detector.
     pub fn to_detector_config(&self) -> rustpotter::PersonalDetectorConfig {
         rustpotter::PersonalDetectorConfig {
-            threshold: self.threshold.clamp(0.10, 0.90),
-            avg_threshold: self.avg_threshold.clamp(0.05, 0.50),
-            min_scores: self.min_scores.clamp(1, 10),
+            threshold: self.threshold,
+            avg_threshold: self.avg_threshold,
+            min_scores: self.min_scores,
             score_mode: match self.score_mode.trim().to_ascii_lowercase().as_str() {
-                "max" => rustpotter::ScoreMode::Max,
                 "median" | "p50" => rustpotter::ScoreMode::Median,
                 "average" | "avg" => rustpotter::ScoreMode::Average,
+                "p25" => rustpotter::ScoreMode::P25,
                 "p75" => rustpotter::ScoreMode::P75,
                 "p80" => rustpotter::ScoreMode::P80,
                 "p90" => rustpotter::ScoreMode::P90,
@@ -382,6 +536,13 @@ impl WakewordCalibrationConfig {
             gain_normalizer_enabled: self.gain_normalizer,
             band_pass_enabled: self.band_pass,
             eager: self.eager,
+            gain_min: self.gain_min,
+            gain_max: self.gain_max,
+            gain_ref: self.gain_ref,
+            band_low_hz: self.band_low_hz,
+            band_high_hz: self.band_high_hz,
+            score_ref: self.score_ref,
+            dtw_band_size: self.dtw_band_size,
         }
     }
 }
@@ -404,10 +565,6 @@ fn default_ww_score_mode() -> String {
 
 fn default_vad_threshold() -> f32 {
     45.0
-}
-
-fn default_false() -> bool {
-    false
 }
 
 impl Config {
@@ -616,5 +773,135 @@ mod tests {
         assert_eq!(wifi.interface, "wlan0");
         assert_eq!(wifi.dns_port, 1053);
         assert_eq!(wifi.portal_port, 8088);
+    }
+
+    #[test]
+    fn acoustic_legacy_profile_preserves_new_defaults() {
+        let old = r#"
+threshold = 0.40
+avg_threshold = 0.21
+min_scores = 7
+score_mode = "median"
+eager = false
+vad_threshold = 55.0
+gain_normalizer = false
+band_pass = true
+"#;
+        let settings: WakewordCalibrationConfig = toml::from_str(old).unwrap();
+        settings.validate().unwrap();
+        assert_eq!(settings.threshold, 0.40);
+        assert_eq!(settings.min_scores, 7);
+        assert_eq!(settings.pre_roll_ms, 400);
+        assert_eq!(settings.followup_timeout_secs, 0);
+        assert_eq!(settings.band_high_hz, 7500.0);
+        assert_eq!(settings.gain_ref, None);
+    }
+
+    #[test]
+    fn acoustic_profile_roundtrip_preserves_non_default_values() {
+        let settings = WakewordCalibrationConfig {
+            enabled: false,
+            shadow_mode: true,
+            threshold: 0.52,
+            avg_threshold: 0.24,
+            min_scores: 13,
+            score_mode: "p75".into(),
+            eager: false,
+            vad_threshold: 73.0,
+            gain_normalizer: false,
+            band_pass: true,
+            gain_min: 0.2,
+            gain_max: 8.0,
+            gain_ref: Some(0.003),
+            band_low_hz: 200.0,
+            band_high_hz: 4000.0,
+            score_ref: 0.31,
+            dtw_band_size: 9,
+            mic_gain: 2.0,
+            pre_roll_ms: 650,
+            silence_timeout_ms: 1400,
+            initial_silence_timeout_ms: 2200,
+            max_utterance_secs: 12,
+            echo_tail_ms: 1200,
+            startup_suppression_ms: 2500,
+            manual_activation_secs: 10,
+            wake_chime: true,
+            followup_timeout_secs: 5,
+            vad_noise_adaptation: false,
+            vad_noise_multiplier: 2.0,
+            vad_noise_offset: 15.0,
+            vad_rise_alpha: 0.04,
+            vad_fall_alpha: 0.2,
+            vad_onset_frames: 5,
+        };
+        settings.validate().unwrap();
+        let toml = toml::to_string(&settings).unwrap();
+        let restored: WakewordCalibrationConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(restored, settings);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WakewordCalibrationConfig>(&json).unwrap(),
+            settings
+        );
+    }
+
+    #[test]
+    fn acoustic_validation_rejects_nonfinite_and_unusable_values() {
+        let base = WakewordCalibrationConfig::default();
+        base.validate().unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 0.8] {
+            let mut cfg = base.clone();
+            cfg.threshold = bad;
+            assert!(cfg.validate().is_err());
+        }
+        for field in [
+            "avg_threshold",
+            "vad_threshold",
+            "mic_gain",
+            "gain_min",
+            "gain_max",
+            "band_low_hz",
+            "band_high_hz",
+            "score_ref",
+            "vad_noise_multiplier",
+            "vad_noise_offset",
+            "vad_rise_alpha",
+            "vad_fall_alpha",
+        ] {
+            let mut json = serde_json::to_value(&base).unwrap();
+            json[field] = serde_json::json!("not-a-number");
+            assert!(serde_json::from_value::<WakewordCalibrationConfig>(json).is_err());
+        }
+        let mut cfg = base.clone();
+        cfg.gain_ref = Some(f32::NAN);
+        assert!(cfg.validate().is_err());
+        cfg = base.clone();
+        cfg.gain_min = 8.0;
+        cfg.gain_max = 6.0;
+        assert!(cfg.validate().is_err());
+        cfg = base.clone();
+        cfg.band_low_hz = cfg.band_high_hz;
+        assert!(cfg.validate().is_err());
+        cfg = base.clone();
+        cfg.score_mode = "mystery".into();
+        assert!(cfg.validate().is_err());
+        cfg = base.clone();
+        cfg.vad_rise_alpha = 0.0;
+        assert!(cfg.validate().is_err());
+        cfg = base.clone();
+        cfg.min_scores = 0;
+        assert!(cfg.validate().is_err());
+        cfg = base.clone();
+        cfg.followup_timeout_secs = 16;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn acoustic_profiles_reject_unknown_fields_instead_of_ignoring_tuning() {
+        assert!(toml::from_str::<WakewordCalibrationConfig>("threshold_typo = 0.4").is_err());
+        assert!(
+            serde_json::from_str::<WakewordCalibrationConfig>(r#"{"noise_supression":true}"#)
+                .is_err()
+        );
     }
 }

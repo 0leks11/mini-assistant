@@ -2,6 +2,18 @@ pub mod enrollment;
 pub mod keyword;
 use tracing::debug;
 
+/// Numeric matcher metadata only; never includes microphone samples or recognized text.
+#[derive(Debug, Clone, Copy)]
+pub struct KeywordObservation {
+    pub score: f32,
+    pub avg_score: f32,
+    #[allow(dead_code)]
+    pub counter: usize,
+    #[allow(dead_code)]
+    pub gain: f32,
+    pub detected: bool,
+}
+
 pub trait WakeWordEngine: Send + Sync {
     /// Process incoming 16-bit 16kHz PCM audio frame (e.g. 512 bytes / 256 samples).
     /// Returns true if wake word was detected in this frame.
@@ -12,15 +24,27 @@ pub trait WakeWordEngine: Send + Sync {
 
     /// Hot-update calibration settings on the fly
     fn update_calibration(&mut self, _cfg: &rustpotter::PersonalDetectorConfig) {}
+
+    /// Drain the most recent numeric matcher observation, if available.
+    fn take_observation(&mut self) -> Option<KeywordObservation> {
+        None
+    }
 }
 
-/// Simple energy-based Voice Activity Detector (VAD) fallback
+/// Energy-based speech segmentation within an explicitly authorized input window.
+/// This detector never grants keyword activation in the production InputGate.
 pub struct SimpleVadEngine {
     base_threshold_rms: f32,
     noise_floor_rms: f32,
     consecutive_active: usize,
     required_consecutive: usize,
     is_speaking: bool,
+    current_frame_active: bool,
+    noise_adaptation: bool,
+    noise_multiplier: f32,
+    noise_offset: f32,
+    rise_alpha: f32,
+    fall_alpha: f32,
 }
 
 impl SimpleVadEngine {
@@ -31,12 +55,60 @@ impl SimpleVadEngine {
             consecutive_active: 0,
             required_consecutive: 3, // ~48ms of audio for onset
             is_speaking: false,
+            current_frame_active: false,
+            noise_adaptation: true,
+            noise_multiplier: 1.15,
+            noise_offset: 10.0,
+            rise_alpha: 0.02,
+            fall_alpha: 0.10,
         }
+    }
+
+    /// Construct from settings already validated at the configuration/API boundary.
+    pub fn from_settings(settings: &crate::config::WakewordCalibrationConfig) -> Self {
+        Self {
+            base_threshold_rms: settings.vad_threshold,
+            noise_floor_rms: settings.vad_threshold * 0.5,
+            consecutive_active: 0,
+            required_consecutive: settings.vad_onset_frames,
+            is_speaking: false,
+            current_frame_active: false,
+            noise_adaptation: settings.vad_noise_adaptation,
+            noise_multiplier: settings.vad_noise_multiplier,
+            noise_offset: settings.vad_noise_offset,
+            rise_alpha: settings.vad_rise_alpha,
+            fall_alpha: settings.vad_fall_alpha,
+        }
+    }
+
+    fn dynamic_threshold(&self) -> f32 {
+        if self.noise_adaptation {
+            (self.noise_floor_rms * self.noise_multiplier + self.noise_offset)
+                .max(self.base_threshold_rms)
+        } else {
+            self.base_threshold_rms
+        }
+    }
+
+    fn reset_onset(&mut self) {
+        self.consecutive_active = 0;
+        self.is_speaking = false;
+        self.current_frame_active = false;
+    }
+
+    /// Current floor, actual decision threshold and frame activity; no audio is retained.
+    pub fn diagnostics(&self) -> (f32, f32, bool) {
+        (
+            self.noise_floor_rms,
+            self.dynamic_threshold(),
+            self.current_frame_active,
+        )
     }
 }
 
 impl WakeWordEngine for SimpleVadEngine {
     fn process(&mut self, pcm_chunk: &[u8]) -> bool {
+        self.current_frame_active = false;
         if pcm_chunk.len() < 2 {
             return false;
         }
@@ -56,26 +128,28 @@ impl WakeWordEngine for SimpleVadEngine {
         // Dynamic noise floor tracking:
         // When not speaking, rapidly track downward or steadily adapt upward.
         // When speaking, only track downward so speech doesn't inflate the noise floor.
-        if !self.is_speaking {
-            if rms < self.noise_floor_rms {
-                self.noise_floor_rms = 0.90 * self.noise_floor_rms + 0.10 * rms;
+        if self.noise_adaptation {
+            let alpha = if rms < self.noise_floor_rms {
+                self.fall_alpha
+            } else if !self.is_speaking {
+                self.rise_alpha
             } else {
-                self.noise_floor_rms = 0.98 * self.noise_floor_rms + 0.02 * rms;
-            }
-        } else if rms < self.noise_floor_rms {
-            self.noise_floor_rms = 0.90 * self.noise_floor_rms + 0.10 * rms;
+                0.0
+            };
+            self.noise_floor_rms += alpha * (rms - self.noise_floor_rms);
         }
 
-        // Dynamic threshold must clear acoustic noise floor while sensitive to far-field voice (~2.4m)
-        let dynamic_threshold = (self.noise_floor_rms * 1.15 + 10.0).max(self.base_threshold_rms);
+        let dynamic_threshold = self.dynamic_threshold();
 
         if rms > dynamic_threshold {
             if self.is_speaking {
+                self.current_frame_active = true;
                 return true;
             }
             self.consecutive_active += 1;
             if self.consecutive_active >= self.required_consecutive {
                 self.is_speaking = true;
+                self.current_frame_active = true;
                 debug!(
                     "VAD voice detected (RMS: {:.1} > dynamic: {:.1}, floor: {:.1})",
                     rms, dynamic_threshold, self.noise_floor_rms
@@ -90,8 +164,7 @@ impl WakeWordEngine for SimpleVadEngine {
     }
 
     fn reset(&mut self) {
-        self.consecutive_active = 0;
-        self.is_speaking = false;
+        self.reset_onset();
         self.noise_floor_rms = self.base_threshold_rms * 0.5;
     }
 }
@@ -113,7 +186,7 @@ impl WakeWordEngine for AlwaysActiveEngine {
 /// sized by audio duration (bytes/samples) and NEVER transmitted to the cloud until activation occurs.
 pub struct InputGate {
     engine: Box<dyn WakeWordEngine>,
-    speech_engine: Option<Box<dyn WakeWordEngine>>,
+    speech_engine: Option<SimpleVadEngine>,
     manual_armed: bool,
     is_active: bool,
     has_spoken: bool,
@@ -165,7 +238,7 @@ impl InputGate {
         rate: u32,
     ) -> Self {
         let mut gate = Self::new(activation, pre_roll_ms, silence_ms, rate, false);
-        gate.speech_engine = Some(Box::new(SimpleVadEngine::new(vad_threshold)));
+        gate.speech_engine = Some(SimpleVadEngine::new(vad_threshold));
         gate
     }
 
@@ -185,6 +258,13 @@ impl InputGate {
     }
 
     pub fn set_manual_armed(&mut self, armed: bool) {
+        if armed != self.manual_armed && !self.is_active {
+            if let Some(vad) = &mut self.speech_engine {
+                // A newly granted input window must not reuse onset evidence from
+                // earlier room speech. Keep the measured noise floor.
+                vad.reset_onset();
+            }
+        }
         self.manual_armed = armed;
     }
 
@@ -195,9 +275,16 @@ impl InputGate {
             return vec![chunk];
         }
 
+        // Observe room energy locally even while gated so diagnostics reflect the
+        // room. Only an explicit manual window may use this result to open input.
+        let speech_active = self
+            .speech_engine
+            .as_mut()
+            .is_some_and(|vad| vad.process(&chunk));
+
         if !self.is_active {
             let triggered = if self.manual_armed {
-                true
+                speech_active
             } else {
                 self.engine.process(&chunk)
             };
@@ -214,7 +301,7 @@ impl InputGate {
 
             if triggered {
                 self.is_active = true;
-                self.has_spoken = false;
+                self.has_spoken = self.manual_armed;
                 self.had_spoken_last_turn = true;
                 self.silence_bytes = 0;
                 let outgoing: Vec<Vec<u8>> = self.pre_roll_buffer.drain(..).collect();
@@ -229,7 +316,7 @@ impl InputGate {
             }
         } else {
             let voice_active = match self.speech_engine.as_mut() {
-                Some(vad) => vad.process(&chunk),
+                Some(_) => speech_active,
                 None => self.engine.process(&chunk),
             };
             if voice_active {
@@ -300,13 +387,41 @@ impl InputGate {
     }
 
     /// Hot-updates the detector calibration on the fly without interrupting audio loop.
+    #[allow(dead_code)]
     pub fn update_calibration(&mut self, cfg: &rustpotter::PersonalDetectorConfig) {
         self.engine.update_calibration(cfg);
     }
 
     /// Hot-updates VAD speech detection threshold.
+    #[allow(dead_code)]
     pub fn update_vad_threshold(&mut self, threshold_rms: f32) {
-        self.speech_engine = Some(Box::new(SimpleVadEngine::new(threshold_rms)));
+        self.speech_engine = Some(SimpleVadEngine::new(threshold_rms));
+    }
+
+    /// Atomically replace the gate's validated 16 kHz PCM16 acoustic settings.
+    /// Pending onset/pre-roll is discarded so old evidence cannot trigger a new profile.
+    pub fn apply_acoustic_settings(&mut self, settings: &crate::config::WakewordCalibrationConfig) {
+        self.reset_gate();
+        self.engine
+            .update_calibration(&settings.to_detector_config());
+        self.speech_engine = Some(SimpleVadEngine::from_settings(settings));
+        const BYTES_PER_MS: usize = 16_000 * 2 / 1000;
+        self.max_pre_roll_bytes = settings.pre_roll_ms as usize * BYTES_PER_MS;
+        self.max_silence_bytes = settings.silence_timeout_ms as usize * BYTES_PER_MS;
+        self.max_initial_silence_bytes =
+            settings.initial_silence_timeout_ms as usize * BYTES_PER_MS;
+    }
+
+    /// Floor RMS, effective VAD threshold RMS and current frame activity.
+    pub fn vad_diagnostics(&self) -> (f32, f32, bool) {
+        self.speech_engine
+            .as_ref()
+            .map_or((0.0, 0.0, false), SimpleVadEngine::diagnostics)
+    }
+
+    /// Drain the keyword observation without logging or retaining microphone audio.
+    pub fn take_keyword_observation(&mut self) -> Option<KeywordObservation> {
+        self.engine.take_observation()
     }
 }
 
@@ -662,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_armed_immediate_activation() {
+    fn manual_armed_waits_for_speech_and_never_opens_on_silence() {
         struct NeverTrigger;
         impl WakeWordEngine for NeverTrigger {
             fn process(&mut self, _: &[u8]) -> bool {
@@ -673,15 +788,157 @@ mod tests {
 
         let mut gate = InputGate::with_activation(Box::new(NeverTrigger), 10.0, 400, 1000, 16000);
         let chunk = vec![0x00; 512];
+        let speech: Vec<u8> = (0..256).flat_map(|_| 5000i16.to_le_bytes()).collect();
 
         // Without manual arm, inactive
         assert!(gate.process_frame(chunk.clone()).is_empty());
         assert!(!gate.is_active());
 
-        // When manual armed (e.g. button pressed)
+        // Arming grants a bounded chance to speak; it is not itself speech.
         gate.set_manual_armed(true);
-        let out = gate.process_frame(chunk.clone());
+        for _ in 0..500 {
+            assert!(gate.process_frame(chunk.clone()).is_empty());
+            assert!(!gate.has_spoken());
+        }
+        assert!(!gate.is_active());
+
+        // Isolated sound bursts cannot accumulate onset across quiet frames.
+        for _ in 0..10 {
+            assert!(gate.process_frame(speech.clone()).is_empty());
+            assert!(gate.process_frame(chunk.clone()).is_empty());
+        }
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        let out = gate.process_frame(speech);
         assert!(!out.is_empty());
         assert!(gate.is_active());
+        assert!(gate.has_spoken());
+    }
+
+    #[test]
+    fn new_manual_window_does_not_reuse_ambient_speech_onset() {
+        let mut gate =
+            InputGate::with_activation(Box::new(keyword::DisabledKeyword), 10.0, 100, 1000, 16000);
+        let speech: Vec<u8> = (0..256).flat_map(|_| 5000i16.to_le_bytes()).collect();
+        for _ in 0..10 {
+            assert!(gate.process_frame(speech.clone()).is_empty());
+        }
+
+        gate.set_manual_armed(true);
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        assert!(!gate.process_frame(speech).is_empty());
+    }
+
+    #[test]
+    fn revoked_manual_window_cannot_leave_partial_onset_authorized() {
+        let mut gate =
+            InputGate::with_activation(Box::new(keyword::DisabledKeyword), 10.0, 100, 1000, 16000);
+        let speech: Vec<u8> = (0..256).flat_map(|_| 5000i16.to_le_bytes()).collect();
+        gate.set_manual_armed(true);
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        assert!(gate.process_frame(speech.clone()).is_empty());
+
+        gate.set_manual_armed(false);
+        for _ in 0..5 {
+            assert!(gate.process_frame(speech.clone()).is_empty());
+        }
+        assert!(!gate.is_active());
+        gate.set_manual_armed(true);
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        assert!(gate.process_frame(speech.clone()).is_empty());
+        assert!(!gate.process_frame(speech).is_empty());
+    }
+
+    #[test]
+    fn calibration_changes_vad_and_timings_without_retaining_old_audio() {
+        let mut gate =
+            InputGate::with_activation(Box::new(keyword::DisabledKeyword), 10.0, 400, 1000, 16000);
+        let quiet_speech: Vec<u8> = (0..160).flat_map(|_| 500i16.to_le_bytes()).collect();
+        gate.set_manual_armed(true);
+        for _ in 0..3 {
+            gate.process_frame(quiet_speech.clone());
+        }
+        assert!(gate.is_active());
+
+        let settings = crate::config::WakewordCalibrationConfig {
+            vad_threshold: 1000.0,
+            vad_noise_adaptation: false,
+            vad_onset_frames: 1,
+            pre_roll_ms: 0,
+            initial_silence_timeout_ms: 500,
+            silence_timeout_ms: 200,
+            ..Default::default()
+        };
+        gate.apply_acoustic_settings(&settings);
+        assert!(!gate.is_active());
+        assert!(!gate.has_spoken());
+        assert!(gate.process_frame(quiet_speech.clone()).is_empty());
+        gate.set_manual_armed(true);
+        assert!(gate.process_frame(quiet_speech).is_empty());
+
+        let speech: Vec<u8> = (0..160).flat_map(|_| 2000i16.to_le_bytes()).collect();
+        // No old frames from the earlier profile leak into the newly opened turn.
+        assert_eq!(gate.process_frame(speech.clone()), vec![speech]);
+        for _ in 0..19 {
+            gate.process_frame(vec![0; 320]);
+            assert!(gate.is_active());
+        }
+        gate.process_frame(vec![0; 320]);
+        assert!(!gate.is_active());
+        assert!(gate.has_spoken());
+    }
+
+    #[test]
+    fn sensitive_vad_settings_never_replace_keyword_activation() {
+        let mut gate =
+            InputGate::with_activation(Box::new(keyword::DisabledKeyword), 10.0, 400, 1000, 16000);
+        gate.apply_acoustic_settings(&crate::config::WakewordCalibrationConfig {
+            vad_threshold: 1.0,
+            vad_noise_adaptation: false,
+            vad_onset_frames: 1,
+            ..Default::default()
+        });
+        let speech: Vec<u8> = (0..256).flat_map(|_| 5000i16.to_le_bytes()).collect();
+        for _ in 0..100 {
+            assert!(gate.process_frame(speech.clone()).is_empty());
+        }
+        assert!(!gate.is_active());
+        assert!(!gate.has_spoken());
+    }
+
+    #[test]
+    fn vad_settings_control_adaptation_and_current_frame_diagnostics() {
+        let settings = crate::config::WakewordCalibrationConfig {
+            vad_threshold: 100.0,
+            vad_noise_adaptation: false,
+            vad_onset_frames: 2,
+            ..Default::default()
+        };
+        let mut vad = SimpleVadEngine::from_settings(&settings);
+        let speech: Vec<u8> = (0..256).flat_map(|_| 500i16.to_le_bytes()).collect();
+        assert!(!vad.process(&speech));
+        assert!(vad.process(&speech));
+        assert_eq!(vad.diagnostics(), (50.0, 100.0, true));
+        assert!(!vad.process(&[0; 512]));
+        assert_eq!(vad.diagnostics(), (50.0, 100.0, false));
+
+        // With a deliberately fast adaptive floor the same steady level is
+        // classified as background rather than repeated speech onset.
+        let mut adaptive =
+            SimpleVadEngine::from_settings(&crate::config::WakewordCalibrationConfig {
+                vad_noise_adaptation: true,
+                vad_noise_multiplier: 2.0,
+                vad_noise_offset: 0.0,
+                vad_rise_alpha: 1.0,
+                ..settings
+            });
+        for _ in 0..10 {
+            assert!(!adaptive.process(&speech));
+        }
+        let (floor, threshold, active) = adaptive.diagnostics();
+        assert_eq!(floor, 500.0);
+        assert_eq!(threshold, 1000.0);
+        assert!(!active);
     }
 }

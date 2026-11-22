@@ -272,6 +272,7 @@ impl Rustpotter {
         self.band_pass_filter = (&config.band_pass).into();
         self.gain_normalizer_filter = (&config.gain_normalizer).into();
         self.reset();
+        self.on_wakeword_change();
     }
     /// Clean internal State
     ///
@@ -345,6 +346,7 @@ impl Rustpotter {
             }
         }
         self.rms_level = GainNormalizerFilter::get_rms_level(&audio_buffer);
+        self.gain = 1.0;
         if self.gain_normalizer_filter.is_some() {
             self.gain = self
                 .gain_normalizer_filter
@@ -491,4 +493,80 @@ pub struct RustpotterDetection {
     pub counter: usize,
     /// Gain applied to the scored frame
     pub gain: f32,
+}
+
+#[cfg(test)]
+mod acoustic_filter_tests {
+    use super::*;
+
+    fn reference() -> WakewordRef {
+        let matrix: Vec<Vec<f32>> = (0..40)
+            .map(|i| (0..16).map(|j| ((i + j) as f32 * 0.3).sin()).collect())
+            .collect();
+        WakewordRef {
+            name: "filter-fixture".into(),
+            avg_features: Some(matrix.clone()),
+            samples_features: (0..3)
+                .map(|i| (format!("sample-{i}"), matrix.clone()))
+                .collect(),
+            threshold: None,
+            avg_threshold: None,
+            rms_level: 0.01,
+            mfcc_size: 16,
+        }
+    }
+
+    #[test]
+    fn hot_filter_update_keeps_auto_reference_and_audio_gain() {
+        let mut settings = crate::PersonalDetectorConfig::default();
+        let mut detector =
+            crate::personal_reference_detector_with_config(reference(), &settings).unwrap();
+        let quiet = vec![0.0001_f32; detector.get_samples_per_frame()];
+        let _ = detector.process_samples(quiet.clone());
+        let before = detector.get_gain();
+        assert!(before > 1.0, "fixture must require normalization");
+        assert_eq!(detector.get_rms_level_ref(), 0.01);
+
+        settings.gain_max = 4.0;
+        detector.update_personal_config(&settings);
+        assert_eq!(
+            detector.get_rms_level_ref(),
+            0.01,
+            "hot update must retain enrolled RMS"
+        );
+        let _ = detector.process_samples(quiet.clone());
+        assert_eq!(
+            detector.get_gain(),
+            4.0,
+            "new gain limit must affect actual audio"
+        );
+
+        settings.gain_ref = Some(0.003);
+        detector.update_personal_config(&settings);
+        assert_eq!(
+            detector.get_rms_level_ref(),
+            0.003,
+            "explicit reference must remain authoritative"
+        );
+
+        settings.gain_normalizer_enabled = false;
+        detector.update_personal_config(&settings);
+        assert!(detector.get_rms_level_ref().is_nan());
+        let _ = detector.process_samples(quiet.clone());
+        assert_eq!(
+            detector.get_gain(),
+            1.0,
+            "disabled filter must report unity gain"
+        );
+        settings.gain_normalizer_enabled = true;
+        settings.gain_ref = None;
+        detector.update_personal_config(&settings);
+        assert_eq!(
+            detector.get_rms_level_ref(),
+            0.01,
+            "re-enabled auto mode needs an enrolled reference"
+        );
+        let _ = detector.process_samples(quiet);
+        assert_eq!(detector.get_gain(), 4.0);
+    }
 }

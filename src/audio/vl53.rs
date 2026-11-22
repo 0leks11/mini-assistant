@@ -114,6 +114,7 @@ impl GestureSession {
 }
 
 /// Map distance in millimeters to volume level (1..=10).
+#[allow(dead_code)]
 pub fn distance_to_level(dist_mm: u32) -> Option<u8> {
     const MIN_MM: u32 = 40;
     const MAX_MM: u32 = 300;
