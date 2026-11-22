@@ -492,11 +492,69 @@ impl AuthManager {
             ));
         }
 
-        // Static pages and public status
+        // Acoustic sessions read endpoints
+        let is_session_read = (method == "GET")
+            && (path.starts_with("/api/v1/acoustics/sessions")
+                || path.starts_with("/api/v1/calibration/sessions"));
+
+        if is_session_read {
+            if identity.has_scope(Scope::AcousticsRead)
+                || identity.has_scope(Scope::Jobs)
+                || identity.has_scope(Scope::Profiles)
+            {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: reading sessions requires calibration identity or owner",
+                ));
+            }
+            return Err((
+                "403 Forbidden",
+                "Forbidden: token lacks acoustics_read, jobs or profiles scope",
+            ));
+        }
+
+        // Acoustic sessions mutation endpoints (create, candidate, restore, confirm_owner, finish, cancel)
+        let is_session_write = (method == "POST")
+            && (path.starts_with("/api/v1/acoustics/sessions")
+                || path.starts_with("/api/v1/calibration/sessions"));
+
+        if is_session_write {
+            if identity.has_scope(Scope::Jobs)
+                || identity.has_scope(Scope::AcousticsWrite)
+                || identity.has_scope(Scope::Profiles)
+            {
+                return Ok(());
+            }
+            if matches!(identity, RequestIdentity::Anonymous) {
+                return Err((
+                    "401 Unauthorized",
+                    "Unauthorized: session actions require calibration identity with jobs, profiles or acoustics_write scope",
+                ));
+            }
+            return Err((
+                "403 Forbidden",
+                "Forbidden: token lacks jobs, profiles or acoustics_write scope",
+            ));
+        }
+
+        // Static pages, OpenAPI schema and public status
         if method == "GET"
             && matches!(
                 path,
-                "/" | "/index.html" | "/setup" | "/acoustics" | "/acoustics/" | "/api/v1/status"
+                "/" | "/index.html"
+                    | "/setup"
+                    | "/acoustics"
+                    | "/acoustics/"
+                    | "/api/v1/status"
+                    | "/api/v1/acoustics/schema"
+                    | "/api/v1/calibration/schema"
+                    | "/api/v1/acoustics/openapi.json"
+                    | "/api/v1/calibration/openapi.json"
+                    | "/api/v1/acoustics/state"
+                    | "/api/v1/calibration/state"
             )
         {
             return Ok(());

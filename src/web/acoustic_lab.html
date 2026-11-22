@@ -141,6 +141,111 @@
         <input type="file" id="profile-file" accept="application/json,.json" hidden>
         <p class="side-note">Значения по умолчанию — исходная точка, а не обещание лучшего распознавания. Подходящий профиль проверяется и на обращениях, и на обычном фоне.</p>
       </section>
+
+      <!-- Calibration Session & Measurements Runner -->
+      <section class="card" aria-labelledby="session-title">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h2 id="session-title" style="margin:0">Калибровочная сессия и измерения</h2>
+          <span id="session-status-badge" class="badge">Сессия: Не активна</span>
+        </div>
+        <p class="section-desc">Ограниченный сеанс измерений с автоматическим сохранением baseline для защиты от сбоев. Кандидаты применяются в RAM без перезаписи startup-конфигурации.</p>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+          <button type="button" id="start-session-btn">Начать сессию калибровки</button>
+          <button type="button" id="finish-session-btn" disabled>Завершить сессию</button>
+          <button type="button" id="cancel-session-btn" disabled>Отменить и восстановить</button>
+        </div>
+
+        <div id="owner-validation-notice" class="notice warning" role="alert" style="background:#2a1c06;border:1px solid #784a0c;color:#fcd34d;padding:12px;border-radius:8px;margin-bottom:14px;" hidden>
+          <strong>⚠️ Требуется живой контроль владельца</strong>
+          <p style="margin:4px 0 8px 0;font-size:13px">Параметры кандидата применены в RAM. Произнесите проверочные фразы («Алиса…») с расстояния 1–3 метра для оценки слышимости в реальной комнате.</p>
+          <button type="button" id="confirm-owner-btn" style="background:#f59e0b;color:#000;font-weight:600;padding:6px 12px;border-radius:6px;border:none;cursor:pointer">Подтвердить живой контроль</button>
+        </div>
+
+        <h3 style="margin-top:16px;margin-bottom:8px">Запуск измерительного задания (Job)</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:12px">
+          <div>
+            <label for="job-stimulus-origin" style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Источник стимула:</label>
+            <select id="job-stimulus-origin">
+              <option value="external_user_position">Внешняя колонка 2м (external_user_position)</option>
+              <option value="own_output">Собственный динамик (own_output)</option>
+              <option value="ambient">Шумовой фон комнаты (ambient)</option>
+            </select>
+          </div>
+          <div>
+            <label for="job-stimulus-signal" style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Тип стимула:</label>
+            <select id="job-stimulus-signal">
+              <option value="chirp_sweep">Chirp sweep (200..3000 Гц, -12 dBFS)</option>
+              <option value="silence">Тишина (фоновый замер 2 сек)</option>
+            </select>
+          </div>
+          <div>
+            <label for="job-output-route" style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Маршрут вывода:</label>
+            <select id="job-output-route">
+              <option value="built_in">Встроенный динамик (built_in)</option>
+              <option value="aux_out" id="job-aux-option">Линейный выход AUX (aux_out)</option>
+              <option value="none">Без звука (none)</option>
+            </select>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+          <button type="button" id="start-job-btn" class="primary">Запустить измерение</button>
+          <button type="button" id="cancel-job-btn" disabled>Остановить</button>
+          <span id="job-status-text" style="font-size:13px;color:var(--muted)">Ожидание</span>
+        </div>
+        <p class="side-note">Действительные capabilities: при отсутствии физического AUX-порта выбор AUX блокируется (без скрытого переключения на динамик). Громкость стимулов строго ограничена ≤ -6.0 dBFS.</p>
+      </section>
+
+      <!-- Samples Library & Audio Player -->
+      <section class="card" aria-labelledby="samples-title">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h2 id="samples-title" style="margin:0">Библиотека контрольных записей</h2>
+          <span id="samples-count-badge" class="badge">0 записей</span>
+        </div>
+        <p class="section-desc">Записи слова вызова и шумов, изолированные по сплитам: калибровочные (calibration), обучающие (train) и проверочные (held_out).</p>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+          <label for="samples-split-select" style="font-size:13px;color:var(--muted)">Сплит:</label>
+          <select id="samples-split-select" style="max-width:200px">
+            <option value="calibration">Калибровка (calibration)</option>
+            <option value="train">Обучение (train)</option>
+            <option value="held_out">Проверочный (held_out)</option>
+          </select>
+          <button type="button" id="refresh-samples-btn">Обновить список</button>
+        </div>
+        <div id="samples-list-container" style="max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:12px">
+          <div class="empty">Загрузка записей…</div>
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <span style="font-size:13px;color:var(--muted)">Прослушивание записи:</span>
+          <audio id="sample-audio-player" controls preload="none" style="height:36px;flex:1;min-width:200px"></audio>
+        </div>
+      </section>
+
+      <!-- Evaluation, Search & Reports Comparison -->
+      <section class="card" aria-labelledby="eval-title">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h2 id="eval-title" style="margin:0">Оценка кандидата и автоматический подбор</h2>
+          <span id="eval-status-badge" class="badge">Готов к оценке</span>
+        </div>
+        <p class="section-desc">Многокритериальная оценка KWS: полнота (recall), ложные срабатывания (FA/hr), утечки на собственном звуке (barge-in leakage), повторные дубли и нагрузка на CPU (Realtime Factor).</p>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+          <button type="button" id="run-eval-btn">Оценить текущие параметры</button>
+          <button type="button" id="run-search-btn" class="primary">Автоподбор параметров (до 20 итераций)</button>
+        </div>
+        <div id="eval-results-container" style="display:none;padding:12px;background:var(--surface2);border:1px solid var(--line);border-radius:10px;margin-bottom:12px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:8px">
+            <div><small class="muted">Полнота (Recall)</small><strong id="eval-recall" style="display:block;font-size:17px">—</strong></div>
+            <div><small class="muted">Ложные / час</small><strong id="eval-fa-rate" style="display:block;font-size:17px">—</strong></div>
+            <div><small class="muted">Утечки на себе</small><strong id="eval-own-leaks" style="display:block;font-size:17px">—</strong></div>
+            <div><small class="muted">Задержка (Latency)</small><strong id="eval-latency" style="display:block;font-size:17px">—</strong></div>
+            <div><small class="muted">RTF (CPU)</small><strong id="eval-rtf" style="display:block;font-size:17px">—</strong></div>
+            <div><small class="muted">Итоговый балл</small><strong id="eval-score" style="display:block;font-size:17px;color:var(--green)">—</strong></div>
+          </div>
+        </div>
+        <h3 style="margin-top:14px;margin-bottom:8px">Последние измерительные отчёты (Jobs)</h3>
+        <div id="job-reports-container" style="max-height:160px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px">
+          <div class="empty">Отчёты измерений пока отсутствуют</div>
+        </div>
+      </section>
       <section class="card" aria-labelledby="capabilities-title">
         <h2 id="capabilities-title">Аудиотракт и фиксированные ограничения</h2>
         <p class="section-desc">Здесь видны параметры, которые этот экран не меняет, и причины ограничений.</p>
@@ -669,6 +774,286 @@ function initAcousticLab() {
       message(e.message, "bad");
     }
   });
+
+  // Sessions, Jobs, Samples & Evaluation UI Logic
+  let activeSession = null;
+  let activeJobId = null;
+
+  async function refreshSessionStatus() {
+    try {
+      const res = await fetch("/api/v1/acoustics/sessions");
+      if (!res.ok) return;
+      const data = await res.json();
+      activeSession = data.session || null;
+      const badge = el("session-status-badge");
+      const startBtn = el("start-session-btn");
+      const finishBtn = el("finish-session-btn");
+      const cancelBtn = el("cancel-session-btn");
+      const ownerNotice = el("owner-validation-notice");
+
+      if (activeSession && (activeSession.state === "running" || activeSession.state === "awaiting_owner" || activeSession.state === "evaluating")) {
+        badge.textContent = `Активна: ${activeSession.name} (${activeSession.state})`;
+        badge.dataset.tone = "good";
+        startBtn.disabled = true;
+        finishBtn.disabled = false;
+        cancelBtn.disabled = false;
+        if (ownerNotice) {
+          ownerNotice.hidden = activeSession.owner_confirmed || !activeSession.active_candidate;
+        }
+      } else {
+        badge.textContent = "Сессия: Не активна";
+        badge.dataset.tone = "muted";
+        startBtn.disabled = false;
+        finishBtn.disabled = true;
+        cancelBtn.disabled = true;
+        if (ownerNotice) ownerNotice.hidden = true;
+      }
+    } catch (_) {}
+  }
+
+  async function refreshJobs() {
+    try {
+      const res = await fetch("/api/v1/acoustics/jobs");
+      if (!res.ok) return;
+      const data = await res.json();
+      activeJobId = data.active_job?.summary?.job_id || null;
+      const statusText = el("job-status-text");
+      const startJobBtn = el("start-job-btn");
+      const cancelJobBtn = el("cancel-job-btn");
+      const auxOpt = el("job-aux-option");
+
+      if (auxOpt) {
+        auxOpt.disabled = !data.aux_supported;
+        if (!data.aux_supported) {
+          auxOpt.textContent = "Линейный выход AUX (аппаратно отсутствует)";
+        }
+      }
+
+      if (activeJobId) {
+        statusText.textContent = `Выполняется job: ${activeJobId} (${data.active_job.summary.state})`;
+        startJobBtn.disabled = true;
+        cancelJobBtn.disabled = false;
+      } else {
+        statusText.textContent = "Ожидание";
+        startJobBtn.disabled = false;
+        cancelJobBtn.disabled = true;
+      }
+
+      const repContainer = el("job-reports-container");
+      if (repContainer && Array.isArray(data.history)) {
+        if (data.history.length === 0) {
+          repContainer.innerHTML = '<div class="empty">Отчёты измерений пока отсутствуют</div>';
+        } else {
+          repContainer.innerHTML = "";
+          for (const j of data.history) {
+            const row = document.createElement("div");
+            row.style.display = "flex";
+            row.style.justifyContent = "space-between";
+            row.style.alignItems = "center";
+            row.style.padding = "6px 0";
+            row.style.borderBottom = "1px solid var(--line)";
+            row.style.fontSize = "12px";
+            row.innerHTML = `<span><strong>${j.name || j.job_id}</strong> (${j.stimulus_origin} → ${j.output_route})</span><span class="badge" data-tone="${j.state === 'completed' ? 'good' : 'warn'}">${j.state}</span>`;
+            repContainer.appendChild(row);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  async function refreshSamples() {
+    const split = el("samples-split-select")?.value || "calibration";
+    try {
+      const res = await fetch(`/api/v1/acoustics/samples?split=${split}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const countBadge = el("samples-count-badge");
+      if (countBadge) countBadge.textContent = `${data.count || 0} записей`;
+      const container = el("samples-list-container");
+      if (!container) return;
+      const samples = data.samples || [];
+      if (samples.length === 0) {
+        container.innerHTML = '<div class="empty">Нет записей в этом сплите</div>';
+        return;
+      }
+      container.innerHTML = "";
+      for (const s of samples) {
+        const item = document.createElement("div");
+        item.style.display = "flex";
+        item.style.justifyContent = "space-between";
+        item.style.alignItems = "center";
+        item.style.padding = "6px 8px";
+        item.style.borderBottom = "1px solid var(--line)";
+        item.style.cursor = "pointer";
+        item.style.fontSize = "13px";
+        item.title = "Нажмите для прослушивания аудиозаписи";
+        item.innerHTML = `<span>▶ <strong>${s.name}</strong> [${s.label}]</span><span class="muted">${s.metrics?.duration_ms || 0} мс · SNR ${s.metrics?.snr_db?.toFixed(1) || '—'} dB</span>`;
+        item.addEventListener("click", () => {
+          const player = el("sample-audio-player");
+          if (player) {
+            player.src = `/api/v1/acoustics/samples/${s.id}/audio`;
+            player.play().catch(() => {});
+            message(`Воспроизведение записи «${s.name}»...`, "good");
+          }
+        });
+        container.appendChild(item);
+      }
+    } catch (_) {}
+  }
+
+  el("start-session-btn")?.addEventListener("click", async () => {
+    const name = window.prompt("Название калибровочной сессии:", "Калибровка комнаты");
+    if (name === null) return;
+    try {
+      const res = await fetch("/api/v1/acoustics/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim() || undefined, max_duration_secs: 1800 })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка старта сессии");
+      message(`Сессия калибровки «${data.session.name}» запущена! Baseline зафиксирован.`, "good");
+      refreshSessionStatus();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("confirm-owner-btn")?.addEventListener("click", async () => {
+    if (!activeSession) return;
+    try {
+      const res = await fetch(`/api/v1/acoustics/sessions/${activeSession.session_id}/confirm_owner`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes: "Owner live verification confirmed from UI" })
+      });
+      if (!res.ok) throw new Error("Не удалось подтвердить контроль");
+      message("Живой контроль подтверждён владельцем!", "good");
+      refreshSessionStatus();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("finish-session-btn")?.addEventListener("click", async () => {
+    if (!activeSession) return;
+    const saveName = window.prompt("Сохранить подобранные параметры как профиль комнаты? Введите название (или оставьте пустым для отката на baseline):");
+    try {
+      const res = await fetch(`/api/v1/acoustics/sessions/${activeSession.session_id}/finish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          owner_confirmed: true,
+          save_profile_name: saveName && saveName.trim() ? saveName.trim() : undefined,
+          activate_profile: !!(saveName && saveName.trim())
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка завершения сессии");
+      message("Сессия калибровки успешно завершена!", "good");
+      refreshSessionStatus();
+      refreshProfilesList();
+      poll();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("cancel-session-btn")?.addEventListener("click", async () => {
+    if (!activeSession) return;
+    if (!window.confirm("Отменить сессию и откатить параметры на baseline?")) return;
+    try {
+      const res = await fetch(`/api/v1/acoustics/sessions/${activeSession.session_id}/cancel`, { method: "POST" });
+      if (!res.ok) throw new Error("Ошибка отмены сессии");
+      message("Сессия отменена. Исходный baseline восстановлен.", "good");
+      refreshSessionStatus();
+      poll();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("start-job-btn")?.addEventListener("click", async () => {
+    const origin = el("job-stimulus-origin").value;
+    const signalType = el("job-stimulus-signal").value;
+    const route = el("job-output-route").value;
+
+    let stimulus;
+    if (signalType === "silence") {
+      stimulus = { silence: { duration_ms: 2000 } };
+    } else {
+      stimulus = { chirp_sweep: { start_hz: 200.0, end_hz: 3000.0, duration_ms: 500, volume_dbfs: -12.0 } };
+    }
+
+    try {
+      const res = await fetch("/api/v1/acoustics/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `measure_${origin}`,
+          stimulus_origin: origin,
+          output_route: route,
+          stimulus,
+          volume_pct: 35
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка запуска измерения");
+      message(`Измерение запущено (Job ID: ${data.job.job_id}). Синхронизация воспроизведения и записи...`, "good");
+      refreshJobs();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("cancel-job-btn")?.addEventListener("click", async () => {
+    if (!activeJobId) return;
+    try {
+      const res = await fetch(`/api/v1/acoustics/jobs/${activeJobId}/cancel`, { method: "POST" });
+      if (!res.ok) throw new Error("Ошибка отмены задания");
+      message("Измерительное задание остановлено.", "good");
+      refreshJobs();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("samples-split-select")?.addEventListener("change", refreshSamples);
+  el("refresh-samples-btn")?.addEventListener("click", refreshSamples);
+
+  el("run-eval-btn")?.addEventListener("click", async () => {
+    message("Оценка параметров на калибровочном корпусе...", "good");
+    try {
+      const settings = validateSettings(draft, latest.controls, latest.defaults);
+      const res = await fetch("/api/v1/acoustics/evaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings, split: "calibration" })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка оценки");
+      const ev = data.evaluation;
+      el("eval-results-container").style.display = "block";
+      el("eval-recall").textContent = (ev.recall * 100).toFixed(1) + "%";
+      el("eval-fa-rate").textContent = ev.false_alarm_rate_per_hour.toFixed(1);
+      el("eval-own-leaks").textContent = String(ev.own_output_leaks);
+      el("eval-latency").textContent = ev.mean_latency_ms ? ev.mean_latency_ms.toFixed(0) + " мс" : "—";
+      el("eval-rtf").textContent = ev.realtime_factor.toFixed(2);
+      el("eval-score").textContent = ev.candidate_score.toFixed(1);
+      message(`Оценка завершена: итоговый балл ${ev.candidate_score.toFixed(1)}, полнота ${(ev.recall * 100).toFixed(0)}%.`, "good");
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("run-search-btn")?.addEventListener("click", async () => {
+    message("Выполняется ограниченный автоматический подбор параметров (до 20 итераций)...", "good");
+    try {
+      const res = await fetch("/api/v1/acoustics/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ split: "calibration", max_trials: 10 })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка автоподбора");
+      const srch = data.search;
+      if (srch.best_candidate) {
+        fillForm(srch.best_candidate, baseRevision, false);
+        message(`Автоподбор завершён (${srch.total_trials} итераций). Лучший кандидат загружен в форму! Балл: ${srch.best_score.toFixed(1)}.`, "good");
+      }
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  refreshSessionStatus();
+  refreshJobs();
+  refreshSamples();
+  setInterval(() => { refreshSessionStatus(); refreshJobs(); }, 3000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
   window.addEventListener("beforeunload", event => { if (dirty() || busy) { event.preventDefault(); event.returnValue = ""; } });
   window.addEventListener("pagehide", () => { if (pollTimer !== null) clearInterval(pollTimer); });

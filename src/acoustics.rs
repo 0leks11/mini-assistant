@@ -1,8 +1,10 @@
 //! Local acoustic settings and metadata. No microphone, provider or shell access.
 pub mod evaluator;
 pub mod jobs;
+pub mod openapi;
 pub mod profiles;
 pub mod samples;
+pub mod sessions;
 use crate::config::{Config, WakewordCalibrationConfig};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -533,6 +535,78 @@ impl AcousticLab {
                         }
                     }
                 });
+                Ok(s)
+            }
+            Ok(Err(_closed)) => {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.pending = false;
+                s.error = Some("Audio loop closed ACK channel without confirming".to_string());
+                anyhow::bail!("Audio loop closed ACK channel without confirming");
+            }
+            Err(_timeout) => {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.error = Some("Audio confirmation timed out awaiting audio loop".to_string());
+                anyhow::bail!("Audio confirmation timed out awaiting audio loop");
+            }
+        }
+    }
+
+    /// Apply candidate settings in RAM (memory only) with audio loop confirmation.
+    pub async fn apply_candidate_in_memory(
+        &self,
+        settings: AcousticSettingsDto,
+    ) -> Result<Snapshot> {
+        settings.validate()?;
+        let target_config: WakewordCalibrationConfig = settings.into();
+        self.apply_config_in_memory(target_config).await
+    }
+
+    /// Apply any WakewordCalibrationConfig in RAM (memory only) with audio loop confirmation.
+    pub async fn apply_config_in_memory(
+        &self,
+        target_config: WakewordCalibrationConfig,
+    ) -> Result<Snapshot> {
+        target_config.validate()?;
+        let _guard = self
+            .writer
+            .try_lock()
+            .context("Another acoustic update is in progress")?;
+        let old = self.snapshot();
+        ensure!(
+            !old.pending,
+            "Previous update is still awaiting the audio loop"
+        );
+        ensure!(
+            old.runtime.ready && !self.tx.is_closed(),
+            "Audio loop is unavailable"
+        );
+        let revision = old
+            .revision
+            .checked_add(1)
+            .context("Acoustic revision exhausted")?;
+        let permit = self
+            .tx
+            .try_reserve()
+            .context("Audio settings queue is unavailable")?;
+        let (reply, ack) = oneshot::channel();
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.revision = revision;
+            s.pending = true;
+            s.error = None;
+        }
+        permit.send(ApplyRequest {
+            revision,
+            settings: target_config,
+            reply,
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(3), ack).await {
+            Ok(Ok(())) => {
+                let s = self.snapshot();
+                ensure!(
+                    s.applied_revision == Some(revision) && s.error.is_none(),
+                    "In-memory settings update rejected by audio loop"
+                );
                 Ok(s)
             }
             Ok(Err(_closed)) => {

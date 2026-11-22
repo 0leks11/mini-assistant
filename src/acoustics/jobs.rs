@@ -416,6 +416,7 @@ pub struct AcousticJobRunner {
     active_job: Arc<Mutex<Option<JobDetail>>>,
     history: Arc<Mutex<VecDeque<JobSummary>>>,
     reports: Arc<Mutex<std::collections::HashMap<String, crate::acoustics::evaluator::JobReport>>>,
+    idempotency_keys: Arc<Mutex<std::collections::HashMap<String, String>>>,
     cancel_flag: Arc<AtomicBool>,
     abort_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -437,6 +438,7 @@ impl AcousticJobRunner {
             reports: Arc::new(Mutex::new(std::collections::HashMap::with_capacity(
                 MAX_JOB_HISTORY,
             ))),
+            idempotency_keys: Arc::new(Mutex::new(std::collections::HashMap::new())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             abort_handle: Arc::new(Mutex::new(None)),
         })
@@ -555,7 +557,20 @@ impl AcousticJobRunner {
     }
 
     /// Starts an acoustic job. Enforces mutual exclusion: fails with 409 Conflict if active.
-    pub fn start_job(self: &Arc<Self>, mut dto: CreateJobDto) -> Result<JobSummary, JobError> {
+    /// If idempotency_key is provided and already observed, returns existing job summary without re-running audio.
+    pub fn start_job(
+        self: &Arc<Self>,
+        mut dto: CreateJobDto,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobSummary, JobError> {
+        if let Some(key) = idempotency_key {
+            let guard = self.idempotency_keys.lock().unwrap();
+            if let Some(existing_id) = guard.get(key) {
+                if let Some(detail) = self.get_job(existing_id) {
+                    return Ok(detail.summary);
+                }
+            }
+        }
         // Parameter clamping & safety limits
         dto.pre_roll_ms = dto.pre_roll_ms.clamp(100, 2000);
         dto.post_roll_ms = dto.post_roll_ms.clamp(100, 5000);
@@ -638,6 +653,14 @@ impl AcousticJobRunner {
 
         let now_ms = now_timestamp_ms();
         let job_id = format!("job_{}", uuid::Uuid::new_v4().simple());
+
+        if let Some(key) = idempotency_key {
+            let mut guard = self.idempotency_keys.lock().unwrap();
+            if guard.len() >= 100 {
+                guard.clear();
+            }
+            guard.insert(key.to_string(), job_id.clone());
+        }
 
         // Mutual exclusion lease check
         {
@@ -1018,10 +1041,10 @@ mod tests {
             post_roll_ms: 100,
             volume_pct: 40,
         };
-        let err = runner.start_job(aux_dto).unwrap_err();
+        let err = runner.start_job(aux_dto, None).unwrap_err();
         assert!(matches!(err, JobError::Unsupported(_)));
 
-        // 2. Starting valid job
+        // 2. Starting valid job with idempotency key
         let job_dto = CreateJobDto {
             name: Some("sweep_test".into()),
             stimulus_origin: StimulusOrigin::OwnOutput,
@@ -1037,8 +1060,14 @@ mod tests {
             volume_pct: 30,
         };
 
-        let summary = runner.start_job(job_dto).unwrap();
+        let summary = runner
+            .start_job(job_dto.clone(), Some("idem-job-1"))
+            .unwrap();
         assert_eq!(summary.name.as_deref(), Some("sweep_test"));
+
+        // 2b. Same idempotency key returns exact same job summary without starting a new job
+        let repeat_summary = runner.start_job(job_dto, Some("idem-job-1")).unwrap();
+        assert_eq!(repeat_summary.job_id, summary.job_id);
 
         // 3. Concurrent start must yield Conflict
         let conflict_dto = CreateJobDto {
@@ -1050,7 +1079,7 @@ mod tests {
             post_roll_ms: 100,
             volume_pct: 30,
         };
-        let conflict_err = runner.start_job(conflict_dto).unwrap_err();
+        let conflict_err = runner.start_job(conflict_dto, None).unwrap_err();
         assert!(matches!(conflict_err, JobError::Conflict(_)));
 
         // Wait for background execution to finish (100ms pre + 200ms sweep + 100ms post)
@@ -1084,7 +1113,7 @@ mod tests {
             volume_pct: 0,
         };
 
-        let summary = runner.start_job(job_dto).unwrap();
+        let summary = runner.start_job(job_dto, None).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let cancelled = runner.cancel_active("Interrupted by user action").unwrap();

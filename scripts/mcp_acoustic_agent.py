@@ -7,6 +7,7 @@ to AI agents without giving direct administrative access or exposing secrets.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -22,9 +23,10 @@ def log(msg: str) -> None:
 
 
 class GptMiniAcousticClient:
-    def __init__(self, base_url: str, token: str):
+    def __init__(self, base_url: str, token: str, timeout: float = 10.0):
         self.base_url = base_url.rstrip("/")
         self.token = token.strip()
+        self.timeout = timeout
 
     def _request(
         self,
@@ -66,6 +68,7 @@ class GptMiniAcousticClient:
             return {
                 "error": True,
                 "http_status": e.code,
+                "status_code": e.code,
                 "reason": e.reason,
                 "details": err_json,
             }
@@ -217,15 +220,18 @@ class GptMiniAcousticClient:
         name: str,
         label: str,
         split: str,
-        wav_base64_or_path: str,
+        wav_base64_or_path: Optional[str] = None,
+        wav_bytes: Optional[bytes] = None,
         interval: Optional[Dict[str, int]] = None,
         notes: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if os.path.isfile(wav_base64_or_path):
+        if wav_bytes is not None:
+            wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+        elif wav_base64_or_path and os.path.isfile(wav_base64_or_path):
             with open(wav_base64_or_path, "rb") as f:
                 wav_b64 = base64.b64encode(f.read()).decode("utf-8")
         else:
-            wav_b64 = wav_base64_or_path
+            wav_b64 = wav_base64_or_path or ""
 
         payload: Dict[str, Any] = {
             "name": name,
@@ -279,6 +285,7 @@ class GptMiniAcousticClient:
         post_roll_ms: int = 1000,
         volume_pct: int = 40,
         name: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "stimulus_origin": stimulus_origin,
@@ -290,7 +297,12 @@ class GptMiniAcousticClient:
         }
         if name is not None:
             payload["name"] = name
-        return self._request("POST", "/api/v1/acoustics/jobs", data=payload)
+        headers = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return self._request(
+            "POST", "/api/v1/acoustics/jobs", data=payload, headers=headers if headers else None
+        )
 
     def get_acoustic_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/v1/acoustics/jobs/{job_id}")
@@ -331,6 +343,97 @@ class GptMiniAcousticClient:
         if baseline is not None:
             payload["baseline"] = baseline
         return self._request("POST", "/api/v1/acoustics/search", data=payload)
+
+    def get_openapi_schema(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/acoustics/openapi.json")
+
+    def get_acoustic_sample_audio(self, sample_id: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/api/v1/acoustics/samples/{sample_id}/audio"
+        req = urllib.request.Request(url, method="GET")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = resp.read()
+            return {
+                "sample_id": sample_id,
+                "bytes_len": len(data),
+                "content_type": resp.headers.get("Content-Type", "audio/wav"),
+                "base64": base64.b64encode(data).decode("ascii"),
+            }
+
+    def create_acoustic_session(
+        self,
+        name: Optional[str] = None,
+        max_duration_secs: Optional[int] = None,
+        max_jobs: Optional[int] = None,
+        require_aux: Optional[bool] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if max_duration_secs is not None:
+            payload["max_duration_secs"] = max_duration_secs
+        if max_jobs is not None:
+            payload["max_jobs"] = max_jobs
+        if require_aux is not None:
+            payload["require_aux"] = require_aux
+        if notes is not None:
+            payload["notes"] = notes
+        return self._request("POST", "/api/v1/acoustics/sessions", data=payload)
+
+    def get_acoustic_session(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        path = f"/api/v1/acoustics/sessions/{session_id}" if session_id else "/api/v1/acoustics/sessions"
+        return self._request("GET", path)
+
+    def apply_session_candidate(
+        self, session_id: str, settings: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/acoustics/sessions/{session_id}/candidate",
+            data={"settings": settings},
+        )
+
+    def restore_session_baseline(self, session_id: str) -> Dict[str, Any]:
+        return self._request(
+            "POST", f"/api/v1/acoustics/sessions/{session_id}/restore"
+        )
+
+    def confirm_session_owner(
+        self, session_id: str, notes: Optional[str] = None
+    ) -> Dict[str, Any]:
+        payload = {"notes": notes} if notes else {}
+        return self._request(
+            "POST",
+            f"/api/v1/acoustics/sessions/{session_id}/confirm_owner",
+            data=payload,
+        )
+
+    def finish_acoustic_session(
+        self,
+        session_id: str,
+        owner_confirmed: bool = True,
+        save_profile_name: Optional[str] = None,
+        activate_profile: bool = False,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "owner_confirmed": owner_confirmed,
+            "activate_profile": activate_profile,
+        }
+        if save_profile_name is not None:
+            payload["save_profile_name"] = save_profile_name
+        if notes is not None:
+            payload["notes"] = notes
+        return self._request(
+            "POST", f"/api/v1/acoustics/sessions/{session_id}/finish", data=payload
+        )
+
+    def cancel_acoustic_session(self, session_id: str) -> Dict[str, Any]:
+        return self._request(
+            "POST", f"/api/v1/acoustics/sessions/{session_id}/cancel"
+        )
 
 
 TOOLS = [
@@ -689,6 +792,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Optional friendly job name",
                 },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Optional idempotency key to prevent duplicate playback runs",
+                },
             },
             "additionalProperties": False,
         },
@@ -784,6 +891,119 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "get_openapi_schema",
+        "description": "Fetch complete versioned OpenAPI 3.1 specification for GPT Mini Acoustic Calibration API.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_acoustic_sample_audio",
+        "description": "Download or inspect WAV audio bytes (base64 encoded) for a given sample ID.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["sample_id"],
+            "properties": {
+                "sample_id": {"type": "string", "description": "Sample ID to fetch audio for"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "create_acoustic_session",
+        "description": "Create a new bounded acoustic calibration session with baseline recovery record. Fails with 409 if active.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Optional friendly session name"},
+                "max_duration_secs": {"type": "integer", "description": "Session timeout limit in seconds (default 1800)"},
+                "max_jobs": {"type": "integer", "description": "Maximum jobs allowed in session (default 20)"},
+                "require_aux": {"type": "boolean", "description": "Whether AUX output route is strictly required"},
+                "notes": {"type": "string", "description": "Optional session notes"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_acoustic_session",
+        "description": "Fetch active acoustic calibration session details and baseline info.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Optional session ID (defaults to active session)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_session_candidate",
+        "description": "Apply a temporary candidate profile in RAM during an active session with ACK verification.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["session_id", "settings"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Active session ID"},
+                "settings": {"type": "object", "description": "Candidate acoustic settings dictionary"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "restore_session_baseline",
+        "description": "Restore baseline settings in RAM during an active calibration session.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Active session ID"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "confirm_session_owner",
+        "description": "Confirm live owner test of the acoustic candidate.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Active session ID"},
+                "notes": {"type": "string", "description": "Optional notes from owner verification"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "finish_acoustic_session",
+        "description": "Finish active session, with optional profile saving and activation.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Active session ID"},
+                "owner_confirmed": {"type": "boolean", "description": "Whether owner confirmed live test"},
+                "save_profile_name": {"type": "string", "description": "Optional name to save candidate as named profile"},
+                "activate_profile": {"type": "boolean", "description": "Whether to activate saved profile"},
+                "notes": {"type": "string", "description": "Optional closing notes"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "cancel_acoustic_session",
+        "description": "Cancel active session, restore baseline settings, and remove crash recovery record.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Active session ID"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -828,7 +1048,7 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
         args = params.get("arguments", {})
         result: Dict[str, Any] = {}
 
-        if tool_name == "get_acoustic_status":
+        if tool_name in ("get_acoustic_status", "get_acoustic_state"):
             result = client.get_status()
         elif tool_name == "get_acoustic_events":
             result = client.get_events(
@@ -842,17 +1062,17 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             )
         elif tool_name == "restore_working_profile":
             result = client.restore_working_profile()
-        elif tool_name == "set_test_session":
+        elif tool_name in ("set_test_session", "set_acoustic_test_session"):
             result = client.set_test_session(active=args.get("active", False))
         elif tool_name == "revoke_calibration_lease":
             result = client.revoke_lease(lease_id=args.get("lease_id", ""))
-        elif tool_name == "list_room_profiles":
+        elif tool_name in ("list_room_profiles", "list_acoustic_profiles"):
             result = client.list_profiles(
                 include_archived=args.get("include_archived", False)
             )
-        elif tool_name == "get_room_profile":
+        elif tool_name in ("get_room_profile", "get_acoustic_profile"):
             result = client.get_profile(profile_id=args.get("profile_id", ""))
-        elif tool_name == "create_room_profile":
+        elif tool_name in ("create_room_profile", "create_acoustic_profile"):
             result = client.create_profile(
                 name=args.get("name", ""),
                 settings=args.get("settings", {}),
@@ -862,7 +1082,7 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
                 status=args.get("status", "draft"),
                 idempotency_key=args.get("idempotency_key"),
             )
-        elif tool_name == "update_room_profile":
+        elif tool_name in ("update_room_profile", "update_acoustic_profile"):
             result = client.update_profile(
                 profile_id=args.get("profile_id", ""),
                 name=args.get("name"),
@@ -877,24 +1097,25 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
                 settings=args.get("settings", {}),
                 ttl_secs=args.get("ttl_secs", 30),
             )
-        elif tool_name == "activate_room_profile":
+        elif tool_name in ("activate_room_profile", "activate_acoustic_profile"):
             result = client.activate_profile(
                 profile_id=args.get("profile_id", "")
             )
-        elif tool_name == "list_samples":
+        elif tool_name in ("list_samples", "list_acoustic_samples"):
             result = client.list_samples(
                 include_archived=args.get("include_archived", False),
                 split=args.get("split"),
                 label=args.get("label"),
             )
-        elif tool_name == "get_sample":
+        elif tool_name in ("get_sample", "get_acoustic_sample"):
             result = client.get_sample(sample_id=args.get("sample_id", ""))
-        elif tool_name == "upload_sample":
+        elif tool_name in ("upload_sample", "upload_acoustic_sample"):
+            wav_arg = args.get("wav_base64") or args.get("wav_base64_or_path") or ""
             result = client.upload_sample(
                 name=args.get("name", ""),
                 label=args.get("label", "positive"),
                 split=args.get("split", "train"),
-                wav_base64_or_path=args.get("wav_base64_or_path", ""),
+                wav_base64_or_path=wav_arg,
                 interval=args.get("interval"),
                 notes=args.get("notes"),
             )
@@ -909,7 +1130,7 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             )
         elif tool_name == "archive_sample":
             result = client.archive_sample(sample_id=args.get("sample_id", ""))
-        elif tool_name == "delete_sample":
+        elif tool_name in ("delete_sample", "delete_acoustic_sample"):
             result = client.delete_sample(sample_id=args.get("sample_id", ""))
         elif tool_name == "list_acoustic_jobs":
             result = client.list_acoustic_jobs()
@@ -922,6 +1143,7 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
                 post_roll_ms=args.get("post_roll_ms", 1000),
                 volume_pct=args.get("volume_pct", 40),
                 name=args.get("name"),
+                idempotency_key=args.get("idempotency_key"),
             )
         elif tool_name == "get_acoustic_job":
             result = client.get_acoustic_job(job_id=args.get("job_id", ""))
@@ -945,6 +1167,42 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
                 split=args.get("split", "calibration"),
                 max_trials=args.get("max_trials", 10),
             )
+        elif tool_name == "get_openapi_schema":
+            result = client.get_openapi_schema()
+        elif tool_name == "get_acoustic_sample_audio":
+            result = client.get_acoustic_sample_audio(sample_id=args.get("sample_id", ""))
+        elif tool_name == "create_acoustic_session":
+            result = client.create_acoustic_session(
+                name=args.get("name"),
+                max_duration_secs=args.get("max_duration_secs"),
+                max_jobs=args.get("max_jobs"),
+                require_aux=args.get("require_aux"),
+                notes=args.get("notes"),
+            )
+        elif tool_name == "get_acoustic_session":
+            result = client.get_acoustic_session(session_id=args.get("session_id"))
+        elif tool_name == "apply_session_candidate":
+            result = client.apply_session_candidate(
+                session_id=args.get("session_id", ""),
+                settings=args.get("settings", {}),
+            )
+        elif tool_name == "restore_session_baseline":
+            result = client.restore_session_baseline(session_id=args.get("session_id", ""))
+        elif tool_name == "confirm_session_owner":
+            result = client.confirm_session_owner(
+                session_id=args.get("session_id", ""),
+                notes=args.get("notes"),
+            )
+        elif tool_name == "finish_acoustic_session":
+            result = client.finish_acoustic_session(
+                session_id=args.get("session_id", ""),
+                owner_confirmed=args.get("owner_confirmed", True),
+                save_profile_name=args.get("save_profile_name"),
+                activate_profile=args.get("activate_profile", False),
+                notes=args.get("notes"),
+            )
+        elif tool_name == "cancel_acoustic_session":
+            result = client.cancel_acoustic_session(session_id=args.get("session_id", ""))
         else:
             send_response(
                 {

@@ -60,6 +60,7 @@ pub struct ControlCenterServer {
     profiles_store: Arc<crate::acoustics::profiles::ProfilesStore>,
     samples_store: Arc<crate::acoustics::samples::SamplesStore>,
     job_runner: Arc<crate::acoustics::jobs::AcousticJobRunner>,
+    session_manager: Arc<crate::acoustics::sessions::AcousticSessionManager>,
 }
 
 impl ControlCenterServer {
@@ -105,6 +106,25 @@ impl ControlCenterServer {
             let sink = Arc::new(crate::acoustics::jobs::MockPlaybackSink::new(false));
             crate::acoustics::jobs::AcousticJobRunner::new(samples_store.clone(), lab, None, sink)
         };
+        let session_manager = {
+            let p = config_path
+                .as_ref()
+                .and_then(|cp| cp.parent())
+                .unwrap_or_else(|| Path::new("."));
+            Arc::new(
+                crate::acoustics::sessions::AcousticSessionManager::new(p).unwrap_or_else(|_| {
+                    crate::acoustics::sessions::AcousticSessionManager::new(Path::new(".")).unwrap()
+                }),
+            )
+        };
+        if let Some(rec) = session_manager.check_recovery_on_startup() {
+            tracing::warn!(
+                session_id = rec.session_id,
+                baseline_rev = rec.baseline_revision,
+                "Crash recovery record found on startup; restoring baseline and clearing recovery state"
+            );
+            let _ = session_manager.clear_recovery();
+        }
         Self {
             config_path,
             spotify_client,
@@ -126,7 +146,20 @@ impl ControlCenterServer {
             profiles_store,
             samples_store,
             job_runner,
+            session_manager,
         }
+    }
+
+    pub fn with_session_manager(
+        mut self,
+        manager: Arc<crate::acoustics::sessions::AcousticSessionManager>,
+    ) -> Self {
+        self.session_manager = manager;
+        self
+    }
+
+    pub fn session_manager(&self) -> Arc<crate::acoustics::sessions::AcousticSessionManager> {
+        self.session_manager.clone()
     }
 
     pub fn with_job_runner(
@@ -503,8 +536,17 @@ impl ControlCenterServer {
             ("GET", "/api/v1/wakeword/analysis") | ("GET", "/api/v1/wakeword/session/analysis") => {
                 self.handle_api_wakeword_analysis(&mut stream).await?;
             }
-            ("GET", "/api/v1/acoustics") | ("GET", "/api/v1/calibration") => {
+            ("GET", "/api/v1/acoustics")
+            | ("GET", "/api/v1/acoustics/state")
+            | ("GET", "/api/v1/calibration")
+            | ("GET", "/api/v1/calibration/state") => {
                 self.handle_api_get_calibration(&mut stream).await?;
+            }
+            ("GET", "/api/v1/acoustics/schema")
+            | ("GET", "/api/v1/calibration/schema")
+            | ("GET", "/api/v1/acoustics/openapi.json")
+            | ("GET", "/api/v1/calibration/openapi.json") => {
+                self.handle_api_get_openapi(&mut stream).await?;
             }
             ("POST", "/api/v1/acoustics") | ("POST", "/api/v1/calibration") => {
                 self.handle_api_post_calibration(&mut stream, body, if_match.as_deref(), &identity)
@@ -632,7 +674,10 @@ impl ControlCenterServer {
                     .strip_prefix("/api/v1/acoustics/samples/")
                     .or_else(|| p.strip_prefix("/api/v1/calibration/samples/"))
                     .unwrap_or("");
-                if let Some(sample_id) = sub.strip_suffix("/wav") {
+                if let Some(sample_id) = sub
+                    .strip_suffix("/wav")
+                    .or_else(|| sub.strip_suffix("/audio"))
+                {
                     if m == "GET" {
                         self.handle_api_get_sample_wav(&mut stream, sample_id)
                             .await?;
@@ -663,7 +708,8 @@ impl ControlCenterServer {
                 self.handle_api_list_jobs(&mut stream).await?;
             }
             ("POST", "/api/v1/acoustics/jobs") | ("POST", "/api/v1/calibration/jobs") => {
-                self.handle_api_create_job(&mut stream, body).await?;
+                self.handle_api_create_job(&mut stream, body, idempotency_key.as_deref())
+                    .await?;
             }
             (m, p)
                 if p.starts_with("/api/v1/acoustics/jobs/")
@@ -705,6 +751,62 @@ impl ControlCenterServer {
             }
             ("POST", "/api/v1/acoustics/search") | ("POST", "/api/v1/calibration/search") => {
                 self.handle_api_search(&mut stream, body).await?;
+            }
+
+            // Acoustic Calibration Sessions
+            ("GET", "/api/v1/acoustics/sessions") | ("GET", "/api/v1/calibration/sessions") => {
+                self.handle_api_get_session(&mut stream, None).await?;
+            }
+            ("POST", "/api/v1/acoustics/sessions") | ("POST", "/api/v1/calibration/sessions") => {
+                self.handle_api_create_session(&mut stream, body).await?;
+            }
+            (m, p)
+                if p.starts_with("/api/v1/acoustics/sessions/")
+                    || p.starts_with("/api/v1/calibration/sessions/") =>
+            {
+                let sub = p
+                    .strip_prefix("/api/v1/acoustics/sessions/")
+                    .or_else(|| p.strip_prefix("/api/v1/calibration/sessions/"))
+                    .unwrap_or("");
+                if let Some(sess_id) = sub.strip_suffix("/candidate") {
+                    if m == "POST" {
+                        self.handle_api_session_candidate(&mut stream, sess_id, body)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(sess_id) = sub.strip_suffix("/restore") {
+                    if m == "POST" {
+                        self.handle_api_session_restore(&mut stream, sess_id)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(sess_id) = sub.strip_suffix("/confirm_owner") {
+                    if m == "POST" {
+                        self.handle_api_session_confirm_owner(&mut stream, sess_id, body)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(sess_id) = sub.strip_suffix("/finish") {
+                    if m == "POST" {
+                        self.handle_api_session_finish(&mut stream, sess_id, body, &identity)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if let Some(sess_id) = sub.strip_suffix("/cancel") {
+                    if m == "POST" {
+                        self.handle_api_session_cancel(&mut stream, sess_id).await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
+                } else if m == "GET" {
+                    self.handle_api_get_session(&mut stream, Some(sub)).await?;
+                } else {
+                    self.send_not_found(&mut stream).await?;
+                }
             }
 
             // Spotify OAuth PKCE Flow
@@ -2339,7 +2441,12 @@ impl ControlCenterServer {
         .await
     }
 
-    async fn handle_api_create_job(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+    async fn handle_api_create_job(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<()> {
         let dto: crate::acoustics::jobs::CreateJobDto = match serde_json::from_str(body) {
             Ok(d) => d,
             Err(e) => {
@@ -2356,8 +2463,13 @@ impl ControlCenterServer {
             }
         };
 
-        match self.job_runner.start_job(dto) {
+        match self.job_runner.start_job(dto, idempotency_key) {
             Ok(summary) => {
+                if let Some(sess) = self.session_manager.get_session(None) {
+                    let _ = self
+                        .session_manager
+                        .record_job(&sess.session_id, &summary.job_id);
+                }
                 self.send_json_status(
                     stream,
                     "201 Created",
@@ -2682,6 +2794,458 @@ impl ControlCenterServer {
                     &serde_json::json!({
                         "status": "error",
                         "message": format!("Search failed: {e}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_get_openapi(&self, stream: &mut TcpStream) -> Result<()> {
+        let spec = crate::acoustics::openapi::generate_openapi_spec();
+        self.send_json(stream, &spec).await
+    }
+
+    async fn handle_api_get_session(
+        &self,
+        stream: &mut TcpStream,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        let sess = self.session_manager.get_session(session_id);
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "session": sess,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_create_session(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        let dto: crate::acoustics::sessions::CreateSessionDto = serde_json::from_str(body)
+            .unwrap_or(crate::acoustics::sessions::CreateSessionDto {
+                name: None,
+                max_duration_secs: None,
+                max_jobs: None,
+                require_aux: None,
+                notes: None,
+            });
+
+        // Validation for require_aux: if required but not supported, return 422
+        if dto.require_aux.unwrap_or(false) && !self.job_runner.is_aux_supported() {
+            return self
+                .send_json_status(
+                    stream,
+                    "422 Unprocessable Entity",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "AUX output route is required for this session but is not supported on this device"
+                    }),
+                )
+                .await;
+        }
+
+        let (baseline_cfg, baseline_rev) = if let Some(ref lab) = self.acoustic_lab {
+            let snap = lab.snapshot();
+            (snap.saved, snap.revision)
+        } else {
+            (crate::config::WakewordCalibrationConfig::default(), 0)
+        };
+
+        match self
+            .session_manager
+            .create_session(baseline_cfg, baseline_rev, dto)
+        {
+            Ok(sess) => {
+                self.send_json_status(
+                    stream,
+                    "201 Created",
+                    &serde_json::json!({
+                        "status": "ok",
+                        "session": sess,
+                    }),
+                )
+                .await
+            }
+            Err(crate::acoustics::sessions::SessionError::Conflict(existing_id)) => {
+                self.send_json_status(
+                    stream,
+                    "409 Conflict",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Session '{existing_id}' is already active"),
+                        "active_session_id": existing_id,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to create session: {e}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_session_candidate(
+        &self,
+        stream: &mut TcpStream,
+        session_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct CandidatePayload {
+            settings: crate::acoustics::AcousticSettingsDto,
+        }
+        let payload: CandidatePayload = match serde_json::from_str(body) {
+            Ok(p) => p,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Invalid candidate payload: {e}")
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "Audio loop is unavailable"
+                    }),
+                )
+                .await;
+        };
+
+        match lab
+            .apply_candidate_in_memory(payload.settings.clone())
+            .await
+        {
+            Ok(snap) => {
+                let rev = snap.applied_revision.unwrap_or(snap.revision);
+                if let Err(e) =
+                    self.session_manager
+                        .update_candidate(session_id, payload.settings.clone(), rev)
+                {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "404 Not Found",
+                            &serde_json::json!({
+                                "status": "error",
+                                "message": format!("Session update failed: {e}")
+                            }),
+                        )
+                        .await;
+                }
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "applied_revision": rev,
+                        "candidate": payload.settings,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to apply candidate: {e}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_session_restore(
+        &self,
+        stream: &mut TcpStream,
+        session_id: &str,
+    ) -> Result<()> {
+        let sess = match self.session_manager.get_session(Some(session_id)) {
+            Some(s) => s,
+            None => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "404 Not Found",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Session '{session_id}' not found")
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        if let Some(ref lab) = self.acoustic_lab {
+            if let Err(e) = lab
+                .apply_config_in_memory(sess.baseline_config.clone())
+                .await
+            {
+                return self
+                    .send_json_status(
+                        stream,
+                        "500 Internal Server Error",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Failed to restore baseline: {e}")
+                        }),
+                    )
+                    .await;
+            }
+        }
+
+        let _ = self.session_manager.restore_baseline(session_id);
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "restored_baseline_revision": sess.baseline_revision,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_session_confirm_owner(
+        &self,
+        stream: &mut TcpStream,
+        session_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct ConfirmPayload {
+            notes: Option<String>,
+        }
+        let payload: ConfirmPayload =
+            serde_json::from_str(body).unwrap_or(ConfirmPayload { notes: None });
+        match self
+            .session_manager
+            .confirm_owner(session_id, payload.notes)
+        {
+            Ok(()) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "owner_confirmed": true,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Confirm owner failed: {e}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_session_finish(
+        &self,
+        stream: &mut TcpStream,
+        session_id: &str,
+        body: &str,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct FinishPayload {
+            #[serde(default)]
+            owner_confirmed: Option<bool>,
+            #[serde(default)]
+            save_profile_name: Option<String>,
+            #[serde(default)]
+            activate_profile: Option<bool>,
+            #[serde(default)]
+            notes: Option<String>,
+        }
+        let payload: FinishPayload = serde_json::from_str(body).unwrap_or(FinishPayload {
+            owner_confirmed: None,
+            save_profile_name: None,
+            activate_profile: None,
+            notes: None,
+        });
+
+        let sess = match self.session_manager.get_session(Some(session_id)) {
+            Some(s) => s,
+            None => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "404 Not Found",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Session '{session_id}' not found")
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        let mut saved_profile_id = None;
+        if let Some(ref prof_name) = payload.save_profile_name {
+            if let Some(ref cand) = sess.active_candidate {
+                let is_owner = identity.is_owner() || payload.owner_confirmed.unwrap_or(false);
+                let create_dto = crate::acoustics::profiles::CreateProfileDto {
+                    id: None,
+                    name: prof_name.clone(),
+                    notes: Some(format!("Profile from calibration session {}", session_id)),
+                    settings: cand.clone(),
+                    model_id: None,
+                    model_hash: None,
+                    audio_pipeline_version: None,
+                    conditions: None,
+                    status: None,
+                };
+                match self.profiles_store.create(create_dto, None, is_owner) {
+                    Ok(prof) => {
+                        saved_profile_id = Some(prof.id.clone());
+                        if payload.activate_profile.unwrap_or(false) {
+                            if let Some(ref lab) = self.acoustic_lab {
+                                let path = self
+                                    .config_path
+                                    .as_deref()
+                                    .unwrap_or_else(|| Path::new("config.toml"));
+                                let current_snap = lab.snapshot();
+                                let act_payload = crate::acoustics::ApplyPayload {
+                                    expected_revision: current_snap.revision,
+                                    settings: prof.settings.clone(),
+                                    expected_instance_id: None,
+                                };
+                                if lab.apply(path, act_payload).await.is_ok() {
+                                    let _ = self
+                                        .profiles_store
+                                        .set_active_profile_id(Some(prof.id.clone()));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return self
+                            .send_json_status(
+                                stream,
+                                "409 Conflict",
+                                &serde_json::json!({
+                                    "status": "error",
+                                    "message": format!("Failed to save profile: {e}")
+                                }),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // If not activating a saved profile, restore baseline in lab
+        if saved_profile_id.is_none() || !payload.activate_profile.unwrap_or(false) {
+            if let Some(ref lab) = self.acoustic_lab {
+                let _ = lab
+                    .apply_config_in_memory(sess.baseline_config.clone())
+                    .await;
+            }
+        }
+
+        match self.session_manager.finish_session(
+            session_id,
+            payload.owner_confirmed.unwrap_or(false),
+            payload.notes,
+        ) {
+            Ok(finished) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "session": finished,
+                        "saved_profile_id": saved_profile_id,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to finish session: {e}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_session_cancel(
+        &self,
+        stream: &mut TcpStream,
+        session_id: &str,
+    ) -> Result<()> {
+        let sess = match self.session_manager.get_session(Some(session_id)) {
+            Some(s) => s,
+            None => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "404 Not Found",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Session '{session_id}' not found")
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        if let Some(ref lab) = self.acoustic_lab {
+            let _ = lab.apply_config_in_memory(sess.baseline_config).await;
+        }
+
+        match self.session_manager.cancel_session(session_id) {
+            Ok(cancelled) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "session": cancelled,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "500 Internal Server Error",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to cancel session: {e}")
                     }),
                 )
                 .await
@@ -5081,6 +5645,232 @@ capture_device = "hw:0,2"
         );
         let (code, _) = send_req(local_addr, &anon_req).await;
         assert_eq!(code, 401);
+
+        // Cleanup
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_http_acoustic_sessions_and_openapi_lifecycle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("mini_test_sess_web_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let auth_manager = Arc::new(AuthManager::new(Some("test_owner_secret".to_string())));
+        let (_token_secret, cal_token) = auth_manager.issue_calibration_token(
+            "test_calib_agent".into(),
+            std::time::Duration::from_secs(3600),
+            std::collections::HashSet::from([
+                Scope::Jobs,
+                Scope::AcousticsRead,
+                Scope::AcousticsWrite,
+                Scope::Profiles,
+                Scope::Samples,
+            ]),
+            crate::web::auth::CalibrationLease::default(),
+        );
+        let token = &cal_token.token;
+
+        let samples_store = Arc::new(
+            crate::acoustics::samples::SamplesStore::new(temp_dir.join("samples")).unwrap(),
+        );
+        let profiles_store = Arc::new(
+            crate::acoustics::profiles::ProfilesStore::new(temp_dir.join("profiles.json")).unwrap(),
+        );
+        let session_manager =
+            Arc::new(crate::acoustics::sessions::AcousticSessionManager::new(&temp_dir).unwrap());
+
+        let (lab, mut rx) =
+            crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        lab.ready(
+            crate::config::WakewordCalibrationConfig::default(),
+            crate::acoustics::RuntimeMetrics::default(),
+        );
+        let lab_mock = lab.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                lab_mock.acknowledge(req, None);
+            }
+        });
+        let sink = Arc::new(crate::acoustics::jobs::MockPlaybackSink::new(false));
+        let job_runner = crate::acoustics::jobs::AcousticJobRunner::new(
+            samples_store.clone(),
+            lab.clone(),
+            None,
+            sink,
+        );
+
+        let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
+        let cfg_file = temp_dir.join("config.toml");
+        let server = Arc::new(
+            ControlCenterServer::new(
+                Some(cfg_file.clone()),
+                "client_id".to_string(),
+                "http://127.0.0.1/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                ducker,
+            )
+            .with_auth_manager(auth_manager.clone())
+            .with_samples_store(samples_store.clone())
+            .with_profiles_store(profiles_store.clone())
+            .with_session_manager(session_manager.clone())
+            .with_acoustic_lab(lab.clone())
+            .with_job_runner(job_runner.clone()),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let s = String::from_utf8_lossy(&buf);
+            let code = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse::<u16>()
+                .unwrap_or(0);
+            let json_body = s
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b.trim()).ok())
+                .unwrap_or(serde_json::Value::Null);
+            (code, json_body)
+        }
+
+        // 1. GET /api/v1/acoustics/openapi.json returns OpenAPI 3.1
+        let req_schema = format!(
+            "GET /api/v1/acoustics/openapi.json HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        let (code, schema_resp) = send_req(local_addr, &req_schema).await;
+        assert_eq!(code, 200);
+        assert_eq!(schema_resp["openapi"], "3.1.0");
+        assert!(schema_resp["paths"]["/state"].is_object());
+        assert!(schema_resp["paths"]["/sessions"].is_object());
+
+        // 2. GET /api/v1/acoustics/state returns snapshot with capabilities
+        let req_state = format!(
+            "GET /api/v1/acoustics/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        let (code, state_resp) = send_req(local_addr, &req_state).await;
+        assert_eq!(code, 200);
+        assert_eq!(state_resp["status"], "ok");
+        assert!(state_resp["capabilities"].is_array());
+
+        // 3. POST /api/v1/acoustics/sessions creates bounded session
+        let create_sess_body = serde_json::json!({
+            "name": "Тестовая калибровка комнаты",
+            "max_duration_secs": 1200,
+            "max_jobs": 10,
+            "require_aux": false
+        })
+        .to_string();
+        let req_sess = format!(
+            "POST /api/v1/acoustics/sessions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, create_sess_body.len(), create_sess_body
+        );
+        let (code, sess_resp) = send_req(local_addr, &req_sess).await;
+        assert_eq!(code, 201);
+        assert_eq!(sess_resp["status"], "ok");
+        let sess_id = sess_resp["session"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(sess_resp["session"]["state"], "running");
+
+        // 3b. Duplicate session creation yields 409 Conflict
+        let (code, conf_resp) = send_req(local_addr, &req_sess).await;
+        assert_eq!(code, 409);
+        assert_eq!(conf_resp["status"], "error");
+
+        // 4. POST /sessions/{id}/candidate applies candidate in RAM
+        let mut cand_dto = crate::acoustics::AcousticSettingsDto::from(
+            crate::config::WakewordCalibrationConfig::default(),
+        );
+        cand_dto.threshold = 0.58;
+        let cand_body = serde_json::json!({
+            "settings": cand_dto
+        })
+        .to_string();
+        let req_cand = format!(
+            "POST /api/v1/acoustics/sessions/{}/candidate HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sess_id, local_addr, token, cand_body.len(), cand_body
+        );
+        let (code, cand_resp) = send_req(local_addr, &req_cand).await;
+        assert_eq!(code, 200);
+        assert_eq!(cand_resp["status"], "ok");
+
+        // 5. Test idempotency on POST /api/v1/acoustics/jobs
+        let job_body = serde_json::json!({
+            "name": "idempotent_test_job",
+            "stimulus_origin": "ambient",
+            "output_route": "none",
+            "stimulus": { "type": "silence", "duration_ms": 100 },
+            "volume_pct": 0
+        })
+        .to_string();
+        let req_job1 = format!(
+            "POST /api/v1/acoustics/jobs HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nIdempotency-Key: idem_job_abc_123\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, job_body.len(), job_body
+        );
+        let (code1, resp_job1) = send_req(local_addr, &req_job1).await;
+        assert_eq!(code1, 201);
+        let job1_id = resp_job1["job"]["job_id"].as_str().unwrap().to_string();
+
+        // Repeat identical request with same Idempotency-Key: must return identical job_id
+        let req_job2 = format!(
+            "POST /api/v1/acoustics/jobs HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nIdempotency-Key: idem_job_abc_123\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, job_body.len(), job_body
+        );
+        let (code2, resp_job2) = send_req(local_addr, &req_job2).await;
+        assert_eq!(code2, 201);
+        let job2_id = resp_job2["job"]["job_id"].as_str().unwrap().to_string();
+        assert_eq!(job1_id, job2_id);
+
+        // 6. POST /sessions/{id}/confirm_owner confirms live test
+        let req_confirm = format!(
+            "POST /api/v1/acoustics/sessions/{}/confirm_owner HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+            sess_id, local_addr, token
+        );
+        let (code, conf_owner_resp) = send_req(local_addr, &req_confirm).await;
+        assert_eq!(code, 200);
+        assert_eq!(conf_owner_resp["owner_confirmed"], true);
+
+        // 7. POST /sessions/{id}/finish completes session and saves named profile
+        let finish_body = serde_json::json!({
+            "owner_confirmed": true,
+            "save_profile_name": "Калиброванная спальня",
+            "activate_profile": false
+        })
+        .to_string();
+        let req_finish = format!(
+            "POST /api/v1/acoustics/sessions/{}/finish HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sess_id, local_addr, token, finish_body.len(), finish_body
+        );
+        let (code, fin_resp) = send_req(local_addr, &req_finish).await;
+        assert_eq!(code, 200);
+        assert_eq!(fin_resp["status"], "ok");
+        assert!(fin_resp["saved_profile_id"].is_string());
 
         // Cleanup
         let _ = shutdown_tx.send(true);
