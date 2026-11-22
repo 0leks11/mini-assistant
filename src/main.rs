@@ -60,10 +60,17 @@ impl VoiceClient {
     }
 }
 
-fn acoustic_engine(path: &std::path::Path, settings: &config::WakewordCalibrationConfig) -> Result<Box<dyn wakeword::WakeWordEngine>> {
+fn acoustic_engine(
+    path: &std::path::Path,
+    settings: &config::WakewordCalibrationConfig,
+) -> Result<Box<dyn wakeword::WakeWordEngine>> {
     settings.validate()?;
-    if !settings.enabled { return Ok(Box::new(wakeword::keyword::DisabledKeyword)); }
-    Ok(Box::new(wakeword::keyword::KeywordEngine::load_with_calibration(path, Some(settings))?))
+    if !settings.enabled {
+        return Ok(Box::new(wakeword::keyword::DisabledKeyword));
+    }
+    Ok(Box::new(
+        wakeword::keyword::KeywordEngine::load_with_calibration(path, Some(settings))?,
+    ))
 }
 
 fn parse_cli_args_from<I, T>(iter: I) -> Result<CliAction>
@@ -524,7 +531,8 @@ async fn main() -> Result<()> {
             let (tx_reload_wakeword, mut rx_reload_wakeword) =
                 tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
             let acoustic_settings = acoustics::effective_settings(&config)?;
-            let (acoustic_lab, mut rx_calibration) = acoustics::AcousticLab::new(acoustic_settings.clone());
+            let (acoustic_lab, mut rx_calibration) =
+                acoustics::AcousticLab::new(acoustic_settings.clone());
 
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
@@ -535,8 +543,11 @@ async fn main() -> Result<()> {
                 .or_else(|| {
                     if std::path::Path::new("config.toml").exists() {
                         Some(std::path::PathBuf::from("config.toml"))
-                    } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists() {
-                        Some(std::path::PathBuf::from("/data/opt/mini-assistant/config.toml"))
+                    } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists()
+                    {
+                        Some(std::path::PathBuf::from(
+                            "/data/opt/mini-assistant/config.toml",
+                        ))
                     } else {
                         None
                     }
@@ -1100,16 +1111,25 @@ async fn main() -> Result<()> {
                 .map(std::path::PathBuf::from)
                 .or(config.assistant.wakeword_model.clone())
                 .unwrap_or_else(|| "/data/opt/mini-assistant/keyword.rpw".into());
-            let (activation, model_loaded) = match acoustic_engine(&model_path, &acoustic_settings) {
+            let (activation, model_loaded) = match acoustic_engine(&model_path, &acoustic_settings)
+            {
                 Ok(engine) => (engine, acoustic_settings.enabled),
                 Err(_) => {
                     warn!("No valid local keyword enrollment: acoustic activation disabled");
-                    (Box::new(wakeword::keyword::DisabledKeyword) as Box<dyn wakeword::WakeWordEngine>, false)
+                    (
+                        Box::new(wakeword::keyword::DisabledKeyword)
+                            as Box<dyn wakeword::WakeWordEngine>,
+                        false,
+                    )
                 }
             };
             let mut gate = wakeword::InputGate::with_activation_and_initial_timeout(
-                activation, acoustic_settings.vad_threshold, acoustic_settings.pre_roll_ms,
-                acoustic_settings.initial_silence_timeout_ms, acoustic_settings.silence_timeout_ms, 16000,
+                activation,
+                acoustic_settings.vad_threshold,
+                acoustic_settings.pre_roll_ms,
+                acoustic_settings.initial_silence_timeout_ms,
+                acoustic_settings.silence_timeout_ms,
+                16000,
             );
             gate.apply_acoustic_settings(&acoustic_settings);
             let manual_arm = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1205,7 +1225,9 @@ async fn main() -> Result<()> {
                                 lab_metrics.model_name = name;
                                 lab_metrics.model_sha256 = hash;
                             }
-                            Err(_) => warn!("Failed to reload local acoustic model; previous model retained"),
+                            Err(_) => warn!(
+                                "Failed to reload local acoustic model; previous model retained"
+                            ),
                         }
                     }
                     if let Ok(request) = rx_calibration.try_recv() {
@@ -1223,7 +1245,12 @@ async fn main() -> Result<()> {
                                 lab_metrics.model_loaded = acoustic_current.enabled;
                                 acoustic_lab.acknowledge(request, None);
                             }
-                            Err(_) => acoustic_lab.acknowledge(request, Some("Local model unavailable; profile saved but not applied".into())),
+                            Err(_) => acoustic_lab.acknowledge(
+                                request,
+                                Some(
+                                    "Local model unavailable; profile saved but not applied".into(),
+                                ),
+                            ),
                         }
                     }
                     acoustics::apply_gain(&mut chunk, acoustic_current.mic_gain);
@@ -1231,7 +1258,18 @@ async fn main() -> Result<()> {
                     let (floor, level, _) = gate.vad_diagnostics();
                     lab_metrics.noise_floor = floor;
                     lab_metrics.vad_level = level;
-                    lab_metrics.mode = if acoustic_current.shadow_mode { "shadow" } else if !acoustic_current.enabled { "disabled" } else if warmup_bytes > 0 { "warmup" } else if gate.is_active() { "streaming" } else { "listening" }.into();
+                    lab_metrics.mode = if acoustic_current.shadow_mode {
+                        "shadow"
+                    } else if !acoustic_current.enabled {
+                        "disabled"
+                    } else if warmup_bytes > 0 {
+                        "warmup"
+                    } else if gate.is_active() {
+                        "streaming"
+                    } else {
+                        "listening"
+                    }
+                    .into();
                     if metrics_since.elapsed() >= Duration::from_millis(250) {
                         acoustic_lab.metrics(lab_metrics.clone());
                         metrics_since = Instant::now();
@@ -1307,7 +1345,8 @@ async fn main() -> Result<()> {
                         });
                         gate.reset_gate();
                         active_turn = None;
-                        arm_until = now + Duration::from_secs(acoustic_current.manual_activation_secs);
+                        arm_until =
+                            now + Duration::from_secs(acoustic_current.manual_activation_secs);
                         followup_until = now;
                     }
                     if warmup_bytes > 0 {
@@ -1338,7 +1377,8 @@ async fn main() -> Result<()> {
                                 followup_until = now;
                                 gate.set_manual_armed(false);
                             } else if acoustic_current.followup_timeout_secs > 0 {
-                                followup_until = now + Duration::from_secs(acoustic_current.followup_timeout_secs);
+                                followup_until = now
+                                    + Duration::from_secs(acoustic_current.followup_timeout_secs);
                                 info!(
                                     finished_turn = finished_id,
                                     timeout_secs = acoustic_current.followup_timeout_secs,
@@ -1399,14 +1439,20 @@ async fn main() -> Result<()> {
                     let mut now_active = gate.is_active();
                     if let Some(observation) = gate.take_keyword_observation() {
                         lab_metrics.candidate_count = lab_metrics.candidate_count.saturating_add(1);
-                        lab_metrics.last_score = observation.score.is_finite().then_some(observation.score);
-                        lab_metrics.last_avg_score = observation.avg_score.is_finite().then_some(observation.avg_score);
+                        lab_metrics.last_score =
+                            observation.score.is_finite().then_some(observation.score);
+                        lab_metrics.last_avg_score = observation
+                            .avg_score
+                            .is_finite()
+                            .then_some(observation.avg_score);
                         if observation.detected {
                             lab_metrics.keyword_count = lab_metrics.keyword_count.saturating_add(1);
                         }
                     }
                     if acoustic_current.shadow_mode {
-                        if !was_active && now_active { lab_metrics.shadow_count = lab_metrics.shadow_count.saturating_add(1); }
+                        if !was_active && now_active {
+                            lab_metrics.shadow_count = lab_metrics.shadow_count.saturating_add(1);
+                        }
                         gate.reset_gate();
                         active_turn = None;
                         continue;
@@ -1421,7 +1467,8 @@ async fn main() -> Result<()> {
                         // Prevent acoustic self-interruption: ONLY discard if the assistant's OWN TTS VOICE
                         // is currently playing or within echo decay. Music or alarms must NOT discard the wake-word!
                         if is_tts_playing || now < tts_echo_until {
-                            lab_metrics.suppressed_count = lab_metrics.suppressed_count.saturating_add(1);
+                            lab_metrics.suppressed_count =
+                                lab_metrics.suppressed_count.saturating_add(1);
                             debug!("Discarded acoustic activation during assistant TTS speech/echo tail");
                             gate.reset_gate();
                             continue;
@@ -1509,9 +1556,9 @@ async fn main() -> Result<()> {
                         lab_metrics.opened_count = lab_metrics.opened_count.saturating_add(1);
                         info!("Explicit local activation: user turn opened");
                     }
-                    let max_utterance_dur = Duration::from_secs(acoustic_current.max_utterance_secs);
-                    if now_active && now.duration_since(utterance_started) >= max_utterance_dur
-                    {
+                    let max_utterance_dur =
+                        Duration::from_secs(acoustic_current.max_utterance_secs);
+                    if now_active && now.duration_since(utterance_started) >= max_utterance_dur {
                         info!(
                             elapsed_secs = ?now.duration_since(utterance_started).as_secs_f32(),
                             "Max utterance duration reached, finalizing speech turn for cloud recognition"

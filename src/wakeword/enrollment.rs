@@ -489,8 +489,9 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
                 (Some(feat_a), Some(feat_b)) => {
                     let a_refs: Vec<&[f32]> = feat_a.iter().map(|r| r.as_slice()).collect();
                     let b_refs: Vec<&[f32]> = feat_b.iter().map(|r| r.as_slice()).collect();
-                    let mut dtw =
-                        rustpotter::mfcc::Dtw::new(rustpotter::mfcc::MfccComparator::calculate_distance);
+                    let mut dtw = rustpotter::mfcc::Dtw::new(
+                        rustpotter::mfcc::MfccComparator::calculate_distance,
+                    );
                     let cost = dtw.compute_optimal_path_with_window(&a_refs, &b_refs, 5);
                     let norm_cost = cost / (a_refs.len() + b_refs.len()) as f32;
                     let val = (1.0 - norm_cost).clamp(0.0, 1.0);
@@ -573,7 +574,11 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
 
     // 5. Outlier Detection: low similarity (< 0.45), low SNR (< 8 dB), or >2σ below mean
     let mean_c = centralities.iter().sum::<f32>() / n as f32;
-    let var_c = centralities.iter().map(|&c| (c - mean_c).powi(2)).sum::<f32>() / n as f32;
+    let var_c = centralities
+        .iter()
+        .map(|&c| (c - mean_c).powi(2))
+        .sum::<f32>()
+        / n as f32;
     let _std_c = var_c.sqrt(); // retained for future 2σ outlier reporting if needed
 
     let mut sample_reports = Vec::with_capacity(n);
@@ -592,8 +597,10 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
             // A lower similarity to others does NOT mean bad quality; it means phonetic diversity,
             // which improves generalization. Threshold lowered from 8 dB to 6 dB.
             is_outlier = true;
-            outlier_reason =
-                Some(format!("Слишком высокий фоновый шум: SNR {:.1} дБ (< 6 дБ)", s.snr));
+            outlier_reason = Some(format!(
+                "Слишком высокий фоновый шум: SNR {:.1} дБ (< 6 дБ)",
+                s.snr
+            ));
         }
         // NOTE: Removed centrality < 0.45 filter — low centrality = high variation = good for robustness.
         // NOTE: Removed 2σ outlier filter — it eliminates exactly the diverse samples we need.
@@ -652,7 +659,9 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
     {
         // Phase-aware seeding: seed one sample from each phase first (most central per phase)
         for phase in [1u8, 2, 3] {
-            if selected_ids.len() >= target_total { break; }
+            if selected_ids.len() >= target_total {
+                break;
+            }
             if let Some((id, _c)) = non_outliers
                 .iter()
                 .filter(|(_, s, _)| s.phase == phase)
@@ -915,7 +924,11 @@ mod tests {
         let trimmed = trim_enrollment(&full).expect("trim");
         // Both word1, the 250ms pause, and word2 must be fully retained
         // Duration should be at least (0.6 + 0.25 + 0.7) * 16000 = 24800 samples
-        assert!(trimmed.len() >= 24800, "Trimmed length {} too short, compound word cut off!", trimmed.len());
+        assert!(
+            trimmed.len() >= 24800,
+            "Trimmed length {} too short, compound word cut off!",
+            trimmed.len()
+        );
         assert!(trimmed.len() < full.len());
     }
 
@@ -1006,8 +1019,7 @@ mod tests {
 
         // Check that selected templates do NOT include the outlier if we have enough normal ones
         assert!(
-            !report.selected_template_ids.contains(&7)
-                || report.selected_template_ids.len() == 7
+            !report.selected_template_ids.contains(&7) || report.selected_template_ids.len() == 7
         );
     }
 

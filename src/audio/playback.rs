@@ -418,9 +418,11 @@ impl AudioPlayback {
                                         let epoch_mon = epoch;
                                         let resp_mon = resp_id;
                                         let is_playing_mon = is_playing_for_worker.clone();
-                                        let has_active_mon = has_active_generation_for_worker.clone();
+                                        let has_active_mon =
+                                            has_active_generation_for_worker.clone();
                                         let active_resp_mon = active_response_for_worker.clone();
-                                        let epoch_mon_counter = cancellation_epoch_for_worker.clone();
+                                        let epoch_mon_counter =
+                                            cancellation_epoch_for_worker.clone();
                                         let lifecycle_mon = lifecycle_for_worker.clone();
                                         let child_mon = current_child_for_worker.clone();
                                         std::thread::spawn(move || {

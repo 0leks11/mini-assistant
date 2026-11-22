@@ -203,11 +203,9 @@ pub fn spawn_vl53_volume_task_with_indicators(
 
         loop {
             // Wait up to 400ms for new proximity event; if timed out while in gesture, exit gesture cleanly
-            let poll_result = tokio::time::timeout(
-                tokio::time::Duration::from_millis(400),
-                async_fd.readable(),
-            )
-            .await;
+            let poll_result =
+                tokio::time::timeout(tokio::time::Duration::from_millis(400), async_fd.readable())
+                    .await;
 
             match poll_result {
                 Ok(Ok(mut guard)) => {
@@ -249,7 +247,8 @@ pub fn spawn_vl53_volume_task_with_indicators(
 
                                 // Update visual indicator state: active only during real volume gesture interaction
                                 if active_interaction {
-                                    if last_gesture_activity.elapsed() >= std::time::Duration::from_millis(1000)
+                                    if last_gesture_activity.elapsed()
+                                        >= std::time::Duration::from_millis(1000)
                                         || last_event_dist > IDLE_THRESHOLD_MM
                                     {
                                         active_interaction = false;
@@ -257,13 +256,15 @@ pub fn spawn_vl53_volume_task_with_indicators(
                                         session.anchor_mm = last_event_dist;
                                         if was_in_gesture {
                                             was_in_gesture = false;
-                                            gesture_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                                            gesture_active
+                                                .store(false, std::sync::atomic::Ordering::SeqCst);
                                             crate::web::set_led_hardware("off");
                                             debug!("VL53L0 gesture volume interaction finished; LED turned off");
                                         }
                                     } else if !was_in_gesture {
                                         was_in_gesture = true;
-                                        gesture_active.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        gesture_active
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
                                         let cur_color = led_color
                                             .try_read()
                                             .map(|c| c.clone())

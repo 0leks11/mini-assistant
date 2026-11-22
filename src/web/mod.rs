@@ -246,7 +246,10 @@ impl ControlCenterServer {
         };
 
         if method == "POST" && matches!(path, "/api/v1/acoustics" | "/api/v1/calibration") {
-            let same_origin = origin.as_ref().is_none_or(|o| host.as_ref().is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}")));
+            let same_origin = origin.as_ref().is_none_or(|o| {
+                host.as_ref()
+                    .is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}"))
+            });
             if !same_origin || !json_content {
                 return self.send_json_status(&mut stream, "403 Forbidden", &serde_json::json!({"status":"error","message":"Acoustic updates require same-origin JSON"})).await;
             }
@@ -267,7 +270,13 @@ impl ControlCenterServer {
             }
 
             ("GET", "/acoustics") | ("GET", "/acoustics/") => {
-                self.send_response(&mut stream,"200 OK","text/html; charset=utf-8",ACOUSTIC_LAB_HTML.as_bytes()).await?;
+                self.send_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    ACOUSTIC_LAB_HTML.as_bytes(),
+                )
+                .await?;
             }
 
             // REST API v1
@@ -315,8 +324,7 @@ impl ControlCenterServer {
             ("POST", "/api/v1/wakeword/rename") | ("POST", "/api/v1/wakeword/name") => {
                 self.handle_api_wakeword_rename(&mut stream, body).await?;
             }
-            ("GET", "/api/v1/wakeword/analysis")
-            | ("GET", "/api/v1/wakeword/session/analysis") => {
+            ("GET", "/api/v1/wakeword/analysis") | ("GET", "/api/v1/wakeword/session/analysis") => {
                 self.handle_api_wakeword_analysis(&mut stream).await?;
             }
             ("GET", "/api/v1/acoustics") | ("GET", "/api/v1/calibration") => {
@@ -648,20 +656,39 @@ impl ControlCenterServer {
     async fn handle_api_get_calibration(&self, stream: &mut TcpStream) -> Result<()> {
         match &self.acoustic_lab {
             Some(lab) => self.send_json(stream, &lab.response()).await,
-            None => self.send_json_status(stream, "503 Service Unavailable", &serde_json::json!({"status":"error","message":"Audio loop is unavailable"})).await,
+            None => {
+                self.send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await
+            }
         }
     }
 
     async fn handle_api_post_calibration(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
         let Some(lab) = &self.acoustic_lab else {
-            return self.send_json_status(stream,"503 Service Unavailable", &serde_json::json!({"status":"error","message":"Audio loop is unavailable"})).await;
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await;
         };
         let payload: crate::acoustics::ApplyPayload = match serde_json::from_str(body) {
             Ok(value) => value,
             Err(_) => return self.send_json_status(stream,"400 Bad Request",&serde_json::json!({"status":"error","message":"Expected {expected_revision, settings} acoustic profile"})).await,
         };
         if let Err(e) = payload.settings.validate() {
-            return self.send_json_status(stream,"400 Bad Request",&serde_json::json!({"status":"error","message":e.to_string()})).await;
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({"status":"error","message":e.to_string()}),
+                )
+                .await;
         }
         if payload.expected_revision != lab.snapshot().revision || lab.snapshot().pending {
             return self.send_json_status(stream,"409 Conflict",&serde_json::json!({"status":"error","message":"Профиль изменился или ожидает применения. Обновите статус.","snapshot":lab.response()})).await;
@@ -682,7 +709,9 @@ impl ControlCenterServer {
         if std::path::Path::new("config.toml").exists() {
             Some(std::path::PathBuf::from("config.toml"))
         } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists() {
-            Some(std::path::PathBuf::from("/data/opt/mini-assistant/config.toml"))
+            Some(std::path::PathBuf::from(
+                "/data/opt/mini-assistant/config.toml",
+            ))
         } else {
             None
         }
@@ -1180,7 +1209,11 @@ impl ControlCenterServer {
             name: Option<String>,
         }
         if let Ok(req) = serde_json::from_str::<CompileReq>(body) {
-            if let Some(n) = req.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            if let Some(n) = req
+                .name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 sess.keyword_name = n;
             }
         }
@@ -1243,7 +1276,11 @@ impl ControlCenterServer {
             }
         };
 
-        let raw_name = match req.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        let raw_name = match req
+            .name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             Some(n) => n,
             None => {
                 let err = serde_json::json!({ "status": "error", "message": "Имя слова вызова не может быть пустым" });
@@ -1265,7 +1302,9 @@ impl ControlCenterServer {
                         match reference.save_to_buffer() {
                             Ok(bytes) => {
                                 if let Err(e) = std::fs::write(&self.wakeword_model_path, bytes) {
-                                    tracing::warn!("Failed to save renamed wakeword model to file: {e}");
+                                    tracing::warn!(
+                                        "Failed to save renamed wakeword model to file: {e}"
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -1352,7 +1391,10 @@ pub fn set_led_hardware(color: &str) {
     let fd = file.as_raw_fd();
     unsafe {
         if libc::ioctl(fd, 0x0703 /* I2C_SLAVE */, 0x3c as libc::c_ulong) < 0 {
-            warn!("ioctl I2C_SLAVE 0x3c failed: {}, using fallback i2cset", std::io::Error::last_os_error());
+            warn!(
+                "ioctl I2C_SLAVE 0x3c failed: {}, using fallback i2cset",
+                std::io::Error::last_os_error()
+            );
             fallback_i2cset_led(r, g, b);
             return;
         }
@@ -1398,7 +1440,10 @@ pub fn set_led_hardware(color: &str) {
     }
     // 6. Latch update register (0x25 -> 0x00: write 0x00 to latch shadow registers into outputs)
     write_reg(0x25, 0x00);
-    debug!("Updated hardware LED ring to color '{}' (r={:02x}, g={:02x}, b={:02x})", color, r, g, b);
+    debug!(
+        "Updated hardware LED ring to color '{}' (r={:02x}, g={:02x}, b={:02x})",
+        color, r, g, b
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1442,13 +1487,31 @@ fn fallback_i2cset_led(r: u8, g: u8, b: u8) {
 
     for i in 0..12 {
         let _ = std::process::Command::new(bin)
-            .args(["-y", "0", "0x3c", &format!("0x{:02x}", 1 + i * 3), &format!("0x{:02x}", b)])
+            .args([
+                "-y",
+                "0",
+                "0x3c",
+                &format!("0x{:02x}", 1 + i * 3),
+                &format!("0x{:02x}", b),
+            ])
             .status();
         let _ = std::process::Command::new(bin)
-            .args(["-y", "0", "0x3c", &format!("0x{:02x}", 2 + i * 3), &format!("0x{:02x}", g)])
+            .args([
+                "-y",
+                "0",
+                "0x3c",
+                &format!("0x{:02x}", 2 + i * 3),
+                &format!("0x{:02x}", g),
+            ])
             .status();
         let _ = std::process::Command::new(bin)
-            .args(["-y", "0", "0x3c", &format!("0x{:02x}", 3 + i * 3), &format!("0x{:02x}", r)])
+            .args([
+                "-y",
+                "0",
+                "0x3c",
+                &format!("0x{:02x}", 3 + i * 3),
+                &format!("0x{:02x}", r),
+            ])
             .status();
     }
 
@@ -1625,7 +1688,11 @@ pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> 
                     .chars()
                     .take_while(|c| c.is_whitespace())
                     .collect::<String>();
-                updated.push(format!("{}wake_words = [\"{}\"]", indent, clean_name.to_lowercase()));
+                updated.push(format!(
+                    "{}wake_words = [\"{}\"]",
+                    indent,
+                    clean_name.to_lowercase()
+                ));
                 replaced_wake_words = true;
                 continue;
             }
@@ -1656,7 +1723,10 @@ pub fn update_config_wakeword(config_path: &Path, new_name: &str) -> Result<()> 
 }
 
 #[cfg(test)]
-pub fn update_config_calibration(config_path: &Path, cal: &crate::config::WakewordCalibrationConfig) -> Result<()> {
+pub fn update_config_calibration(
+    config_path: &Path,
+    cal: &crate::config::WakewordCalibrationConfig,
+) -> Result<()> {
     crate::acoustics::save_settings(config_path, cal)
 }
 
@@ -1927,9 +1997,10 @@ capture_device = "hw:0,2"
         update_config_calibration(&cfg_file, &cal).unwrap();
         let updated = std::fs::read_to_string(&cfg_file).unwrap();
         let parsed: toml::Value = toml::from_str(&updated).unwrap();
-        let restored: crate::config::WakewordCalibrationConfig = parsed["wakeword"].clone().try_into().unwrap();
-        assert_eq!(restored,cal);
-        assert_eq!(parsed["audio"]["capture_device"].as_str(),Some("hw:0,2"));
+        let restored: crate::config::WakewordCalibrationConfig =
+            parsed["wakeword"].clone().try_into().unwrap();
+        assert_eq!(restored, cal);
+        assert_eq!(parsed["audio"]["capture_device"].as_str(), Some("hw:0,2"));
 
         std::fs::remove_file(&cfg_file).unwrap();
     }

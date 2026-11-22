@@ -443,7 +443,10 @@ impl SessionTurns {
                 );
             }
         }
-        anyhow::ensure!(!turns.iter().any(|r| r.id == id), "Input turn was already submitted");
+        anyhow::ensure!(
+            !turns.iter().any(|r| r.id == id),
+            "Input turn was already submitted"
+        );
         turns.push_back(TurnRecord {
             id,
             submitted_at: now,
@@ -461,7 +464,9 @@ impl SessionTurns {
                 turns.retain(|r| !auth.is_finished(r.id));
             }
             let now = std::time::Instant::now();
-            turns.retain(|r| now.duration_since(r.submitted_at) < std::time::Duration::from_secs(10));
+            turns.retain(|r| {
+                now.duration_since(r.submitted_at) < std::time::Duration::from_secs(10)
+            });
         }
     }
 

@@ -162,14 +162,8 @@ mod tests {
         assert_eq!(mpcm.len(), 3872);
 
         // Verify end record header at end: type=2, len=0
-        assert_eq!(
-            u32::from_le_bytes(mpcm[3864..3868].try_into().unwrap()),
-            2
-        );
-        assert_eq!(
-            u32::from_le_bytes(mpcm[3868..3872].try_into().unwrap()),
-            0
-        );
+        assert_eq!(u32::from_le_bytes(mpcm[3864..3868].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(mpcm[3868..3872].try_into().unwrap()), 0);
     }
 
     #[test]
