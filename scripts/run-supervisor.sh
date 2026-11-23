@@ -15,6 +15,10 @@ echo 2 > /proc/sys/abi/cp15_barrier 2>/dev/null || true
 # 2. Enable VL53L0 proximity sensor
 echo 1 > /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null || true
 
+# 2b. Enable hardware audio amplifiers (internal speaker + AUX line-out)
+echo 1 > /sys/class/tdm_state/amp_table 2>/dev/null || true
+echo 1 > /sys/class/tdm_state/aux_amp 2>/dev/null || true
+
 # 3. Start Bluetooth bcm-attach daemon if not running
 if [ -x "$DIR/bcm-attach" ] && ! ps | grep -v grep | grep -q "$DIR/bcm-attach"; then
     echo "[$(date -Iseconds 2>/dev/null || date)] Starting bcm-attach daemon..." >> "$LOGFILE"
@@ -66,6 +70,9 @@ watchdog_loop() {
         echo 2 > /proc/sys/abi/cp15_barrier 2>/dev/null || true
         # Proximity sensor active
         echo 1 > /sys/devices/virtual/input/input0/enable_ps_sensor 2>/dev/null || true
+        # Hardware audio amplifiers active (speaker + AUX)
+        echo 1 > /sys/class/tdm_state/amp_table 2>/dev/null || true
+        echo 1 > /sys/class/tdm_state/aux_amp 2>/dev/null || true
 
         # Watchdog: ensure system year has not slipped backward
         YEAR=$(date +%Y 2>/dev/null || echo 2015)
