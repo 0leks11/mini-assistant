@@ -1,5 +1,9 @@
 """Live Device Acoustic Release Verification (Stage 9).
 
+This test mutates a real device and is excluded from ordinary host checks.
+Run it only for an agreed device experiment with both
+GPT_MINI_RUN_LIVE_ACOUSTIC_TEST=1 and an explicit GPT_MINI_URL.
+
 Executes the complete autonomous acoustic calibration scenario against the
 live running GPT Mini device over MCP stdio protocol without code or SSH access.
 Verifies the Stage 9 gate:
@@ -27,10 +31,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "mcp_acoustic_agent.py"
 
 
+@unittest.skipUnless(
+    os.environ.get("GPT_MINI_RUN_LIVE_ACOUSTIC_TEST") == "1"
+    and bool(os.environ.get("GPT_MINI_URL", "").strip()),
+    "Live device test requires explicit opt-in and target URL",
+)
 class LiveDeviceAcousticReleaseTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = os.environ.get("GPT_MINI_URL", "http://10.77.0.111:8080")
+        cls.base_url = os.environ["GPT_MINI_URL"].rstrip("/")
         
         # Request calibration token as owner via same-origin header emulation
         req = urllib.request.Request(

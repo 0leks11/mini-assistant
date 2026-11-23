@@ -397,7 +397,7 @@ class GptMiniAcousticClient:
 
     def restore_session_baseline(self, session_id: str) -> Dict[str, Any]:
         return self._request(
-            "POST", f"/api/v1/acoustics/sessions/{session_id}/restore"
+            "POST", f"/api/v1/acoustics/sessions/{session_id}/restore", data={}
         )
 
     def confirm_session_owner(
@@ -432,7 +432,7 @@ class GptMiniAcousticClient:
 
     def cancel_acoustic_session(self, session_id: str) -> Dict[str, Any]:
         return self._request(
-            "POST", f"/api/v1/acoustics/sessions/{session_id}/cancel"
+            "POST", f"/api/v1/acoustics/sessions/{session_id}/cancel", data={}
         )
 
 
