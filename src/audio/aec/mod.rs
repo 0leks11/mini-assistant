@@ -29,12 +29,21 @@ pub struct AecConfig {
 impl Default for AecConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             bulk_delay_samples: 235, // 14.69ms calibrated on GPT Mini + KRK monitor
             step_size: 0.25,
             power_leak: 0.92,
             regularization: 2.0,
             max_attenuation_db: 30.0,
+        }
+    }
+}
+
+impl AecConfig {
+    pub fn default_mini() -> Self {
+        Self {
+            enabled: true,
+            ..Default::default()
         }
     }
 }

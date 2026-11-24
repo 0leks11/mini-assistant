@@ -6,6 +6,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+use super::aec::{AecConfig, AecProcessor};
+
 /// Channel selection mode for the 8-channel PDM microphone array
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelMode {
@@ -28,7 +30,9 @@ pub struct Decimator {
     bit_shift: u32,
     gain: f32,
     raw_buffer: Vec<u8>,
-    out_chunk_buffer: Vec<u8>,
+    pub out_chunk_buffer: Vec<u8>,
+    ref_chunk_buffer: Vec<i16>,
+    aec: Option<AecProcessor>,
 }
 
 impl Decimator {
@@ -40,7 +44,19 @@ impl Decimator {
             gain,
             raw_buffer: Vec::with_capacity(4096),
             out_chunk_buffer: Vec::with_capacity(512),
+            ref_chunk_buffer: Vec::with_capacity(256),
+            aec: None,
         }
+    }
+
+    /// Enable Acoustic Echo Cancellation (MDF AEC) on the capture stream
+    pub fn with_aec(mut self, aec_config: AecConfig) -> Self {
+        if aec_config.enabled {
+            self.aec = Some(AecProcessor::new(aec_config));
+        } else {
+            self.aec = None;
+        }
+        self
     }
 
     /// Default configuration for Station Mini 1 (YNDX-0004) PDM array:
@@ -84,6 +100,17 @@ impl Decimator {
         }
     }
 
+    /// Extract single reference sample from channel 6 (hardware loopback of DAC / amplifier)
+    #[inline]
+    fn extract_ref_sample(frame_bytes: &[u8]) -> i32 {
+        let (ch_pairs, _) = frame_bytes.as_chunks::<4>();
+        if ch_pairs.len() > 6 {
+            i32::from_le_bytes(ch_pairs[6])
+        } else {
+            0
+        }
+    }
+
     /// Process incoming raw bytes from ALSA capture stream (8ch S32_LE 48kHz).
     /// Returns 16ms chunks of 1-channel S16_LE 16kHz PCM (512 bytes = 256 samples).
     pub fn process(&mut self, incoming: &[u8]) -> Vec<Vec<u8>> {
@@ -123,11 +150,38 @@ impl Decimator {
             self.out_chunk_buffer
                 .extend_from_slice(&clamped.to_le_bytes());
 
+            if self.aec.is_some() {
+                let r0 = Self::extract_ref_sample(f0) as i64;
+                let r1 = Self::extract_ref_sample(f1) as i64;
+                let r2 = Self::extract_ref_sample(f2) as i64;
+                let ref_filtered = (r0 + 2 * r1 + r2) / 4;
+                let ref_shifted = ref_filtered >> self.bit_shift;
+                let ref_clamped = (ref_shifted as f32).clamp(-32768.0, 32767.0) as i16;
+                self.ref_chunk_buffer.push(ref_clamped);
+            }
+
             if self.out_chunk_buffer.len() >= TARGET_CHUNK_BYTES {
                 ready_chunks.push(self.out_chunk_buffer.split_off(TARGET_CHUNK_BYTES));
-                // Swap so out_chunk_buffer contains remaining, ready_chunks gets 512 bytes
                 let last = ready_chunks.len() - 1;
                 std::mem::swap(&mut ready_chunks[last], &mut self.out_chunk_buffer);
+
+                if let Some(ref mut aec) = self.aec {
+                    if aec.is_enabled() && self.ref_chunk_buffer.len() >= 256 {
+                        let chunk = &mut ready_chunks[last];
+                        let mut mic_pcm = [0i16; 256];
+                        let (in_pairs, _) = chunk.as_chunks::<2>();
+                        for (in_bytes, sample) in in_pairs.iter().zip(mic_pcm.iter_mut()) {
+                            *sample = i16::from_le_bytes(*in_bytes);
+                        }
+                        let mut out_pcm = [0i16; 256];
+                        aec.process_frame(&mic_pcm, &self.ref_chunk_buffer[..256], &mut out_pcm);
+                        let (out_pairs, _) = chunk.as_chunks_mut::<2>();
+                        for (sample, out_bytes) in out_pcm.iter().zip(out_pairs.iter_mut()) {
+                            out_bytes.copy_from_slice(&sample.to_le_bytes());
+                        }
+                        self.ref_chunk_buffer.drain(..256);
+                    }
+                }
             }
         }
 
@@ -146,6 +200,7 @@ pub struct AlsaCaptureConfig {
     pub bit_shift: u32,
     pub gain: f32,
     pub custom_arecord_path: Option<PathBuf>,
+    pub aec: AecConfig,
 }
 
 impl Default for AlsaCaptureConfig {
@@ -156,6 +211,7 @@ impl Default for AlsaCaptureConfig {
             bit_shift: 16,
             gain: 1.0,
             custom_arecord_path: None,
+            aec: AecConfig::default(),
         }
     }
 }
@@ -268,7 +324,8 @@ impl AlsaCapture {
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = stdout;
-            let mut decimator = Decimator::new(config.channel_mode, config.bit_shift, config.gain);
+            let mut decimator = Decimator::new(config.channel_mode, config.bit_shift, config.gain)
+                .with_aec(config.aec);
             let mut buf = [0u8; 4096];
 
             while is_running_clone.load(Ordering::SeqCst) {
@@ -472,6 +529,28 @@ mod tests {
         let _ = decimator.process(&block);
         let s = i16::from_le_bytes(decimator.out_chunk_buffer[0..2].try_into().unwrap());
         assert_eq!(s, 32767);
+    }
+
+    #[test]
+    fn test_decimator_aec_disabled_passthrough() {
+        let aec_cfg = AecConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let mut decimator = Decimator::new(ChannelMode::Ch0, 16, 1.0).with_aec(aec_cfg);
+        // Feed 256 blocks of 96 bytes
+        let mut block = vec![0u8; 96 * 256];
+        let val: i32 = 1234 << 16;
+        for i in 0..256 {
+            let offset = i * 96;
+            block[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+            block[offset + 32..offset + 36].copy_from_slice(&val.to_le_bytes());
+            block[offset + 64..offset + 68].copy_from_slice(&val.to_le_bytes());
+        }
+        let chunks = decimator.process(&block);
+        assert_eq!(chunks.len(), 1);
+        let sample = i16::from_le_bytes([chunks[0][0], chunks[0][1]]);
+        assert_eq!(sample, 1234);
     }
 
     #[tokio::test]

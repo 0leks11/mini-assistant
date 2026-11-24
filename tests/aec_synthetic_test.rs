@@ -61,7 +61,10 @@ fn test_aec_disabled_passthrough() {
 
 #[test]
 fn test_aec_silence_reference_passthrough() {
-    let aec_cfg = AecConfig::default();
+    let aec_cfg = AecConfig {
+        enabled: true,
+        ..Default::default()
+    };
     let mut aec = AecProcessor::new(aec_cfg);
 
     let mic = vec![1000i16; BLOCK_SIZE];
@@ -79,6 +82,7 @@ fn test_aec_silence_reference_passthrough() {
 fn test_aec_synthetic_rir_convergence_and_erle() {
     let delay_samples = 235; // Calibrated GPT Mini + KRK monitor bulk delay
     let config = AecConfig {
+        enabled: true,
         bulk_delay_samples: delay_samples,
         step_size: 0.40,
         ..Default::default()
@@ -155,6 +159,7 @@ fn test_aec_synthetic_rir_convergence_and_erle() {
 fn test_aec_double_talk_protection() {
     let delay_samples = 235;
     let config = AecConfig {
+        enabled: true,
         bulk_delay_samples: delay_samples,
         ..Default::default()
     };

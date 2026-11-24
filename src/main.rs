@@ -1794,6 +1794,7 @@ async fn main() -> Result<()> {
                         bit_shift: 16,
                         gain: 1.0,
                         custom_arecord_path: None,
+                        aec: config.audio.aec.clone(),
                     };
                     match audio::AlsaCapture::start(alsa_cfg, tx_raw_mic) {
                         Ok(c) => {

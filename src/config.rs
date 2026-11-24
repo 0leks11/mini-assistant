@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::audio::AecConfig;
+
 /// Main configuration — loaded from config.toml (not in git!)
 /// Copy config.example.toml → config.toml and fill in values
 #[derive(Debug, Deserialize)]
@@ -139,6 +141,9 @@ pub struct AudioConfig {
     /// Capture backend: "vqe" (vendor IPC :9850, default), "alsa" (direct hw:0,2), "mock"
     #[serde(default = "default_capture_backend")]
     pub capture_backend: String,
+    /// Acoustic Echo Cancellation (MDF AEC) configuration
+    #[serde(default)]
+    pub aec: AecConfig,
 }
 
 fn default_capture_backend() -> String {

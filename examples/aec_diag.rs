@@ -4,6 +4,7 @@ use std::f32::consts::PI;
 
 fn main() {
     let config = AecConfig {
+        enabled: true,
         bulk_delay_samples: 0, // zero delay for direct test
         step_size: 0.25,
         ..Default::default()
