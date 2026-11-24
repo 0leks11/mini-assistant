@@ -69,6 +69,10 @@ uuid = { version = "1", features = ["v4"] }
 rustpotter = { path = "vendor/rustpotter-ref", default-features = false }
 hound = "3.5.1"
 
+# Fast FFT and complex math for Acoustic Echo Cancellation (MDF AEC)
+rustfft = { version = "6.4", default-features = false }
+num-complex = { version = "0.4", default-features = false }
+
 [profile.release]
 opt-level = "z"    # minimize binary size
 strip = true       # strip debug symbols
