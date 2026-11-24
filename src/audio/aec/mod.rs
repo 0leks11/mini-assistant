@@ -9,11 +9,13 @@
 #![allow(dead_code)]
 
 pub mod mdf;
+pub mod res;
 pub mod ring_buffer;
 
 use serde::{Deserialize, Serialize};
 
 use self::mdf::{MdfConfig, PartitionedMdfFilter, BLOCK_SIZE};
+use self::res::ResConfig;
 use self::ring_buffer::DelayBuffer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +26,24 @@ pub struct AecConfig {
     pub power_leak: f32,
     pub regularization: f32,
     pub max_attenuation_db: f32,
+    #[serde(default = "default_true")]
+    pub res_enabled: bool,
+    #[serde(default = "default_res_floor_db")]
+    pub res_floor_db: f32,
+    #[serde(default = "default_res_overdrive")]
+    pub res_overdrive: f32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_res_floor_db() -> f32 {
+    -18.0
+}
+
+fn default_res_overdrive() -> f32 {
+    1.5
 }
 
 impl Default for AecConfig {
@@ -35,6 +55,9 @@ impl Default for AecConfig {
             power_leak: 0.92,
             regularization: 2.0,
             max_attenuation_db: 30.0,
+            res_enabled: true,
+            res_floor_db: -18.0,
+            res_overdrive: 1.5,
         }
     }
 }
@@ -76,6 +99,12 @@ impl AecProcessor {
             power_leak: config.power_leak,
             regularization: config.regularization,
             max_attenuation_db: config.max_attenuation_db,
+            res: ResConfig {
+                enabled: config.res_enabled,
+                floor_db: config.res_floor_db,
+                overdrive: config.res_overdrive,
+                ..Default::default()
+            },
         };
         let filter = PartitionedMdfFilter::new(mdf_config);
 

@@ -8,6 +8,8 @@ use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
+use super::res::{ResConfig, ResidualEchoSuppressor};
+
 pub const BLOCK_SIZE: usize = 256; // N = 256 samples (16ms @ 16kHz)
 pub const FFT_SIZE: usize = 512; // 2N = 512 points overlap-save FFT
 pub const NUM_PARTITIONS: usize = 8; // K = 8 partitions (total length L = 2048 samples = 128ms)
@@ -18,6 +20,7 @@ pub struct MdfConfig {
     pub power_leak: f32,         // lambda (PSD smoothing factor, typically 0.90 .. 0.95)
     pub regularization: f32,     // epsilon (avoids division by zero in quiet bins)
     pub max_attenuation_db: f32, // clamp for residual suppression (e.g. 25.0 dB)
+    pub res: ResConfig,
 }
 
 impl Default for MdfConfig {
@@ -27,6 +30,7 @@ impl Default for MdfConfig {
             power_leak: 0.92,
             regularization: 2.0,
             max_attenuation_db: 30.0,
+            res: ResConfig::default(),
         }
     }
 }
@@ -45,7 +49,10 @@ pub struct PartitionedMdfFilter {
     power_spectrum: Vec<f32>,
     // Working buffers for FFT/IFFT (preallocated to guarantee zero runtime allocations)
     fft_in_out: Vec<Complex32>,
+    d_hat_freq: Vec<Complex32>,
+    e_freq: Vec<Complex32>,
     scratch: Vec<Complex32>,
+    res: ResidualEchoSuppressor,
     // Real-time energy metrics
     energy_mic: f32,
     energy_ref: f32,
@@ -63,6 +70,8 @@ impl PartitionedMdfFilter {
             .get_inplace_scratch_len()
             .max(ifft.get_inplace_scratch_len());
 
+        let res = ResidualEchoSuppressor::new(config.res.clone());
+
         Self {
             config,
             fft,
@@ -72,7 +81,10 @@ impl PartitionedMdfFilter {
             x_old: vec![0.0; BLOCK_SIZE],
             power_spectrum: vec![1e-3; FFT_SIZE],
             fft_in_out: vec![Complex32::default(); FFT_SIZE],
+            d_hat_freq: vec![Complex32::default(); FFT_SIZE],
+            e_freq: vec![Complex32::default(); FFT_SIZE],
             scratch: vec![Complex32::default(); scratch_len],
+            res,
             energy_mic: 0.0,
             energy_ref: 0.0,
             energy_err: 0.0,
@@ -82,7 +94,7 @@ impl PartitionedMdfFilter {
 
     /// Processes one block of microphone input y(n) and aligned reference x(n) (BLOCK_SIZE = 256 samples).
     ///
-    /// Returns the cleaned error block e(n) where the estimated acoustic echo has been subtracted.
+    /// Returns the cleaned error block e(n) where the estimated acoustic echo and residual harmonics have been suppressed.
     pub fn process_block(
         &mut self,
         mic_block: &[f32],
@@ -138,6 +150,8 @@ impl PartitionedMdfFilter {
                 self.fft_in_out[i] += w_k[i] * x_k[i];
             }
         }
+        // Save estimated echo spectrum before IFFT overwrites fft_in_out
+        self.d_hat_freq.copy_from_slice(&self.fft_in_out);
 
         // 7. IFFT to obtain time-domain estimated echo d_hat
         self.ifft
@@ -146,44 +160,57 @@ impl PartitionedMdfFilter {
 
         // 8. Subtract estimated echo in time domain: e(n) = y(n) - d_hat[BLOCK_SIZE + n]
         // Overlap-save discards the first N samples; second N samples contain linear convolution result.
-        let mut e_block_energy = 0.0f32;
+        let mut e_linear_energy = 0.0f32;
         for i in 0..BLOCK_SIZE {
             let d_hat = self.fft_in_out[BLOCK_SIZE + i].re * ifft_scale;
             let err = mic_block[i] - d_hat;
             out_err_block[i] = err;
-            e_block_energy += err * err;
+            e_linear_energy += err * err;
         }
-        self.energy_err = 0.9 * self.energy_err + 0.1 * e_block_energy;
 
         // 9. Double-talk protection:
-        // During initial convergence (first 25 blocks), allow filter to adapt to room acoustics.
-        // After initial convergence, freeze adaptation if error energy spikes significantly above reference.
-        let is_double_talk = self.adapted_blocks > 25
-            && self.energy_err > (self.energy_ref * 2.0 + 1e-3)
-            && self.energy_err > 0.05;
+        // Detects near-end speech burst instantly (zero delay) by comparing instantaneous
+        // and smoothed error energy against reference echo energy.
+        let is_warmup = self.adapted_blocks <= 25;
+        let is_double_talk = !is_warmup
+            && (e_linear_energy > (e_ref * 1.5 + 1e-3)
+                || self.energy_err > (self.energy_ref * 1.5 + 1e-3))
+            && (e_linear_energy > 0.005 || self.energy_err > 0.01);
 
+        // 10. Compute linear error in frequency domain: E(f) = FFT([0_N, e(n)])
+        for (i, &err_val) in out_err_block.iter().enumerate().take(BLOCK_SIZE) {
+            self.e_freq[i] = Complex32::default();
+            self.e_freq[BLOCK_SIZE + i] = Complex32::new(err_val, 0.0);
+        }
+        self.fft
+            .process_with_scratch(&mut self.e_freq, &mut self.scratch);
+
+        // 11. Apply Non-linear Residual Echo Suppression (RES Wiener Post-Filter)
+        self.res.apply(
+            &self.e_freq,
+            &self.d_hat_freq,
+            is_double_talk,
+            is_warmup,
+            out_err_block,
+        );
+
+        // 12. Update final error energy for ERLE and telemetry metrics
+        let e_block_energy: f32 = out_err_block.iter().map(|&s| s * s).sum();
+        self.energy_err = 0.9 * self.energy_err + 0.1 * e_block_energy;
+
+        // 13. Weight adaptation (Constrained Partitioned Frequency-Domain LMS):
         if !is_double_talk {
             self.adapted_blocks = self.adapted_blocks.saturating_add(1);
 
-            // 10. Compute error in frequency domain: E(f) = FFT([0_N, e(n)])
-            let mut e_freq = vec![Complex32::default(); FFT_SIZE];
-            for i in 0..BLOCK_SIZE {
-                e_freq[i] = Complex32::default();
-                e_freq[BLOCK_SIZE + i] = Complex32::new(out_err_block[i], 0.0);
-            }
-            self.fft
-                .process_with_scratch(&mut e_freq, &mut self.scratch);
-
-            // 11. Weight adaptation (Constrained Partitioned Frequency-Domain LMS):
             let mu = self.config.step_size;
             let eps = self.config.regularization;
 
             for k in 0..NUM_PARTITIONS {
                 let x_k = &self.x_freq[k];
                 // Compute unconstrained gradient in frequency domain: phi_k(f) = mu * conj(X_k(f)) * E(f) / (P_total(f) + eps)
-                for i in 0..FFT_SIZE {
+                for (i, x_val) in x_k.iter().enumerate().take(FFT_SIZE) {
                     let norm_factor = mu / (self.power_spectrum[i] + eps);
-                    self.fft_in_out[i] = x_k[i].conj() * e_freq[i] * norm_factor;
+                    self.fft_in_out[i] = x_val.conj() * self.e_freq[i] * norm_factor;
                 }
 
                 // Transform gradient to time domain

@@ -226,3 +226,78 @@ fn test_aec_double_talk_protection() {
         "Double-talk must be detected during simultaneous user speech"
     );
 }
+
+#[test]
+fn test_res_post_filter_enhancement() {
+    let delay_samples = 235;
+    let fs = 16000.0f32;
+    let num_blocks = 80;
+    let total_samples = num_blocks * BLOCK_SIZE;
+
+    // Multi-tone signal
+    let mut far_end = Vec::with_capacity(total_samples);
+    for n in 0..total_samples {
+        let t = n as f32 / fs;
+        let s = (0.3 * (2.0 * PI * 317.0 * t).sin()
+            + 0.2 * (2.0 * PI * 643.0 * t).sin()
+            + 0.2 * (2.0 * PI * 1151.0 * t).sin()
+            + 0.15 * (2.0 * PI * 1987.0 * t).sin()
+            + 0.15 * (2.0 * PI * 3121.0 * t).sin())
+            * (1.0 + 0.2 * (2.0 * PI * 5.0 * t).sin());
+        far_end.push(s);
+    }
+    let rir = generate_synthetic_rir(delay_samples, 250, 0.5);
+    let echo = convolve(&far_end, &rir);
+
+    let far_end_pcm: Vec<i16> = far_end.iter().map(|&s| (s * 20000.0) as i16).collect();
+    let mic_pcm: Vec<i16> = echo.iter().map(|&s| (s * 20000.0) as i16).collect();
+
+    // 1. Run with RES disabled
+    let config_no_res = AecConfig {
+        enabled: true,
+        bulk_delay_samples: delay_samples,
+        step_size: 0.35,
+        res_enabled: false,
+        ..Default::default()
+    };
+    let mut aec_no_res = AecProcessor::new(config_no_res);
+    let mut out_frame = vec![0i16; BLOCK_SIZE];
+    for b in 0..num_blocks {
+        let s = b * BLOCK_SIZE;
+        let e = s + BLOCK_SIZE;
+        aec_no_res.process_frame(&mic_pcm[s..e], &far_end_pcm[s..e], &mut out_frame);
+    }
+    let metrics_no_res = aec_no_res.get_metrics();
+
+    // 2. Run with RES enabled
+    let config_with_res = AecConfig {
+        enabled: true,
+        bulk_delay_samples: delay_samples,
+        step_size: 0.35,
+        res_enabled: true,
+        res_floor_db: -20.0,
+        ..Default::default()
+    };
+    let mut aec_with_res = AecProcessor::new(config_with_res);
+    for b in 0..num_blocks {
+        let s = b * BLOCK_SIZE;
+        let e = s + BLOCK_SIZE;
+        aec_with_res.process_frame(&mic_pcm[s..e], &far_end_pcm[s..e], &mut out_frame);
+    }
+    let metrics_with_res = aec_with_res.get_metrics();
+
+    println!(
+        "RES Comparison: No RES ERLE = {:.1} dB, With RES ERLE = {:.1} dB",
+        metrics_no_res.erle_db, metrics_with_res.erle_db
+    );
+
+    // RES must provide substantial residual attenuation (higher ERLE)
+    assert!(
+        metrics_with_res.erle_db > metrics_no_res.erle_db,
+        "RES Wiener filter must improve ERLE over pure linear MDF filter"
+    );
+    assert!(
+        metrics_with_res.erle_db >= 25.0,
+        "Target ERLE with RES enabled must reach >= 25 dB"
+    );
+}
