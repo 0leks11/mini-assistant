@@ -9,9 +9,12 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::info;
 
+/// Safe default volume level on daemon startup/reboot (1 = 10% gain).
+pub const DEFAULT_STARTUP_LEVEL: u8 = 1;
+
 /// Current volume level (0–10), shared across audio playback, voice tools, and VL53 sensor.
-/// Default is 10 (100% normal playback gain).
-static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(10);
+/// Default is 1 (10% safe level on boot/restart).
+static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(DEFAULT_STARTUP_LEVEL);
 
 /// Get current volume level (0–10).
 pub fn current_level() -> u8 {

@@ -141,6 +141,9 @@ pub struct AudioConfig {
     /// Capture backend: "vqe" (vendor IPC :9850, default), "alsa" (direct hw:0,2), "mock"
     #[serde(default = "default_capture_backend")]
     pub capture_backend: String,
+    /// Master & Soloist volume level (0-10) enforced at daemon startup/reboot
+    #[serde(default = "default_startup_volume")]
+    pub startup_volume: u8,
     /// Acoustic Echo Cancellation (MDF AEC) configuration
     #[serde(default)]
     pub aec: AecConfig,
@@ -148,6 +151,10 @@ pub struct AudioConfig {
 
 fn default_capture_backend() -> String {
     "alsa".to_string()
+}
+
+fn default_startup_volume() -> u8 {
+    1
 }
 
 #[derive(Debug, Deserialize)]

@@ -499,6 +499,8 @@ async fn main() -> Result<()> {
             let music_ducker = Arc::new(spotify::MusicDucker::new());
             let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let is_gesture_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let startup_vol = config.audio.startup_volume.min(10);
+            audio::volume::set_volume_level(startup_vol);
             audio::volume::init_volume_clicker();
 
             let is_soloist_playing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -506,10 +508,19 @@ async fn main() -> Result<()> {
             let soloist_playing_flag = is_soloist_playing.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(2500));
+                let mut synced_startup_vol = false;
                 loop {
                     interval.tick().await;
                     match soloist_poller_client.get_status().await {
                         Ok(status) => {
+                            if !synced_startup_vol
+                                && soloist_poller_client
+                                    .set_volume(startup_vol * 10)
+                                    .await
+                                    .is_ok()
+                            {
+                                synced_startup_vol = true;
+                            }
                             let playing = status.is_actually_playing();
                             soloist_playing_flag
                                 .store(playing, std::sync::atomic::Ordering::Relaxed);

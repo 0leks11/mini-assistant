@@ -106,16 +106,28 @@ pub fn make_mpcm_record_header(rec_type: u32, length: u32) -> [u8; 8] {
     hdr
 }
 
-/// Convert 24kHz mono S16_LE PCM to 48kHz stereo S16_LE PCM with:
+/// Convert 24kHz mono S16_LE PCM to 48kHz stereo S16_LE PCM using current master volume.
+pub fn convert_24k_mono_to_48k_stereo(mono_24k: &[u8], last_sample: &mut Option<i16>) -> Vec<u8> {
+    convert_24k_mono_to_48k_stereo_with_level(
+        mono_24k,
+        last_sample,
+        crate::audio::volume::current_level(),
+    )
+}
+
+/// Convert 24kHz mono S16_LE PCM to 48kHz stereo S16_LE PCM at explicit `vol_level` (0..=10) with:
 /// 1. Clamping to [-16000, 16000] to protect `mini_pcm_sink`'s peak guard (17000).
 /// 2. Linear interpolation between samples for smooth 2x upsampling.
 /// 3. Stereo frame replication (left = right).
-pub fn convert_24k_mono_to_48k_stereo(mono_24k: &[u8], last_sample: &mut Option<i16>) -> Vec<u8> {
+pub fn convert_24k_mono_to_48k_stereo_with_level(
+    mono_24k: &[u8],
+    last_sample: &mut Option<i16>,
+    vol_level: u8,
+) -> Vec<u8> {
     let sample_count = mono_24k.len() / 2;
     if sample_count == 0 {
         return Vec::new();
     }
-    let vol_level = crate::audio::volume::current_level();
     // Each mono sample produces 2 stereo frames = 4 samples = 8 bytes
     let mut out = Vec::with_capacity(sample_count * 8);
 
@@ -921,7 +933,7 @@ mod tests {
         input.extend_from_slice(&s0.to_le_bytes());
         input.extend_from_slice(&s1.to_le_bytes());
 
-        let out = convert_24k_mono_to_48k_stereo(&input, &mut last_sample);
+        let out = convert_24k_mono_to_48k_stereo_with_level(&input, &mut last_sample, 10);
         // 2 mono samples -> 4 stereo frames = 8 samples = 16 bytes
         assert_eq!(out.len(), 16);
 
@@ -942,7 +954,8 @@ mod tests {
         let mut clamp_input = Vec::new();
         clamp_input.extend_from_slice(&32000i16.to_le_bytes());
         clamp_input.extend_from_slice(&(-30000i16).to_le_bytes());
-        let clamped_out = convert_24k_mono_to_48k_stereo(&clamp_input, &mut last_sample);
+        let clamped_out =
+            convert_24k_mono_to_48k_stereo_with_level(&clamp_input, &mut last_sample, 10);
         // Checked against 16000 ceiling
         let max_sample = clamped_out
             .as_chunks::<2>()
