@@ -426,10 +426,10 @@ impl Rustpotter {
         let candidate_threshold = (self.threshold * 0.5).min(0.25);
         let mut wakeword_detections = self
             .wakewords
-            .values()
+            .values_mut()
             .filter_map(|wakeword| {
                 wakeword.run_detection(
-                    self.audio_mfcc_window.clone(),
+                    &self.audio_mfcc_window,
                     candidate_avg_threshold,
                     candidate_threshold,
                 )

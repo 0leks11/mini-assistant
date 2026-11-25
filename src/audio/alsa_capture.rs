@@ -59,6 +59,12 @@ impl Decimator {
         self
     }
 
+    /// Return current AEC metrics when echo cancellation is active.
+    #[allow(dead_code)]
+    pub fn aec_metrics(&self) -> Option<super::aec::AecMetrics> {
+        self.aec.as_ref().map(AecProcessor::get_metrics)
+    }
+
     /// Default configuration for Station Mini 1 (YNDX-0004) PDM array:
     /// 4-mic beamforming average, 16-bit right shift from S32_LE, 1.0x gain.
     #[allow(dead_code)]
@@ -326,7 +332,7 @@ impl AlsaCapture {
             let mut reader = stdout;
             let mut decimator = Decimator::new(config.channel_mode, config.bit_shift, config.gain)
                 .with_aec(config.aec);
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 16384];
 
             while is_running_clone.load(Ordering::SeqCst) {
                 match reader.read(&mut buf) {

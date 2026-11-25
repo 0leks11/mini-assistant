@@ -1,24 +1,65 @@
-use super::Dtw;
+use super::{
+    dtw::{compute_window_cost_flat, compute_window_cost_with_scratch},
+    Dtw,
+};
 use std::cmp;
 
 pub struct MfccComparator {
     score_ref: f32,
     band_size: u16,
+    work_prev: Vec<f32>,
+    work_curr: Vec<f32>,
 }
 impl MfccComparator {
     pub fn new(score_ref: f32, band_size: u16) -> Self {
         MfccComparator {
             score_ref,
             band_size,
+            work_prev: Vec::new(),
+            work_curr: Vec::new(),
         }
     }
     pub fn calculate_distance(ax: &[f32], bx: &[f32]) -> f32 {
         1. - cosine_similarity(ax, bx)
     }
+    #[allow(dead_code)]
     pub fn compare(&self, a: &[&[f32]], b: &[&[f32]]) -> f32 {
         let mut dtw = Dtw::new(MfccComparator::calculate_distance);
         let cost = dtw.compute_optimal_path_with_window(a, b, self.band_size);
         let normalized_cost = cost / (a.len() + b.len()) as f32;
+        self.compute_probability(normalized_cost)
+    }
+    #[allow(dead_code)]
+    pub fn compare_reusing_scratch(&mut self, a: &[&[f32]], b: &[&[f32]]) -> f32 {
+        let cost = compute_window_cost_with_scratch(
+            a,
+            b,
+            self.band_size,
+            MfccComparator::calculate_distance,
+            &mut self.work_prev,
+            &mut self.work_curr,
+        );
+        let normalized_cost = cost / (a.len() + b.len()) as f32;
+        self.compute_probability(normalized_cost)
+    }
+    pub fn compare_flat(
+        &mut self,
+        template: &[Vec<f32>],
+        query_flat: &[f32],
+        query_frames: usize,
+        dim: usize,
+    ) -> f32 {
+        let cost = compute_window_cost_flat(
+            template,
+            query_flat,
+            query_frames,
+            dim,
+            self.band_size,
+            MfccComparator::calculate_distance,
+            &mut self.work_prev,
+            &mut self.work_curr,
+        );
+        let normalized_cost = cost / (template.len() + query_frames) as f32;
         self.compute_probability(normalized_cost)
     }
     fn compute_probability(&self, cost: f32) -> f32 {

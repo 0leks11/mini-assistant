@@ -111,6 +111,13 @@ while true; do
         wait_for_ntp
     fi
 
+    # Enable Amlogic hardware DAC/TDM loopback onto hw:0,2 Ch6..7 for M-AEC
+    if [ -x /system/workdir/bin/amixer ]; then
+        LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/workdir/bin/amixer -q cset numid=7 1 >/dev/null 2>&1 || true
+        LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/workdir/bin/amixer -q cset numid=8 4 >/dev/null 2>&1 || true
+        LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/workdir/bin/amixer -q cset numid=9 4 >/dev/null 2>&1 || true
+    fi
+
     if [ -f "$DIR/config.toml" ]; then
         "$DAEMON" -c "$DIR/config.toml" >> "$LOGFILE" 2>&1
     else

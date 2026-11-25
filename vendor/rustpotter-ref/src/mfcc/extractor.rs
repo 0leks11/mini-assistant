@@ -1,6 +1,7 @@
 use std::f32::consts::PI;
+use std::sync::Arc;
 
-use rustfft::{num_complex::Complex32, FftPlanner};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 
 pub struct MfccExtractor {
     num_coefficients: usize,
@@ -13,6 +14,12 @@ pub struct MfccExtractor {
     filter_bank: Vec<Vec<f32>>,
     hamming_window: Vec<f32>,
     samples: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
+    fft_buffer: Vec<Complex32>,
+    fft_scratch: Vec<Complex32>,
+    magnitude_spectrum: Vec<f32>,
+    mel_spectrum: Vec<f32>,
+    dct_cos_table: Vec<f32>,
 }
 
 impl MfccExtractor {
@@ -26,22 +33,32 @@ impl MfccExtractor {
         let min_frequency = 0;
         let max_frequency = sample_rate / 2;
         let magnitude_spectrum_size = samples_per_frame / 2;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(samples_per_frame);
+        let scratch_len = fft.get_inplace_scratch_len();
+        let n_coeff = num_coefficients as usize;
         MfccExtractor {
-            samples: vec![],
+            samples: Vec::with_capacity(samples_per_frame + samples_per_shift),
             samples_per_shift,
             samples_per_frame,
             pre_emphasis_coefficient,
-            num_coefficients: num_coefficients as usize,
+            num_coefficients: n_coeff,
             magnitude_spectrum_size,
             filter_bank: Self::new_mel_filter_bank(
                 sample_rate,
                 magnitude_spectrum_size,
-                num_coefficients as usize,
+                n_coeff,
                 min_frequency,
                 max_frequency,
             ),
             hamming_window: Self::new_hamming_window(samples_per_frame),
             sample_rate,
+            fft,
+            fft_buffer: vec![Complex32::default(); samples_per_frame],
+            fft_scratch: vec![Complex32::default(); scratch_len],
+            magnitude_spectrum: vec![0.0; magnitude_spectrum_size],
+            mel_spectrum: vec![0.0; n_coeff],
+            dct_cos_table: Self::new_dct_cos_table(n_coeff),
         }
     }
     pub fn set_out_size(&mut self, out_size: u16) {
@@ -55,6 +72,8 @@ impl MfccExtractor {
             min_frequency,
             max_frequency,
         );
+        self.mel_spectrum.resize(self.num_coefficients, 0.0);
+        self.dct_cos_table = Self::new_dct_cos_table(self.num_coefficients);
         self.reset();
     }
     pub fn compute(&mut self, audio_samples: &[f32]) -> Vec<Vec<f32>> {
@@ -67,50 +86,77 @@ impl MfccExtractor {
         self.samples.clear();
     }
     fn process_audio_part(&mut self, audio_buffer: &[f32]) -> Option<Vec<f32>> {
-        let mut new_samples = self.pre_emphasis(audio_buffer);
+        let shift_len = audio_buffer.len();
         if self.samples.len() >= self.samples_per_frame {
-            self.samples.drain(0..new_samples.len());
-            self.samples.append(&mut new_samples);
-            Some(self.extract_mfccs(&self.samples[0..self.samples_per_frame]))
+            self.samples.copy_within(shift_len.., 0);
+            self.samples.truncate(self.samples.len() - shift_len);
+            let mut tmp_sample = 0.;
+            for &current in audio_buffer {
+                let previous = tmp_sample;
+                tmp_sample = current;
+                self.samples
+                    .push(tmp_sample - self.pre_emphasis_coefficient * previous);
+            }
+            Some(self.extract_mfccs_from_samples())
         } else {
-            self.samples.append(&mut new_samples);
+            let mut tmp_sample = 0.;
+            for &current in audio_buffer {
+                let previous = tmp_sample;
+                tmp_sample = current;
+                self.samples
+                    .push(tmp_sample - self.pre_emphasis_coefficient * previous);
+            }
             None
         }
     }
-    fn extract_mfccs(&self, samples: &[f32]) -> Vec<f32> {
-        let magnitude_spectrum = self.calculate_magnitude_spectrum(samples);
-        let mut mfcc_frame =
-            self.calculate_mel_frequency_cepstral_coefficients(&magnitude_spectrum);
-        mfcc_frame.drain(0..1);
+    fn extract_mfccs_from_samples(&mut self) -> Vec<f32> {
+        for i in 0..self.samples_per_frame {
+            self.fft_buffer[i] = Complex32 {
+                re: self.samples[i] * self.hamming_window[i],
+                im: 0.,
+            };
+        }
+        self.fft
+            .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
+        for i in 0..self.magnitude_spectrum_size {
+            let c = self.fft_buffer[i];
+            self.magnitude_spectrum[i] = (c.re * c.re + c.im * c.im).sqrt();
+        }
+        for i in 0..self.num_coefficients {
+            let fb_row = &self.filter_bank[i];
+            let mut sum = 0.0f32;
+            for (j, &ms) in self.magnitude_spectrum.iter().enumerate() {
+                sum += ms * ms * fb_row[j];
+            }
+            self.mel_spectrum[i] = (sum + f32::MIN_POSITIVE).ln();
+        }
+        let n_coeff = self.num_coefficients;
+        let mut mfcc_frame = Vec::with_capacity(n_coeff.saturating_sub(1));
+        for k in 1..n_coeff {
+            let cos_row = &self.dct_cos_table[k * n_coeff..(k + 1) * n_coeff];
+            let mut sum = 0.0f32;
+            for (n, &mel) in self.mel_spectrum.iter().enumerate() {
+                sum += mel * cos_row[n];
+            }
+            mfcc_frame.push(2. * sum);
+        }
         mfcc_frame
-    }
-    fn pre_emphasis(&self, audio_buffer: &[f32]) -> Vec<f32> {
-        let mut tmp_sample = 0.;
-        audio_buffer
-            .iter()
-            .map(|current| {
-                let previous = tmp_sample;
-                tmp_sample = *current;
-                tmp_sample - self.pre_emphasis_coefficient * previous
-            })
-            .collect()
     }
 
     //==================================================================
     // Feature extraction utils
-    fn calculate_magnitude_spectrum(&self, audio_frame: &[f32]) -> Vec<f32> {
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(self.samples_per_frame);
-        let mut buffer = (0..self.samples_per_frame)
-            .map(|i| Complex32 {
-                re: audio_frame[i] * self.hamming_window[i],
-                im: 0.,
-            })
-            .collect::<Vec<_>>();
-        fft.process(&mut buffer);
-        (0..self.magnitude_spectrum_size)
-            .map(|i| ((buffer[i].re * buffer[i].re) + (buffer[i].im * buffer[i].im)).sqrt())
-            .collect()
+    fn new_dct_cos_table(n_coeff: usize) -> Vec<f32> {
+        if n_coeff == 0 {
+            return Vec::new();
+        }
+        let pi_over_n = PI / n_coeff as f32;
+        let mut table = Vec::with_capacity(n_coeff * n_coeff);
+        for k in 0..n_coeff {
+            for n in 0..n_coeff {
+                table.push((pi_over_n * (n as f32 + 0.5) * k as f32).cos());
+            }
+        }
+        table
     }
     fn new_hamming_window(samples_per_frame: usize) -> Vec<f32> {
         let ns_minus_1 = samples_per_frame - 1;
@@ -118,48 +164,8 @@ impl MfccExtractor {
             .map(|s| 0.54 - (0.46 * (2. * PI * (s as f32 / ns_minus_1 as f32)).cos()))
             .collect()
     }
-    fn calculate_mel_frequency_cepstral_coefficients(
-        &self,
-        magnitude_spectrum: &[f32],
-    ) -> Vec<f32> {
-        let mfccs: Vec<f32> = self
-            .calculate_mel_frequency_cepstrum(magnitude_spectrum)
-            .iter()
-            .map(|ms| (ms + f32::MIN_POSITIVE).ln())
-            .collect();
-        self.discrete_cosine_transform(mfccs)
-    }
     fn frequency_to_mel(frequency: usize) -> f32 {
         1127. * (1. + (frequency as f32 / 700.0)).ln()
-    }
-    fn calculate_mel_frequency_cepstrum(&self, magnitude_spectrum: &[f32]) -> Vec<f32> {
-        (0..self.num_coefficients)
-            .map(|i| {
-                magnitude_spectrum
-                    .iter()
-                    .enumerate()
-                    .map(|(j, ms)| ms * ms * self.filter_bank[i][j])
-                    .sum()
-            })
-            .collect()
-    }
-    fn discrete_cosine_transform(&self, mut input_signal: Vec<f32>) -> Vec<f32> {
-        let dct_signal: Vec<f32> = input_signal.to_vec();
-        let pi_over_n = PI / input_signal.len() as f32;
-        input_signal
-            .iter_mut()
-            .enumerate()
-            .for_each(|(k, input_sample)| {
-                *input_sample = 2.
-                    * dct_signal
-                        .iter()
-                        .enumerate()
-                        .map(|(n, dct_sample)| {
-                            dct_sample * (pi_over_n * (n as f32 + 0.5) * k as f32).cos()
-                        })
-                        .sum::<f32>();
-            });
-        input_signal
     }
     fn new_mel_filter_bank(
         sample_rate: usize,

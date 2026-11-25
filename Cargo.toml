@@ -80,5 +80,11 @@ lto = true         # link-time optimization
 codegen-units = 1  # better optimization
 panic = "abort"    # smaller binary
 
+[profile.release.package.rustpotter]
+opt-level = 3
+
+[profile.release.package.rustfft]
+opt-level = 3
+
 [profile.dev]
 opt-level = 1      # faster dev builds
