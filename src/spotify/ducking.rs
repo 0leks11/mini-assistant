@@ -81,8 +81,8 @@ impl MusicDucker {
             .compare_exchange(0, current_lvl, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let orig_pct = current_lvl * 10;
-            let ducked_pct = ducked_lvl * 10;
+            let orig_pct = volume::soloist_percent_for_level(current_lvl);
+            let ducked_pct = volume::soloist_percent_for_level(ducked_lvl);
             info!(
                 orig_level = current_lvl,
                 ducked_level = ducked_lvl,
@@ -119,7 +119,7 @@ impl MusicDucker {
                 "Dialogue ended: smoothly restoring music volume to pre-duck level"
             );
 
-            let start_pct = ducked_lvl * 10;
+            let start_pct = volume::soloist_percent_for_level(ducked_lvl);
             let target_pct = volume::soloist_percent_for_level(target_level);
 
             if target_pct > start_pct + 15 {
@@ -252,5 +252,21 @@ mod tests {
 
         // Reset
         volume::set_volume_level(10);
+    }
+
+    #[test]
+    fn test_ducking_uses_logarithmic_soloist_percentages() {
+        let ducked_from_3 = calculate_ducked_level(3).unwrap();
+        assert_eq!(ducked_from_3, 2);
+        assert_eq!(volume::soloist_percent_for_level(3), 57);
+        assert_eq!(volume::soloist_percent_for_level(ducked_from_3), 50);
+
+        let ducked_from_8 = calculate_ducked_level(8).unwrap();
+        assert_eq!(ducked_from_8, 2);
+        let start_pct = volume::soloist_percent_for_level(ducked_from_8);
+        let target_pct = volume::soloist_percent_for_level(8);
+        assert_eq!(start_pct, 50);
+        assert_eq!(target_pct, 89);
+        assert_eq!(volume::level_for_soloist_percent(target_pct), 8);
     }
 }
