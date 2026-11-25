@@ -84,6 +84,15 @@ impl ResidualEchoSuppressor {
         self.smoothed_freq_gain.fill(1.0);
     }
 
+    /// Returns active post-filter gain weights across bins `0..=HALF_FFT`, or `None` if bypassed.
+    pub fn active_gains(&self, is_double_talk: bool, is_warmup: bool) -> Option<&[f32]> {
+        if !self.config.enabled || is_warmup || is_double_talk {
+            None
+        } else {
+            Some(&self.prev_gain)
+        }
+    }
+
     /// Applies Residual Echo Suppression in frequency domain.
     ///
     /// - `e_freq`: FFT of time-domain linear error `[0_N, e(n)]`.

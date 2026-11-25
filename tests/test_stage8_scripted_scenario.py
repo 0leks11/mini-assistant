@@ -106,6 +106,7 @@ class StatefulAcousticHandler(http.server.BaseHTTPRequestHandler):
                         "delete": {"operationId": "delete_acoustic_sample"},
                     },
                     "/samples/{id}/audio": {"get": {"operationId": "get_acoustic_sample_audio"}},
+                    "/samples/{id}/spectrogram": {"get": {"operationId": "get_sample_spectrogram"}},
                     "/sessions": {
                         "get": {"operationId": "get_acoustic_session"},
                         "post": {"operationId": "create_acoustic_session"},
@@ -155,6 +156,33 @@ class StatefulAcousticHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(wav_bytes)))
             self.end_headers()
             self.wfile.write(wav_bytes)
+            return
+
+        if self.path.startswith("/api/v1/acoustics/samples/") and self.path.endswith("/spectrogram"):
+            sample_id = self.path.split("/")[5]
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "sample_id": sample_id,
+                    "spectrogram": {
+                        "sample_rate": 16000,
+                        "fft_size": 512,
+                        "hop_ms": 16.0,
+                        "duration_ms": 500,
+                        "freq_bands_hz": [250 * i for i in range(1, 33)],
+                        "band_energies_dbfs": {
+                            "sub_bass": -45.0,
+                            "low_mid": -38.0,
+                            "mid": -12.0,
+                            "presence": -30.0,
+                            "brilliance": -48.0,
+                            "full": -11.5,
+                        },
+                        "frames_db": [[-40.0] * 32],
+                    },
+                },
+            )
             return
 
         if self.path == "/api/v1/acoustics/sessions":
@@ -469,6 +497,10 @@ class TestStage8AcousticScenarioAndDrift(unittest.TestCase):
         self.assertGreater(audio_resp["bytes_len"], 0)
         self.assertEqual(audio_resp["content_type"], "audio/wav")
 
+        spec_resp = client.get_sample_spectrogram(sample_id)
+        self.assertEqual(spec_resp["status"], "ok")
+        self.assertEqual(len(spec_resp["spectrogram"]["freq_bands_hz"]), 32)
+
         # 4. Apply candidate in RAM during session
         cand_resp = client.apply_session_candidate(
             session_id=sess_id, settings={"threshold": 0.52, "score_mode": "avg"}
@@ -600,6 +632,10 @@ class TestStage8AcousticScenarioAndDrift(unittest.TestCase):
 
         audio = rpc("get_acoustic_sample_audio", {"sample_id": smp_id})
         self.assertGreater(audio["bytes_len"], 0)
+
+        spec = rpc("get_sample_spectrogram", {"sample_id": smp_id})
+        self.assertEqual(spec["status"], "ok")
+        self.assertEqual(len(spec["spectrogram"]["freq_bands_hz"]), 32)
 
         # 6. apply_session_candidate
         cand = rpc("apply_session_candidate", {"session_id": sess_id, "settings": {"threshold": 0.50}})

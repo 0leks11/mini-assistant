@@ -61,6 +61,11 @@ pub struct PartitionedMdfFilter {
     adapted_blocks: usize,
     dt_streak: usize,
     last_double_talk: bool,
+    // Compact 32-band (0..8 kHz) & 6-band ERLE live telemetry (EMA smoothed, zero extra FFTs)
+    band_before_pwr: [f32; 6],
+    band_after_pwr: [f32; 6],
+    spectrum_before_db: [f32; 32],
+    spectrum_after_db: [f32; 32],
 }
 
 impl PartitionedMdfFilter {
@@ -95,6 +100,10 @@ impl PartitionedMdfFilter {
             adapted_blocks: 0,
             dt_streak: 0,
             last_double_talk: false,
+            band_before_pwr: [1e-12; 6],
+            band_after_pwr: [1e-12; 6],
+            spectrum_before_db: [-120.0; 32],
+            spectrum_after_db: [-120.0; 32],
         }
     }
 
@@ -235,6 +244,9 @@ impl PartitionedMdfFilter {
             out_err_block,
         );
 
+        // 11b. Aggregate 32 display bands (250 Hz/band) & 6 standard bands from linear spectra
+        self.update_spectral_telemetry(is_double_talk, is_warmup);
+
         // 12. Update final error energy for ERLE and telemetry metrics
         let e_block_energy: f32 = out_err_block.iter().map(|&s| s * s).sum();
         self.energy_err = 0.9 * self.energy_err + 0.1 * e_block_energy;
@@ -298,5 +310,69 @@ impl PartitionedMdfFilter {
 
     pub fn adapted_blocks(&self) -> usize {
         self.adapted_blocks
+    }
+
+    pub fn spectral_telemetry(&self) -> ([f32; 32], [f32; 32], [f32; 6]) {
+        let mut band_erle = [0.0f32; 6];
+        for (i, erle_slot) in band_erle.iter_mut().enumerate() {
+            let b = self.band_before_pwr[i];
+            let a = self.band_after_pwr[i];
+            if b > 1e-10 && a > 1e-12 {
+                *erle_slot = 10.0 * (b / a).log10();
+            }
+        }
+        (self.spectrum_before_db, self.spectrum_after_db, band_erle)
+    }
+
+    fn update_spectral_telemetry(&mut self, is_double_talk: bool, is_warmup: bool) {
+        // Parseval scaling for FFT([0_N, s_N]) with N=256 active samples (amplitude 1.0 -> power 0.5 -> 0 dBFS)
+        const PWR_SCALE: f32 = 1.0 / 32768.0;
+        let gains = self.res.active_gains(is_double_talk, is_warmup);
+        let mut bin_before_sum = [0.0f32; 32];
+        let mut bin_after_sum = [0.0f32; 32];
+        let mut cur_bands_before = [0.0f32; 6];
+        let mut cur_bands_after = [0.0f32; 6];
+
+        for k in 1..=BLOCK_SIZE {
+            let y_pwr = (self.e_freq[k] + self.d_hat_freq[k]).norm_sqr() * PWR_SCALE;
+            let g = gains.map_or(1.0, |gs| gs[k]);
+            let a_pwr = self.e_freq[k].norm_sqr() * g * g * PWR_SCALE;
+
+            let disp_idx = ((k - 1) / 8).min(31);
+            bin_before_sum[disp_idx] += y_pwr;
+            bin_after_sum[disp_idx] += a_pwr;
+
+            if (2..=5).contains(&k) {
+                cur_bands_before[0] += y_pwr;
+                cur_bands_after[0] += a_pwr;
+            } else if (6..=15).contains(&k) {
+                cur_bands_before[1] += y_pwr;
+                cur_bands_after[1] += a_pwr;
+            } else if (16..=47).contains(&k) {
+                cur_bands_before[2] += y_pwr;
+                cur_bands_after[2] += a_pwr;
+            } else if (48..=127).contains(&k) {
+                cur_bands_before[3] += y_pwr;
+                cur_bands_after[3] += a_pwr;
+            } else if k >= 128 {
+                cur_bands_before[4] += y_pwr;
+                cur_bands_after[4] += a_pwr;
+            }
+            if k >= 2 {
+                cur_bands_before[5] += y_pwr;
+                cur_bands_after[5] += a_pwr;
+            }
+        }
+
+        for i in 0..32 {
+            let db_b = 10.0 * bin_before_sum[i].max(1e-12).log10();
+            let db_a = 10.0 * bin_after_sum[i].max(1e-12).log10();
+            self.spectrum_before_db[i] = 0.65 * self.spectrum_before_db[i] + 0.35 * db_b;
+            self.spectrum_after_db[i] = 0.65 * self.spectrum_after_db[i] + 0.35 * db_a;
+        }
+        for i in 0..6 {
+            self.band_before_pwr[i] = 0.9 * self.band_before_pwr[i] + 0.1 * cur_bands_before[i];
+            self.band_after_pwr[i] = 0.9 * self.band_after_pwr[i] + 0.1 * cur_bands_after[i];
+        }
     }
 }

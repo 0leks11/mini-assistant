@@ -691,6 +691,13 @@ impl ControlCenterServer {
                     } else {
                         self.send_not_found(&mut stream).await?;
                     }
+                } else if let Some(sample_id) = sub.strip_suffix("/spectrogram") {
+                    if m == "GET" {
+                        self.handle_api_get_sample_spectrogram(&mut stream, sample_id)
+                            .await?;
+                    } else {
+                        self.send_not_found(&mut stream).await?;
+                    }
                 } else if let Some(sample_id) = sub.strip_suffix("/archive") {
                     if m == "POST" {
                         self.handle_api_archive_sample(&mut stream, sample_id)
@@ -2272,6 +2279,37 @@ impl ControlCenterServer {
             Ok(bytes) => {
                 self.send_response(stream, "200 OK", "audio/wav", &bytes)
                     .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": e.to_string()
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_get_sample_spectrogram(
+        &self,
+        stream: &mut TcpStream,
+        sample_id: &str,
+    ) -> Result<()> {
+        match self.samples_store.get_spectrogram(sample_id) {
+            Ok(spectrogram) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "sample_id": sample_id,
+                        "spectrogram": spectrogram
+                    }),
+                )
+                .await
             }
             Err(e) => {
                 self.send_json_status(
@@ -5296,6 +5334,27 @@ capture_device = "hw:0,2"
         assert_eq!(code, 200);
         assert_eq!(downloaded_wav, wav_bytes);
 
+        // 3b. Compute STFT spectrogram from stored sample
+        let req_spec = format!(
+            "GET /api/v1/acoustics/samples/{}/spectrogram HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            sample_id, local_addr, token
+        );
+        let (code, spec_resp) = send_req(local_addr, &req_spec).await;
+        assert_eq!(code, 200, "Spectrogram failed: {:?}", spec_resp);
+        assert_eq!(spec_resp["status"], "ok");
+        assert_eq!(
+            spec_resp["spectrogram"]["freq_bands_hz"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+        assert!(!spec_resp["spectrogram"]["frames_db"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(spec_resp["spectrogram"]["band_energies_dbfs"]["full"].is_number());
+
         // 4. Get metadata
         let req_meta = format!(
             "GET /api/v1/acoustics/samples/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
@@ -6088,6 +6147,9 @@ capture_device = "hw:0,2"
         assert_eq!(aec_resp["enabled"], true);
         assert_eq!(aec_resp["dtd_status"], "ACTIVE");
         assert!((aec_resp["erle_db"].as_f64().unwrap() - 28.4).abs() < 0.1);
+        assert!(aec_resp["band_erle_db"]["full"].is_number());
+        assert_eq!(aec_resp["spectrum_before_db"].as_array().unwrap().len(), 32);
+        assert_eq!(aec_resp["spectrum_after_db"].as_array().unwrap().len(), 32);
 
         // 3. Calibration token cannot persist startup config (403)
         let persist_body = r#"{"enabled":false,"persist":true}"#;

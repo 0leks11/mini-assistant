@@ -228,13 +228,26 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
         err_rms_dbfs: -53.4,
         double_talk_active: false,
         blocks_processed: 100,
-        adapted_blocks: 90
+        adapted_blocks: 90,
+        band_erle_db: {
+          sub_bass: 18.2,
+          low_mid: 24.5,
+          mid: 31.1,
+          presence: 28.0,
+          brilliance: 21.4,
+          full: 29.4
+        },
+        spectrum_before_db: Array(32).fill(-28.0),
+        spectrum_after_db: Array(32).fill(-57.4)
       };
       context.initAcousticLab(); await settle();
       const get = id => document.getElementById(id);
       assert.equal(get('aec-status-badge').textContent, 'ACTIVE');
       assert.equal(get('aec-erle-value').textContent, '+29.4 дБ');
       assert.equal(get('aec-levels-value').textContent, '-26 / -24 / -53');
+      assert.equal(get('band-erle-sub_bass').textContent, '+18.2 дБ');
+      assert.equal(get('band-erle-mid').textContent, '+31.1 дБ');
+      assert.equal(get('band-erle-full').textContent, '+29.4 дБ');
       assert.equal(get('aec-enabled-toggle').disabled, false);
       assert.equal(get('aec-enabled-toggle').checked, true);
     } else throw new Error('Unknown case');

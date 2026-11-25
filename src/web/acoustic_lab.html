@@ -218,6 +218,13 @@
           <span style="font-size:13px;color:var(--muted)">Прослушивание записи:</span>
           <audio id="sample-audio-player" controls preload="none" style="height:36px;flex:1;min-width:200px"></audio>
         </div>
+        <div id="sample-spectrogram-box" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+            <strong id="sample-spec-title" style="font-size:13px">Спектрограмма записи</strong>
+            <span id="sample-spec-bands" class="muted" style="font-size:12px">—</span>
+          </div>
+          <canvas id="sample-spec-canvas" width="480" height="128" style="width:100%;height:128px;border-radius:6px;background:#0d131a;margin-top:8px;display:block"></canvas>
+        </div>
       </section>
 
       <!-- Evaluation, Search & Reports Comparison -->
@@ -245,6 +252,31 @@
         <div id="job-reports-container" style="max-height:160px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px">
           <div class="empty">Отчёты измерений пока отсутствуют</div>
         </div>
+      </section>
+      <section class="card" aria-labelledby="waterfall-title">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap">
+          <h2 id="waterfall-title" style="margin:0">Спектрограммы M-AEC (до и после)</h2>
+          <span class="badge">0–8 кГц · 32 полосы (250 Гц)</span>
+        </div>
+        <p class="section-desc">Живой 2D waterfall по кадрам захвата (верх — 8 кГц, низ — 0 Гц; цвет от синего тишины к красному пика) и ERLE по 6 частотным диапазонам.</p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:12px">
+          <div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px"><span>До M-AEC (микрофон)</span><span>8 → 0 кГц</span></div>
+            <canvas id="waterfall-before" width="256" height="128" style="width:100%;height:128px;border-radius:6px;background:#0d131a;border:1px solid var(--line);display:block"></canvas>
+          </div>
+          <div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px"><span>После M-AEC + RES</span><span>8 → 0 кГц</span></div>
+            <canvas id="waterfall-after" width="256" height="128" style="width:100%;height:128px;border-radius:6px;background:#0d131a;border:1px solid var(--line);display:block"></canvas>
+          </div>
+        </div>
+        <dl class="facts" style="margin-top:4px">
+          <dt>Sub-bass (&lt;200 Hz)</dt><dd id="band-erle-sub_bass">—</dd>
+          <dt>Low-mid (200–500 Hz)</dt><dd id="band-erle-low_mid">—</dd>
+          <dt>Mid (500–1.5k Hz)</dt><dd id="band-erle-mid">—</dd>
+          <dt>Presence (1.5–4k Hz)</dt><dd id="band-erle-presence">—</dd>
+          <dt>Brilliance (4–8k Hz)</dt><dd id="band-erle-brilliance">—</dd>
+          <dt>Full (все полосы)</dt><dd id="band-erle-full">—</dd>
+        </dl>
       </section>
       <section class="card" aria-labelledby="capabilities-title">
         <h2 id="capabilities-title">Аудиотракт и фиксированные ограничения</h2>
@@ -546,6 +578,25 @@ function initAcousticLab() {
     refreshFieldMeta(); updateActions();
   }
 
+  function dbToColor(db) {
+    const t = Math.max(0, Math.min(1, ((Number.isFinite(db) ? db : -96) + 90) / 84));
+    let r = 13, g = 19, b = 26;
+    if (t < 0.25) {
+      const k = t / 0.25;
+      r = Math.round(13 + 16 * k); g = Math.round(19 + 59 * k); b = Math.round(26 + 190 * k);
+    } else if (t < 0.5) {
+      const k = (t - 0.25) / 0.25;
+      r = Math.round(29 - 23 * k); g = Math.round(78 + 104 * k); b = Math.round(216 - 4 * k);
+    } else if (t < 0.75) {
+      const k = (t - 0.5) / 0.25;
+      r = Math.round(6 + 239 * k); g = Math.round(182 - 24 * k); b = Math.round(212 - 201 * k);
+    } else {
+      const k = (t - 0.75) / 0.25;
+      r = Math.round(245 - 6 * k); g = Math.round(158 - 90 * k); b = Math.round(11 + 57 * k);
+    }
+    return `rgb(${r},${g},${b})`;
+  }
+
   function runtimeView(data) {
     const runtime = data.runtime || {};
     setBadge("runtime-badge", runtime.ready ? (runtime.model_loaded ? "Готова" : "Без модели") : "Не готова", runtime.ready && runtime.model_loaded ? "good" : "warn");
@@ -565,6 +616,21 @@ function initAcousticLab() {
     el("revision-value").textContent = `r${appRev} (сохранено: r${savRev})`;
     el("updated-value").textContent = new Date().toLocaleTimeString("ru-RU");
     for (const key of ["candidate","keyword","opened","suppressed","shadow"]) el(key + "-count").textContent = Number.isFinite(runtime[key + "_count"]) ? String(runtime[key + "_count"]) : "—";
+    const BAND_KEYS = ["sub_bass", "low_mid", "mid", "presence", "brilliance", "full"];
+    function pushWaterfallColumn(canvasId, binsDb) {
+      const canvas = el(canvasId);
+      if (!canvas || typeof canvas.getContext !== "function" || !Array.isArray(binsDb) || !binsDb.length) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      const w = canvas.width, h = canvas.height, colW = 2;
+      ctx.drawImage(canvas, -colW, 0);
+      const binH = h / binsDb.length;
+      for (let i = 0; i < binsDb.length; i++) {
+        ctx.fillStyle = dbToColor(binsDb[i]);
+        const y = Math.floor(h - (i + 1) * binH);
+        ctx.fillRect(w - colW, y, colW, Math.ceil(binH) + 1);
+      }
+    }
     const aec = data.aec;
     const aecToggle = el("aec-enabled-toggle");
     if (aec) {
@@ -577,6 +643,16 @@ function initAcousticLab() {
       } else {
         el("aec-levels-value").textContent = "—";
       }
+      const bands = aec.band_erle_db || {};
+      for (const bk of BAND_KEYS) {
+        const cell = el("band-erle-" + bk);
+        if (cell) {
+          const val = bands[bk];
+          cell.textContent = Number.isFinite(val) ? (val >= 0 ? "+" : "") + val.toFixed(1) + " дБ" : "—";
+        }
+      }
+      pushWaterfallColumn("waterfall-before", aec.spectrum_before_db);
+      pushWaterfallColumn("waterfall-after", aec.spectrum_after_db);
       if (aecToggle) {
         aecToggle.disabled = false;
         aecToggle.checked = !!aec.enabled;
@@ -586,6 +662,10 @@ function initAcousticLab() {
       el("aec-erle-value").textContent = "—";
       el("aec-erle-meter").value = 0;
       el("aec-levels-value").textContent = "—";
+      for (const bk of BAND_KEYS) {
+        const cell = el("band-erle-" + bk);
+        if (cell) cell.textContent = "—";
+      }
       if (aecToggle) aecToggle.disabled = true;
     }
     el("capabilities").className = ""; el("capabilities").replaceChildren();
@@ -890,6 +970,44 @@ function initAcousticLab() {
     } catch (_) {}
   }
 
+  async function loadSampleSpectrogram(sampleId, sampleName) {
+    const box = el("sample-spectrogram-box");
+    const title = el("sample-spec-title");
+    const bands = el("sample-spec-bands");
+    const canvas = el("sample-spec-canvas");
+    try {
+      const res = await fetch(`/api/v1/acoustics/samples/${sampleId}/spectrogram`);
+      const data = await res.json();
+      if (!res.ok || !data.spectrogram) throw new Error(data.message || "Ошибка спектрограммы");
+      const spec = data.spectrogram;
+      if (box) box.style.display = "block";
+      if (title) title.textContent = `Спектрограмма: ${sampleName} (${spec.duration_ms} мс)`;
+      const be = spec.band_energies_dbfs || {};
+      if (bands && Number.isFinite(be.full)) {
+        bands.textContent = `Sub ${be.sub_bass?.toFixed(1)} · Low ${be.low_mid?.toFixed(1)} · Mid ${be.mid?.toFixed(1)} · Pres ${be.presence?.toFixed(1)} · Bril ${be.brilliance?.toFixed(1)} · Full ${be.full?.toFixed(1)} dBFS`;
+      }
+      if (canvas && typeof canvas.getContext === "function" && Array.isArray(spec.frames_db) && spec.frames_db.length) {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          const w = canvas.width, h = canvas.height;
+          ctx.fillStyle = "#0d131a";
+          ctx.fillRect(0, 0, w, h);
+          const cols = spec.frames_db.length;
+          const colW = w / cols;
+          for (let c = 0; c < cols; c++) {
+            const bins = spec.frames_db[c];
+            if (!Array.isArray(bins) || !bins.length) continue;
+            const binH = h / bins.length;
+            for (let b = 0; b < bins.length; b++) {
+              ctx.fillStyle = dbToColor(bins[b]);
+              ctx.fillRect(c * colW, Math.floor(h - (b + 1) * binH), Math.ceil(colW) + 1, Math.ceil(binH) + 1);
+            }
+          }
+        }
+      }
+    } catch (e) { message(e.message, "bad"); }
+  }
+
   async function refreshSamples() {
     const split = el("samples-split-select")?.value || "calibration";
     try {
@@ -916,7 +1034,14 @@ function initAcousticLab() {
         item.style.cursor = "pointer";
         item.style.fontSize = "13px";
         item.title = "Нажмите для прослушивания аудиозаписи";
-        item.innerHTML = `<span>▶ <strong>${s.name}</strong> [${s.label}]</span><span class="muted">${s.metrics?.duration_ms || 0} мс · SNR ${s.metrics?.snr_db?.toFixed(1) || '—'} dB</span>`;
+        item.innerHTML = `<span>▶ <strong>${s.name}</strong> [${s.label}]</span><span style="display:flex;align-items:center;gap:8px"><span class="muted">${s.metrics?.duration_ms || 0} мс · SNR ${s.metrics?.snr_db?.toFixed(1) || '—'} dB</span><button type="button" class="sample-spec-btn" style="padding:2px 8px;font-size:11px">Спектр</button></span>`;
+        const specBtn = item.querySelector && item.querySelector(".sample-spec-btn");
+        if (specBtn) {
+          specBtn.addEventListener("click", (ev) => {
+            if (ev && ev.stopPropagation) ev.stopPropagation();
+            loadSampleSpectrogram(s.id, s.name);
+          });
+        }
         item.addEventListener("click", () => {
           const player = el("sample-audio-player");
           if (player) {

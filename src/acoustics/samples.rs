@@ -3,6 +3,8 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use num_complex::Complex32;
+use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -365,6 +367,146 @@ pub fn validate_and_analyze_wav(
     ))
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleSpectrogramBands {
+    pub sub_bass: f32,
+    pub low_mid: f32,
+    pub mid: f32,
+    pub presence: f32,
+    pub brilliance: f32,
+    pub full: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleSpectrogram {
+    pub sample_rate: u32,
+    pub fft_size: usize,
+    pub hop_ms: f32,
+    pub duration_ms: u32,
+    pub freq_bands_hz: Vec<u16>,
+    pub band_energies_dbfs: SampleSpectrogramBands,
+    pub frames_db: Vec<Vec<f32>>,
+}
+
+/// Computes a 32-band STFT spectrogram (`0..8000 Hz`, 250 Hz/band) and 6-band energy summary
+/// from a validated mono 16kHz PCM16 WAV buffer.
+pub fn compute_sample_spectrogram_from_wav(wav_bytes: &[u8]) -> Result<SampleSpectrogram> {
+    const FFT_SIZE: usize = 512;
+    const BASE_HOP: usize = 256;
+    const MAX_FRAMES: usize = 240;
+
+    let (pcm, metrics) = validate_and_analyze_wav(wav_bytes, None)?;
+
+    let mut padded = if pcm.len() < FFT_SIZE {
+        let mut buf = Vec::with_capacity(FFT_SIZE);
+        buf.extend_from_slice(&pcm);
+        buf.resize(FFT_SIZE, 0);
+        buf
+    } else {
+        pcm
+    };
+
+    let hop = if padded.len() <= FFT_SIZE {
+        BASE_HOP
+    } else {
+        let max_start = padded.len() - FFT_SIZE;
+        let step_needed = (max_start / (MAX_FRAMES - 1)).max(BASE_HOP);
+        step_needed.div_ceil(BASE_HOP) * BASE_HOP
+    };
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(FFT_SIZE);
+    let scratch_len = fft.get_inplace_scratch_len();
+    let mut fft_buf = vec![Complex32::default(); FFT_SIZE];
+    let mut scratch = vec![Complex32::default(); scratch_len];
+
+    let window: Vec<f32> = (0..FFT_SIZE)
+        .map(|n| {
+            let phase = 2.0 * std::f32::consts::PI * n as f32 / FFT_SIZE as f32;
+            0.5 * (1.0 - phase.cos())
+        })
+        .collect();
+    let sum_w_sq: f32 = window.iter().map(|&w| w * w).sum::<f32>().max(1.0);
+    let pwr_scale = 1.0 / (FFT_SIZE as f32 * sum_w_sq);
+
+    let mut frames_db = Vec::new();
+    let mut band_pwr_acc = [0.0f64; 6];
+
+    let mut start = 0usize;
+    while start + FFT_SIZE <= padded.len() {
+        for i in 0..FFT_SIZE {
+            let x = f32::from(padded[start + i]) / 32768.0;
+            fft_buf[i] = Complex32::new(x * window[i], 0.0);
+        }
+        fft.process_with_scratch(&mut fft_buf, &mut scratch);
+
+        let mut bin_sum = [0.0f32; 32];
+        for (k, bin) in fft_buf.iter().enumerate().take(FFT_SIZE / 2 + 1).skip(1) {
+            let weight = if k < FFT_SIZE / 2 { 2.0 } else { 1.0 };
+            let pwr = weight * bin.norm_sqr() * pwr_scale;
+
+            let disp_idx = ((k - 1) / 8).min(31);
+            bin_sum[disp_idx] += pwr;
+
+            let p64 = f64::from(pwr);
+            if (2..=5).contains(&k) {
+                band_pwr_acc[0] += p64;
+            } else if (6..=15).contains(&k) {
+                band_pwr_acc[1] += p64;
+            } else if (16..=47).contains(&k) {
+                band_pwr_acc[2] += p64;
+            } else if (48..=127).contains(&k) {
+                band_pwr_acc[3] += p64;
+            } else if k >= 128 {
+                band_pwr_acc[4] += p64;
+            }
+            if k >= 2 {
+                band_pwr_acc[5] += p64;
+            }
+        }
+
+        let frame_row: Vec<f32> = bin_sum
+            .iter()
+            .map(|&p| {
+                let db = (10.0 * p.max(1e-12).log10()).clamp(-96.0, 0.0);
+                (db * 10.0).round() / 10.0
+            })
+            .collect();
+        frames_db.push(frame_row);
+
+        if padded.len() == FFT_SIZE {
+            break;
+        }
+        start += hop;
+    }
+
+    let n_frames = frames_db.len().max(1) as f64;
+    let to_dbfs = |sum: f64| -> f32 {
+        let db = (10.0 * (sum / n_frames).max(1e-12).log10()).clamp(-96.0, 0.0) as f32;
+        (db * 10.0).round() / 10.0
+    };
+
+    let freq_bands_hz: Vec<u16> = (1..=32).map(|b| (b * 250) as u16).collect();
+    let _ = &mut padded;
+
+    Ok(SampleSpectrogram {
+        sample_rate: metrics.sample_rate,
+        fft_size: FFT_SIZE,
+        hop_ms: ((hop as f32 * 1000.0 / metrics.sample_rate as f32) * 10.0).round() / 10.0,
+        duration_ms: metrics.duration_ms,
+        freq_bands_hz,
+        band_energies_dbfs: SampleSpectrogramBands {
+            sub_bass: to_dbfs(band_pwr_acc[0]),
+            low_mid: to_dbfs(band_pwr_acc[1]),
+            mid: to_dbfs(band_pwr_acc[2]),
+            presence: to_dbfs(band_pwr_acc[3]),
+            brilliance: to_dbfs(band_pwr_acc[4]),
+            full: to_dbfs(band_pwr_acc[5]),
+        },
+        frames_db,
+    })
+}
+
 /// Encodes raw PCM16 samples into standard mono 16kHz WAV format bytes.
 pub fn encode_wav_pcm16_mono(samples: &[i16]) -> Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::with_capacity(44 + samples.len() * 2));
@@ -485,6 +627,11 @@ impl SamplesStore {
         let path = self.base_dir.join(format!("{id}.wav"));
         ensure!(path.exists(), "Sample WAV file not found: {id}");
         std::fs::read(&path).with_context(|| format!("Failed to read sample WAV {id}"))
+    }
+
+    pub fn get_spectrogram(&self, id: &str) -> Result<SampleSpectrogram> {
+        let wav = self.get_wav_bytes(id)?;
+        compute_sample_spectrogram_from_wav(&wav)
     }
 
     pub fn store_sample(&self, dto: CreateSampleDto, wav_bytes: &[u8]) -> Result<SampleMetadata> {
@@ -793,5 +940,32 @@ mod tests {
         assert!(store.get_metadata(&held_out_meta.id).is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sample_spectrogram_detects_1khz_peak() {
+        let mut samples = Vec::with_capacity(8000);
+        for i in 0..8000 {
+            let t = i as f32 / 16000.0;
+            let s = ((2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 12000.0) as i16;
+            samples.push(s);
+        }
+        let wav = encode_wav_pcm16_mono(&samples).expect("wav");
+        let spec = compute_sample_spectrogram_from_wav(&wav).expect("spectrogram");
+        assert_eq!(spec.freq_bands_hz.len(), 32);
+        assert!(!spec.frames_db.is_empty());
+        assert!(
+            spec.band_energies_dbfs.mid > spec.band_energies_dbfs.sub_bass + 20.0,
+            "1 kHz tone must dominate Mid band: {:?}",
+            spec.band_energies_dbfs
+        );
+        assert!(
+            spec.band_energies_dbfs.mid > spec.band_energies_dbfs.brilliance + 20.0,
+            "1 kHz tone must exceed Brilliance band: {:?}",
+            spec.band_energies_dbfs
+        );
+        // Band 3 covers 750..1000 Hz, band 4 covers 1000..1250 Hz (1 kHz hits bin 32 -> band 3/4)
+        let mid_frame = &spec.frames_db[spec.frames_db.len() / 2];
+        assert!(mid_frame[3].max(mid_frame[4]) > -15.0);
     }
 }

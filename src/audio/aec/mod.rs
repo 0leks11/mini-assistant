@@ -82,6 +82,16 @@ pub struct AecMetrics {
     pub double_talk_active: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AecBandErle {
+    pub sub_bass: f32,
+    pub low_mid: f32,
+    pub mid: f32,
+    pub presence: f32,
+    pub brilliance: f32,
+    pub full: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AecTelemetrySnapshot {
     pub enabled: bool,
@@ -93,8 +103,13 @@ pub struct AecTelemetrySnapshot {
     pub double_talk_active: bool,
     pub blocks_processed: u64,
     pub adapted_blocks: u64,
+    pub band_erle_db: AecBandErle,
+    pub spectrum_before_db: Vec<f32>,
+    pub spectrum_after_db: Vec<f32>,
     pub config: AecConfig,
 }
+
+pub const AEC_SPECTRUM_BINS: usize = 32;
 
 /// Lock-free runtime telemetry and enable toggle shared between the ALSA capture thread and HTTP API.
 #[derive(Debug)]
@@ -107,6 +122,9 @@ pub struct SharedAecTelemetry {
     double_talk_active: AtomicBool,
     blocks_processed: AtomicU64,
     adapted_blocks: AtomicU64,
+    band_erle_bits: [AtomicU32; 6],
+    before_bins_bits: [AtomicU32; AEC_SPECTRUM_BINS],
+    after_bins_bits: [AtomicU32; AEC_SPECTRUM_BINS],
     config: Mutex<AecConfig>,
 }
 
@@ -122,6 +140,9 @@ impl SharedAecTelemetry {
             double_talk_active: AtomicBool::new(false),
             blocks_processed: AtomicU64::new(0),
             adapted_blocks: AtomicU64::new(0),
+            band_erle_bits: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            before_bins_bits: std::array::from_fn(|_| AtomicU32::new((-120.0_f32).to_bits())),
+            after_bins_bits: std::array::from_fn(|_| AtomicU32::new((-120.0_f32).to_bits())),
             config: Mutex::new(config),
         })
     }
@@ -156,6 +177,27 @@ impl SharedAecTelemetry {
         self.blocks_processed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Publishes block metrics alongside 6-band ERLE and 32-band before/after spectra.
+    pub fn publish_with_spectrum(
+        &self,
+        metrics: &AecMetrics,
+        adapted_blocks: usize,
+        band_erle: &[f32; 6],
+        before_bins: &[f32; AEC_SPECTRUM_BINS],
+        after_bins: &[f32; AEC_SPECTRUM_BINS],
+    ) {
+        for (dst, &val) in self.band_erle_bits.iter().zip(band_erle.iter()) {
+            dst.store(val.to_bits(), Ordering::Relaxed);
+        }
+        for (dst, &val) in self.before_bins_bits.iter().zip(before_bins.iter()) {
+            dst.store(val.to_bits(), Ordering::Relaxed);
+        }
+        for (dst, &val) in self.after_bins_bits.iter().zip(after_bins.iter()) {
+            dst.store(val.to_bits(), Ordering::Relaxed);
+        }
+        self.publish(metrics, adapted_blocks);
+    }
+
     /// Returns an instantaneous consistent telemetry snapshot for UI and REST consumers.
     pub fn snapshot(&self) -> AecTelemetrySnapshot {
         let enabled = self.enabled.load(Ordering::SeqCst);
@@ -171,6 +213,37 @@ impl SharedAecTelemetry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+
+        let round1 = |v: f32| {
+            if v.is_finite() {
+                (v * 10.0).round() / 10.0
+            } else {
+                0.0
+            }
+        };
+        let b = |idx: usize| {
+            round1(f32::from_bits(
+                self.band_erle_bits[idx].load(Ordering::Relaxed),
+            ))
+        };
+        let band_erle_db = AecBandErle {
+            sub_bass: b(0),
+            low_mid: b(1),
+            mid: b(2),
+            presence: b(3),
+            brilliance: b(4),
+            full: b(5),
+        };
+        let spectrum_before_db = self
+            .before_bins_bits
+            .iter()
+            .map(|a| round1(f32::from_bits(a.load(Ordering::Relaxed))))
+            .collect();
+        let spectrum_after_db = self
+            .after_bins_bits
+            .iter()
+            .map(|a| round1(f32::from_bits(a.load(Ordering::Relaxed))))
+            .collect();
 
         let dtd_status = if !enabled {
             "DISABLED"
@@ -197,6 +270,9 @@ impl SharedAecTelemetry {
             double_talk_active,
             blocks_processed,
             adapted_blocks,
+            band_erle_db,
+            spectrum_before_db,
+            spectrum_after_db,
             config,
         }
     }
@@ -365,7 +441,14 @@ impl AecProcessor {
         }
 
         if let Some(ref telem) = self.shared_telemetry {
-            telem.publish(&self.get_metrics(), self.filter.adapted_blocks());
+            let (before_bins, after_bins, band_erle) = self.filter.spectral_telemetry();
+            telem.publish_with_spectrum(
+                &self.get_metrics(),
+                self.filter.adapted_blocks(),
+                &band_erle,
+                &before_bins,
+                &after_bins,
+            );
         }
     }
 

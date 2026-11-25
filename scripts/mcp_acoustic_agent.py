@@ -364,6 +364,9 @@ class GptMiniAcousticClient:
                 "base64": base64.b64encode(data).decode("ascii"),
             }
 
+    def get_sample_spectrogram(self, sample_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/acoustics/samples/{sample_id}/spectrogram")
+
     def create_acoustic_session(
         self,
         name: Optional[str] = None,
@@ -1009,10 +1012,20 @@ TOOLS = [
     },
     {
         "name": "get_aec_telemetry",
-        "description": "Get live multichannel AEC telemetry (ERLE dB, DTD status, Ref/Mic/Err dBFS, active config).",
+        "description": "Get live multichannel AEC telemetry (ERLE dB, 6-band ERLE, 32-band spectra, DTD status, Ref/Mic/Err dBFS, active config).",
         "inputSchema": {
             "type": "object",
             "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_sample_spectrogram",
+        "description": "Compute 32-band STFT spectrogram (0..8000 Hz) and 6-band dBFS summary for a stored acoustic sample.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"sample_id": {"type": "string"}},
+            "required": ["sample_id"],
             "additionalProperties": False,
         },
     },
@@ -1064,6 +1077,8 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             result = client.get_status()
         elif tool_name == "get_aec_telemetry":
             result = client.get_aec_telemetry()
+        elif tool_name == "get_sample_spectrogram":
+            result = client.get_sample_spectrogram(args["sample_id"])
         elif tool_name == "get_acoustic_events":
             result = client.get_events(
                 since_sample=args.get("since_sample"),

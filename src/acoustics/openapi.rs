@@ -157,6 +157,19 @@ pub fn generate_openapi_spec() -> Value {
                     }
                 }
             },
+            "/samples/{id}/spectrogram": {
+                "get": {
+                    "summary": "Compute 32-band STFT spectrogram and 6-band energy summary for a sample",
+                    "operationId": "get_sample_spectrogram",
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": {
+                        "200": {
+                            "description": "Sample spectrogram (32 bins 0..8000 Hz, 6-band dBFS summary)",
+                            "content": { "application/json": {} }
+                        }
+                    }
+                }
+            },
             "/sessions": {
                 "get": {
                     "summary": "Get active calibration session",
