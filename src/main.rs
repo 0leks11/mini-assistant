@@ -515,7 +515,9 @@ async fn main() -> Result<()> {
                         Ok(status) => {
                             if !synced_startup_vol
                                 && soloist_poller_client
-                                    .set_volume(startup_vol * 10)
+                                    .set_volume(audio::volume::soloist_percent_for_level(
+                                        startup_vol,
+                                    ))
                                     .await
                                     .is_ok()
                             {
@@ -886,7 +888,11 @@ async fn main() -> Result<()> {
                             let new_level = crate::audio::volume::set_volume_level(level);
                             let soloist_client_for_vol = soloist_for_tools.clone();
                             tokio::spawn(async move {
-                                let _ = soloist_client_for_vol.set_volume(new_level * 10).await;
+                                let _ = soloist_client_for_vol
+                                    .set_volume(crate::audio::volume::soloist_percent_for_level(
+                                        new_level,
+                                    ))
+                                    .await;
                             });
                             let _ = req.reply_tx.send(json!({
                                 "status": "ok",
@@ -900,7 +906,11 @@ async fn main() -> Result<()> {
                             let new_level = crate::audio::volume::volume_up();
                             let soloist_client_for_vol = soloist_for_tools.clone();
                             tokio::spawn(async move {
-                                let _ = soloist_client_for_vol.set_volume(new_level * 10).await;
+                                let _ = soloist_client_for_vol
+                                    .set_volume(crate::audio::volume::soloist_percent_for_level(
+                                        new_level,
+                                    ))
+                                    .await;
                             });
                             let _ = req.reply_tx.send(json!({
                                 "status": "ok",
@@ -914,7 +924,11 @@ async fn main() -> Result<()> {
                             let new_level = crate::audio::volume::volume_down();
                             let soloist_client_for_vol = soloist_for_tools.clone();
                             tokio::spawn(async move {
-                                let _ = soloist_client_for_vol.set_volume(new_level * 10).await;
+                                let _ = soloist_client_for_vol
+                                    .set_volume(crate::audio::volume::soloist_percent_for_level(
+                                        new_level,
+                                    ))
+                                    .await;
                             });
                             let _ = req.reply_tx.send(json!({
                                 "status": "ok",

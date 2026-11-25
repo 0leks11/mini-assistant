@@ -64,7 +64,7 @@ impl MusicDucker {
 
         // Determine current volume: prefer Soloist reported volume if non-zero, fallback to master level
         let current_lvl = match &status {
-            Ok(s) if s.volume > 0 => ((s.volume as u16 + 5) / 10).clamp(1, 10) as u8,
+            Ok(s) if s.volume > 0 => volume::level_for_soloist_percent(s.volume).max(1),
             _ => volume::current_level(),
         };
 
@@ -120,7 +120,7 @@ impl MusicDucker {
             );
 
             let start_pct = ducked_lvl * 10;
-            let target_pct = target_level * 10;
+            let target_pct = volume::soloist_percent_for_level(target_level);
 
             if target_pct > start_pct + 15 {
                 let step = (target_pct - start_pct) / 3;

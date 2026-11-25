@@ -237,7 +237,10 @@ pub fn spawn_vl53_volume_task_with_indicators(
 
                                     // Sync to Soloist if available
                                     if let Some(ref soloist) = soloist_client {
-                                        let soloist_vol = new_level * 10;
+                                        let soloist_vol =
+                                            crate::audio::volume::soloist_percent_for_level(
+                                                new_level,
+                                            );
                                         let soloist = soloist.clone();
                                         tokio::spawn(async move {
                                             let _ = soloist.set_volume(soloist_vol).await;

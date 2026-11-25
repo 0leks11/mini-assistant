@@ -946,7 +946,9 @@ impl ControlCenterServer {
         if let Some(ref soloist) = self.soloist_client {
             let s = soloist.clone();
             tokio::spawn(async move {
-                let _ = s.set_volume(new_level * 10).await;
+                let _ = s
+                    .set_volume(volume::soloist_percent_for_level(new_level))
+                    .await;
             });
         }
 

@@ -3,7 +3,7 @@
 //! Maintains volume level on a 0–10 scale (0 = mute, 10 = max).
 //! Controls:
 //! 1. Assistant voice and alarm PCM audio via direct sample scaling in `AudioPlayback`.
-//! 2. Spotify Soloist playback via `soloist.set_volume(level * 10)`.
+//! 2. Spotify Soloist playback via `soloist.set_volume(soloist_percent_for_level(level))`.
 //! 3. Proximity sensor (VL53L0) hand-distance gestures.
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -47,6 +47,33 @@ pub fn volume_down() -> u8 {
 pub fn set_volume_pct(pct: u8) -> u8 {
     let level = ((pct as u16 + 5) / 10).min(10) as u8;
     set_volume_level(level)
+}
+
+/// Maps assistant level (0..=10) onto Spotify Soloist's logarithmic volume scale (0..=100).
+///
+/// Soloist attenuates `10%` to ~`-74 dBFS` (inaudible on AUX KRK), whereas `42%` matches
+/// linear `-20 dB` (`level = 1`) TTS playback loudness in the room.
+pub fn soloist_percent_for_level(level: u8) -> u8 {
+    const TABLE: [u8; 11] = [0, 42, 50, 57, 64, 71, 77, 83, 89, 95, 100];
+    TABLE[level.min(10) as usize]
+}
+
+/// Inverse mapping from Spotify Soloist volume (0..=100) to assistant level (0..=10).
+pub fn level_for_soloist_percent(pct: u8) -> u8 {
+    if pct == 0 {
+        return 0;
+    }
+    const TABLE: [u8; 11] = [0, 42, 50, 57, 64, 71, 77, 83, 89, 95, 100];
+    let mut best_lvl = 1u8;
+    let mut best_diff = u8::MAX;
+    for (idx, &t) in TABLE.iter().enumerate().skip(1) {
+        let diff = pct.abs_diff(t);
+        if diff < best_diff {
+            best_diff = diff;
+            best_lvl = idx as u8;
+        }
+    }
+    best_lvl
 }
 
 /// Apply volume scaling to a 16-bit PCM sample according to the current volume level.
@@ -215,5 +242,18 @@ mod tests {
 
         // Reset to 10
         set_volume_level(10);
+    }
+
+    #[test]
+    fn test_soloist_percent_curve() {
+        assert_eq!(soloist_percent_for_level(0), 0);
+        assert_eq!(soloist_percent_for_level(1), 42);
+        assert_eq!(soloist_percent_for_level(10), 100);
+        assert_eq!(soloist_percent_for_level(255), 100);
+        assert_eq!(level_for_soloist_percent(0), 0);
+        for lvl in 1..=10u8 {
+            let pct = soloist_percent_for_level(lvl);
+            assert_eq!(level_for_soloist_percent(pct), lvl);
+        }
     }
 }
