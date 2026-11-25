@@ -24,9 +24,9 @@ impl DelayBuffer {
     }
 
     /// Default configuration calibrated on GPT Mini + KRK Systems monitor:
-    /// bulk delay = 235 samples @ 16 kHz (14.69 ms).
+    /// bulk delay = 16 samples @ 16 kHz (1.00 ms causal headroom before ~29-sample direct peak).
     pub fn default_mini() -> Self {
-        Self::new(235, 1024)
+        Self::new(16, 1024)
     }
 
     pub fn set_delay(&mut self, delay: usize) {

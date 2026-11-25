@@ -1,7 +1,7 @@
 //! Acoustic Echo Cancellation (AEC) Subsystem for GPT Mini.
 //!
 //! Integrates:
-//! - DelayBuffer: Hardware & acoustic propagation alignment (tau_bulk = 235 samples @ 16kHz);
+//! - DelayBuffer: Hardware & acoustic propagation alignment (tau_bulk = 16 samples @ 16kHz);
 //! - PartitionedMdfFilter: 8-partition frequency domain adaptive filter (128ms tail);
 //! - Double-Talk Detector: Geigel energy ratio to protect near-end voice;
 //! - Zero-regression fallback: transparent passthrough when AEC is disabled in config.toml.
@@ -50,7 +50,7 @@ impl Default for AecConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bulk_delay_samples: 235, // 14.69ms calibrated on GPT Mini + KRK monitor
+            bulk_delay_samples: 16, // 1.00ms causal alignment (direct acoustic peak ~29 samples)
             step_size: 0.25,
             power_leak: 0.92,
             regularization: 2.0,
