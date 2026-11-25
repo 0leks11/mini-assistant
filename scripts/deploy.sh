@@ -10,7 +10,7 @@ MINI_DEPLOY_DIR="/data/opt/mini-assistant"
 TARGET="armv7-unknown-linux-musleabihf"
 
 usage() {
-    echo "Usage: $0 [--host HOST] [--port PORT] [--key PATH] [--jump user@pi] [--skip-build]"
+    echo "Usage: $0 [--host HOST] [--port PORT] [--key PATH] [--jump user@pi] [--skip-build] [--restart|--no-restart]"
 }
 
 require_value() {
@@ -22,7 +22,7 @@ require_value() {
 
 # Parse arguments before reading any configuration; --help has no side effects.
 SKIP_BUILD=0
-RESTART=0
+RESTART=1
 while [[ $# -gt 0 ]]; do
     case $1 in
         --host) require_value "$@"; CLI_HOST="$2"; shift 2 ;;
@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --jump) require_value "$@"; CLI_JUMP="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --restart) RESTART=1; shift ;;
+        --no-restart) RESTART=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument" >&2; usage >&2; exit 2 ;;
     esac

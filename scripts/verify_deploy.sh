@@ -90,11 +90,17 @@ fi
 REMOTE "test -f $MINI_DEPLOY_DIR/mini-assistant.prev" >/dev/null 2>&1
 check "rollback binary present" $?
 
-# 3. Processes: exactly one of each, no duplicates
+# 3. Processes: exactly one of each, no duplicates, and active exe not deleted
 PROCS="$(REMOTE "ps | grep -v grep")"
 count_of() { printf '%s\n' "$PROCS" | grep -c "$1"; }
 [ "$(count_of 'opt/mini-assistant/mini-assistant')" -eq 1 ]; check "single mini-assistant" $? \
     "(count=$(count_of 'opt/mini-assistant/mini-assistant'))"
+LIVE_EXE_CHECK="$(REMOTE "for p in \$(pidof mini-assistant 2>/dev/null); do ls -l /proc/\$p/exe 2>/dev/null; done")"
+if [ -n "$LIVE_EXE_CHECK" ] && ! grep -q '(deleted)' <<< "$LIVE_EXE_CHECK"; then
+    check "running process uses current binary (not deleted)" 0
+else
+    check "running process uses current binary (not deleted)" 1 "(${LIVE_EXE_CHECK:-no_pid})"
+fi
 [ "$(count_of 'run-supervisor.sh')" -ge 1 ]; check "supervisor running" $?
 [ "$(count_of 'mini_pcm_source')" -ge 1 ]; check "mic capture helper" $?
 [ "$(count_of 'soloist-env/soloist')" -ge 1 ]; check "soloist process" $?

@@ -191,6 +191,22 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(any(command[0] == "docker" for command in commands))
         self.assertTrue(any(command[0] == "ssh" for command in commands))
 
+    def test_restart_enabled_by_default_and_no_restart_opts_out(self):
+        run_default = self.run_deploy("--skip-build")
+        self.assertEqual(run_default.returncode, 0, run_default.stderr)
+        self.assertTrue(
+            any(cmd[0] == "ssh" and "S99mini_assistant start" in cmd[-1] for cmd in self.commands()),
+            "Default deploy must restart mini-assistant under supervisor",
+        )
+
+        self.log.unlink()
+        run_no_restart = self.run_deploy("--skip-build", "--no-restart")
+        self.assertEqual(run_no_restart.returncode, 0, run_no_restart.stderr)
+        self.assertFalse(
+            any(cmd[0] == "ssh" and "S99mini_assistant start" in cmd[-1] for cmd in self.commands()),
+            "--no-restart must skip daemon restart",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
