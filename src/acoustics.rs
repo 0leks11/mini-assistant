@@ -226,6 +226,7 @@ pub struct AcousticLab {
     events: Mutex<VecDeque<AcousticEvent>>,
     next_event_sequence: AtomicU64,
     test_session_active: AtomicBool,
+    aec_telemetry: Mutex<Option<Arc<crate::audio::aec::SharedAecTelemetry>>>,
 }
 
 impl AcousticLab {
@@ -252,9 +253,35 @@ impl AcousticLab {
                 events: Mutex::new(VecDeque::with_capacity(256)),
                 next_event_sequence: AtomicU64::new(1),
                 test_session_active: AtomicBool::new(false),
+                aec_telemetry: Mutex::new(None),
             }),
             rx,
         )
+    }
+
+    pub fn set_aec_telemetry(&self, telemetry: Arc<crate::audio::aec::SharedAecTelemetry>) {
+        *self.aec_telemetry.lock().unwrap_or_else(|e| e.into_inner()) = Some(telemetry);
+    }
+
+    pub fn aec_snapshot(&self) -> Option<crate::audio::aec::AecTelemetrySnapshot> {
+        self.aec_telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|t| t.snapshot())
+    }
+
+    pub fn set_aec_enabled(
+        &self,
+        enabled: bool,
+    ) -> Option<crate::audio::aec::AecTelemetrySnapshot> {
+        let guard = self.aec_telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref telem) = *guard {
+            telem.set_enabled(enabled);
+            Some(telem.snapshot())
+        } else {
+            None
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -631,8 +658,38 @@ impl AcousticLab {
 
     pub fn response(&self) -> Value {
         let mut value = serde_json::to_value(self.snapshot()).expect("finite acoustic metadata");
+        let aec_snap = self.aec_snapshot();
+        let aec_capability = match &aec_snap {
+            Some(aec) if aec.enabled => json!({
+                "label": "Эхоподавление / нейросетевое шумоподавление",
+                "value": format!(
+                    "MDF PBFDAF (8 партиций, 128 мс) + RES Wiener · включён (delay={} сэмпл., μ={:.2})",
+                    aec.config.bulk_delay_samples, aec.config.step_size
+                ),
+                "editable": false,
+                "reason": format!(
+                    "Опорный канал: ALSA hw:0,2 Ch6 loopback. Текущий ERLE: {:.1} дБ, статус DTD: {}.",
+                    aec.erle_db, aec.dtd_status
+                ),
+            }),
+            Some(_) => json!({
+                "label": "Эхоподавление / нейросетевое шумоподавление",
+                "value": "Программный MDF M-AEC + RES отключён",
+                "editable": false,
+                "reason": "Включите M-AEC переключателем на этой странице или [audio.aec] enabled = true в config.toml.",
+            }),
+            None => json!({
+                "label": "Эхоподавление / нейросетевое шумоподавление",
+                "value": "MDF M-AEC + RES (захват hw:0,2 не запущен)",
+                "editable": false,
+                "reason": "Полосовой фильтр и нормализация ниже действуют в KWS поверх M-AEC после запуска захвата.",
+            }),
+        };
         let v = value.as_object_mut().unwrap();
         v.insert("status".into(), json!("ok"));
+        if let Some(aec) = aec_snap {
+            v.insert("aec".into(), json!(aec));
+        }
         v.insert(
             "defaults".into(),
             json!(WakewordCalibrationConfig::default()),
@@ -642,7 +699,7 @@ impl AcousticLab {
             {"label":"Микрофонный поток","value":"PCM16 mono · 16 000 Гц; ALSA native 8ch S32LE · 48 000 Гц", "editable":false,"reason":"Геометрия согласована с драйвером и моделью; изменение требует отдельной проверки тракта."},
             {"label":"Выбор физического микрофона","value":std::env::var("MINI_MIC_CHANNEL").ok().filter(|s| ["ch0","ch1","ch2","ch3","avg4"].contains(&s.as_str())).unwrap_or_else(||"ch0".into()),"editable":false,"reason":"Выбирается при запуске ALSA. Горячее переключение каналов в этом тракте не реализовано."},
             {"label":"MFCC","value":"Окно 30 мс / шаг 10 мс; pre-emphasis 0.97", "editable":false,"reason":"Изменение признаков потребует переобучения модели, а не калибровки порога."},
-            {"label":"Эхоподавление / нейросетевое шумоподавление","value":"Независимый программный AEC/NS не подключён", "editable":false,"reason":"Полосовой фильтр и нормализация ниже действуют в KWS; они не заменяют AEC/NS."},
+            aec_capability,
             {"label":"Обучение модели","value":"3–8 эталонов в текущем формате; окно записи 3.8 с, максимум 4 с", "editable":false,"reason":"Мастер обучения остаётся на главной странице. Изменение лимита шаблонов требует измерения CPU на Mini."}
         ]));
         value
@@ -702,16 +759,16 @@ pub fn effective_settings(config: &Config) -> Result<WakewordCalibrationConfig> 
     Ok(s)
 }
 
-/// Replace only the acoustic table; retain the rest of the TOML document values.
-/// Atomic rename, private temp permissions and fsync protect against truncated files.
-pub fn save_settings(path: &Path, settings: &WakewordCalibrationConfig) -> Result<()> {
-    settings.validate()?;
+fn update_toml_document(
+    path: &Path,
+    mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
+) -> Result<()> {
     let source = std::fs::read_to_string(path).context("Acoustic config file unavailable")?;
     ensure!(source.len() <= 1024 * 1024, "Config too large");
     let mut doc: toml::Value =
         toml::from_str(&source).context("Invalid existing TOML; not overwritten")?;
     let table = doc.as_table_mut().context("Config must be a TOML table")?;
-    table.insert("wakeword".into(), toml::Value::try_from(settings)?);
+    mutate(table)?;
     let text = toml::to_string_pretty(&doc)?;
     let parent = path
         .parent()
@@ -737,6 +794,34 @@ pub fn save_settings(path: &Path, settings: &WakewordCalibrationConfig) -> Resul
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// Replace only the acoustic table; retain the rest of the TOML document values.
+/// Atomic rename, private temp permissions and fsync protect against truncated files.
+pub fn save_settings(path: &Path, settings: &WakewordCalibrationConfig) -> Result<()> {
+    settings.validate()?;
+    update_toml_document(path, |table| {
+        table.insert("wakeword".into(), toml::Value::try_from(settings)?);
+        Ok(())
+    })
+}
+
+/// Atomically update `[audio.aec].enabled` in config.toml while preserving all other sections.
+pub fn save_aec_enabled(path: &Path, enabled: bool) -> Result<()> {
+    update_toml_document(path, |table| {
+        let audio = table
+            .entry("audio".to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .context("[audio] section must be a TOML table")?;
+        let aec = audio
+            .entry("aec".to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .context("[audio.aec] section must be a TOML table")?;
+        aec.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+        Ok(())
+    })
 }
 
 /// Soft gain at the shared mono PCM boundary, before enrollment, KWS and cloud.

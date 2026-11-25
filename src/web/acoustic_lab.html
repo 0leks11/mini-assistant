@@ -266,6 +266,12 @@
           <dt>Применённая ревизия</dt><dd id="revision-value">—</dd>
           <dt>Обновление</dt><dd id="updated-value">—</dd>
         </dl>
+        <div class="meter-label" style="margin-top:16px"><span>M-AEC (подавление эха)</span><span id="aec-status-badge" class="badge">—</span></div>
+        <div class="meter-label"><label for="aec-erle-meter">Подавление ERLE</label><output id="aec-erle-value">—</output></div><meter id="aec-erle-meter" min="0" max="40" value="0"></meter>
+        <dl class="facts" style="margin-top:10px">
+          <dt>Ref / Mic / Err (dBFS)</dt><dd id="aec-levels-value">—</dd>
+        </dl>
+        <label class="switch" style="margin-top:12px"><input type="checkbox" id="aec-enabled-toggle" disabled><span>M-AEC + RES включён</span></label>
         <p class="side-note">Балл — внутренняя мера сходства, не вероятность и не процент. VAD определяет речь внутри открытой реплики; он не заменяет слово вызова.</p>
       </section>
       <section class="card">
@@ -559,6 +565,29 @@ function initAcousticLab() {
     el("revision-value").textContent = `r${appRev} (сохранено: r${savRev})`;
     el("updated-value").textContent = new Date().toLocaleTimeString("ru-RU");
     for (const key of ["candidate","keyword","opened","suppressed","shadow"]) el(key + "-count").textContent = Number.isFinite(runtime[key + "_count"]) ? String(runtime[key + "_count"]) : "—";
+    const aec = data.aec;
+    const aecToggle = el("aec-enabled-toggle");
+    if (aec) {
+      const tone = aec.dtd_status === "ACTIVE" ? "good" : (aec.dtd_status === "CONVERGING" || aec.dtd_status === "DOUBLE_TALK" ? "warn" : (aec.dtd_status === "DISABLED" ? "bad" : ""));
+      setBadge("aec-status-badge", aec.dtd_status || "—", tone);
+      el("aec-erle-value").textContent = Number.isFinite(aec.erle_db) ? (aec.erle_db >= 0 ? "+" : "") + aec.erle_db.toFixed(1) + " дБ" : "—";
+      el("aec-erle-meter").value = Number.isFinite(aec.erle_db) ? Math.max(0, Math.min(40, aec.erle_db)) : 0;
+      if ([aec.ref_rms_dbfs, aec.mic_rms_dbfs, aec.err_rms_dbfs].every(Number.isFinite)) {
+        el("aec-levels-value").textContent = `${aec.ref_rms_dbfs.toFixed(0)} / ${aec.mic_rms_dbfs.toFixed(0)} / ${aec.err_rms_dbfs.toFixed(0)}`;
+      } else {
+        el("aec-levels-value").textContent = "—";
+      }
+      if (aecToggle) {
+        aecToggle.disabled = false;
+        aecToggle.checked = !!aec.enabled;
+      }
+    } else {
+      setBadge("aec-status-badge", "Не подключён", "");
+      el("aec-erle-value").textContent = "—";
+      el("aec-erle-meter").value = 0;
+      el("aec-levels-value").textContent = "—";
+      if (aecToggle) aecToggle.disabled = true;
+    }
     el("capabilities").className = ""; el("capabilities").replaceChildren();
     for (const capability of data.capabilities || []) {
       const row = document.createElement("div"); row.className = "capability";
@@ -1048,6 +1077,22 @@ function initAcousticLab() {
         message(`Автоподбор завершён (${srch.total_trials} итераций). Лучший кандидат загружен в форму! Балл: ${srch.best_score.toFixed(1)}.`, "good");
       }
     } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("aec-enabled-toggle")?.addEventListener("change", async (event) => {
+    const enabled = !!event.target.checked;
+    try {
+      await request("/api/v1/acoustics/aec", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled, persist: true })
+      });
+      message(enabled ? "M-AEC включён и сохранён в config.toml." : "M-AEC отключён (passthrough) и сохранён в config.toml.", "good");
+      poll();
+    } catch (e) {
+      event.target.checked = !enabled;
+      message(e.message, "bad");
+    }
   });
 
   refreshSessionStatus();

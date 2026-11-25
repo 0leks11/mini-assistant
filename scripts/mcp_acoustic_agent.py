@@ -78,6 +78,9 @@ class GptMiniAcousticClient:
     def get_status(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/acoustics")
 
+    def get_aec_telemetry(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/acoustics/aec")
+
     def get_events(
         self, since_sample: Optional[int] = None, limit: Optional[int] = None
     ) -> Dict[str, Any]:
@@ -1004,6 +1007,15 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "get_aec_telemetry",
+        "description": "Get live multichannel AEC telemetry (ERLE dB, DTD status, Ref/Mic/Err dBFS, active config).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -1050,6 +1062,8 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
 
         if tool_name in ("get_acoustic_status", "get_acoustic_state"):
             result = client.get_status()
+        elif tool_name == "get_aec_telemetry":
+            result = client.get_aec_telemetry()
         elif tool_name == "get_acoustic_events":
             result = client.get_events(
                 since_sample=args.get("since_sample"),

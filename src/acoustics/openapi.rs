@@ -36,6 +36,23 @@ pub fn generate_openapi_spec() -> Value {
                     }
                 }
             },
+            "/aec": {
+                "get": {
+                    "summary": "Get live multichannel AEC telemetry (ERLE, DTD state, levels)",
+                    "operationId": "get_aec_telemetry",
+                    "responses": {
+                        "200": { "description": "Live AEC telemetry snapshot" },
+                        "503": { "description": "Audio capture loop unavailable" }
+                    }
+                },
+                "post": {
+                    "summary": "Enable or disable M-AEC at runtime (with optional owner persistence)",
+                    "operationId": "set_aec_state",
+                    "responses": {
+                        "200": { "description": "Updated AEC telemetry snapshot" }
+                    }
+                }
+            },
             "/profiles": {
                 "get": {
                     "summary": "List saved acoustic profiles",

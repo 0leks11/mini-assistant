@@ -559,6 +559,13 @@ impl ControlCenterServer {
                 self.handle_api_get_acoustic_events(&mut stream, query)
                     .await?;
             }
+            ("GET", "/api/v1/acoustics/aec") | ("GET", "/api/v1/calibration/aec") => {
+                self.handle_api_get_aec(&mut stream).await?;
+            }
+            ("POST", "/api/v1/acoustics/aec") | ("POST", "/api/v1/calibration/aec") => {
+                self.handle_api_post_aec(&mut stream, body, &identity)
+                    .await?;
+            }
             ("POST", "/api/v1/acoustics/test_session")
             | ("POST", "/api/v1/calibration/test_session") => {
                 self.handle_api_post_acoustic_test_session(&mut stream, body)
@@ -1351,6 +1358,106 @@ impl ControlCenterServer {
             }),
         )
         .await
+    }
+
+    async fn handle_api_get_aec(&self, stream: &mut TcpStream) -> Result<()> {
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await;
+        };
+        let Some(snap) = lab.aec_snapshot() else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"AEC telemetry is not attached (capture inactive)"}),
+                )
+                .await;
+        };
+        let mut resp = serde_json::to_value(&snap)?;
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert("status".into(), serde_json::json!("ok"));
+        }
+        self.send_json(stream, &resp).await
+    }
+
+    async fn handle_api_post_aec(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        let Some(lab) = &self.acoustic_lab else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"Audio loop is unavailable"}),
+                )
+                .await;
+        };
+        #[derive(serde::Deserialize)]
+        struct AecTogglePayload {
+            enabled: bool,
+            #[serde(default)]
+            persist: Option<bool>,
+        }
+        let payload: AecTogglePayload = match serde_json::from_str(body) {
+            Ok(p) => p,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({"status":"error","message":format!("Invalid JSON: {e}")}),
+                    )
+                    .await;
+            }
+        };
+        let persist = payload.persist.unwrap_or(false);
+        if persist && !identity.is_owner() {
+            return self
+                .send_json_status(
+                    stream,
+                    "403 Forbidden",
+                    &serde_json::json!({"status":"error","message":"Forbidden: calibration identity cannot persist startup [audio.aec] settings"}),
+                )
+                .await;
+        }
+        let Some(updated) = lab.set_aec_enabled(payload.enabled) else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({"status":"error","message":"AEC telemetry is not attached (capture inactive)"}),
+                )
+                .await;
+        };
+        if persist {
+            if let Some(cfg_path) = self.resolve_config_path() {
+                if cfg_path.exists() {
+                    if let Err(e) = crate::acoustics::save_aec_enabled(&cfg_path, payload.enabled) {
+                        return self
+                            .send_json_status(
+                                stream,
+                                "500 Internal Server Error",
+                                &serde_json::json!({"status":"error","message":format!("Failed to persist AEC state: {e}")}),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        let mut resp = serde_json::to_value(&updated)?;
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert("status".into(), serde_json::json!("ok"));
+        }
+        self.send_json(stream, &resp).await
     }
 
     async fn handle_api_post_acoustic_test_session(
@@ -5875,6 +5982,146 @@ capture_device = "hw:0,2"
         assert!(fin_resp["saved_profile_id"].is_string());
 
         // Cleanup
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_http_aec_telemetry_and_runtime_toggle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("mini_test_aec_web_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let auth_manager = Arc::new(AuthManager::new(Some("owner_secret_aec".to_string())));
+        let (_, cal_token) = auth_manager.issue_calibration_token(
+            "calib_aec_agent".into(),
+            std::time::Duration::from_secs(3600),
+            std::collections::HashSet::from([Scope::AcousticsRead, Scope::AcousticsWrite]),
+            crate::web::auth::CalibrationLease::default(),
+        );
+        let token = &cal_token.token;
+
+        let (lab, _rx) =
+            crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        let aec_cfg = crate::audio::AecConfig::default_mini();
+        let aec_telem = crate::audio::SharedAecTelemetry::new(aec_cfg);
+        aec_telem.publish(
+            &crate::audio::AecMetrics {
+                erle_db: 28.4,
+                mic_rms_dbfs: -24.0,
+                ref_rms_dbfs: -26.0,
+                err_rms_dbfs: -52.4,
+                double_talk_active: false,
+            },
+            40,
+        );
+        lab.set_aec_telemetry(aec_telem);
+
+        let cfg_file = temp_dir.join("config.toml");
+        std::fs::write(&cfg_file, "[audio]\nstartup_volume = 1\n").unwrap();
+
+        let server = Arc::new(
+            ControlCenterServer::new(
+                Some(cfg_file.clone()),
+                "client_id".to_string(),
+                "http://127.0.0.1/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                Arc::new(crate::spotify::ducking::MusicDucker::new()),
+            )
+            .with_auth_manager(auth_manager)
+            .with_acoustic_lab(lab),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let s = String::from_utf8_lossy(&buf);
+            let code = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse::<u16>()
+                .unwrap_or(0);
+            let json_body = s
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b.trim()).ok())
+                .unwrap_or(serde_json::Value::Null);
+            (code, json_body)
+        }
+
+        // 1. Anonymous GET /api/v1/acoustics/aec -> 401
+        let req_anon = format!(
+            "GET /api/v1/acoustics/aec HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            local_addr
+        );
+        let (code, _) = send_req(local_addr, &req_anon).await;
+        assert_eq!(code, 401);
+
+        // 2. Calibration token GET /api/v1/acoustics/aec -> 200 with ACTIVE ERLE
+        let req_get = format!(
+            "GET /api/v1/acoustics/aec HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            local_addr, token
+        );
+        let (code, aec_resp) = send_req(local_addr, &req_get).await;
+        assert_eq!(code, 200);
+        assert_eq!(aec_resp["status"], "ok");
+        assert_eq!(aec_resp["enabled"], true);
+        assert_eq!(aec_resp["dtd_status"], "ACTIVE");
+        assert!((aec_resp["erle_db"].as_f64().unwrap() - 28.4).abs() < 0.1);
+
+        // 3. Calibration token cannot persist startup config (403)
+        let persist_body = r#"{"enabled":false,"persist":true}"#;
+        let req_cal_persist = format!(
+            "POST /api/v1/acoustics/aec HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, persist_body.len(), persist_body
+        );
+        let (code, _) = send_req(local_addr, &req_cal_persist).await;
+        assert_eq!(code, 403);
+
+        // 4. Calibration token RAM-only toggle works (200)
+        let ram_body = r#"{"enabled":false}"#;
+        let req_cal_ram = format!(
+            "POST /api/v1/acoustics/aec HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, token, ram_body.len(), ram_body
+        );
+        let (code, ram_resp) = send_req(local_addr, &req_cal_ram).await;
+        assert_eq!(code, 200);
+        assert_eq!(ram_resp["enabled"], false);
+        assert_eq!(ram_resp["dtd_status"], "DISABLED");
+
+        // 5. Owner can enable + persist to config.toml
+        let owner_body = r#"{"enabled":true,"persist":true}"#;
+        let req_owner_persist = format!(
+            "POST /api/v1/acoustics/aec HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer owner_secret_aec\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            local_addr, owner_body.len(), owner_body
+        );
+        let (code, owner_resp) = send_req(local_addr, &req_owner_persist).await;
+        assert_eq!(code, 200);
+        assert_eq!(owner_resp["enabled"], true);
+        let cfg_text = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(cfg_text.contains("[audio.aec]"));
+        assert!(cfg_text.contains("enabled = true"));
+
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_dir_all(&temp_dir);

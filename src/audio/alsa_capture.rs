@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use super::aec::{AecConfig, AecProcessor};
+use super::aec::{AecConfig, AecProcessor, SharedAecTelemetry};
 
 /// Channel selection mode for the 8-channel PDM microphone array
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,6 +55,21 @@ impl Decimator {
             self.aec = Some(AecProcessor::new(aec_config));
         } else {
             self.aec = None;
+        }
+        self
+    }
+
+    /// Enable MDF AEC wired with lock-free runtime telemetry and live enable toggle.
+    pub fn with_aec_and_telemetry(
+        mut self,
+        aec_config: AecConfig,
+        telemetry: Option<Arc<SharedAecTelemetry>>,
+    ) -> Self {
+        match telemetry {
+            Some(telem) => {
+                self.aec = Some(AecProcessor::new(aec_config).with_shared_telemetry(telem));
+            }
+            None => return self.with_aec(aec_config),
         }
         self
     }
@@ -172,18 +187,27 @@ impl Decimator {
                 std::mem::swap(&mut ready_chunks[last], &mut self.out_chunk_buffer);
 
                 if let Some(ref mut aec) = self.aec {
-                    if aec.is_enabled() && self.ref_chunk_buffer.len() >= 256 {
-                        let chunk = &mut ready_chunks[last];
-                        let mut mic_pcm = [0i16; 256];
-                        let (in_pairs, _) = chunk.as_chunks::<2>();
-                        for (in_bytes, sample) in in_pairs.iter().zip(mic_pcm.iter_mut()) {
-                            *sample = i16::from_le_bytes(*in_bytes);
-                        }
-                        let mut out_pcm = [0i16; 256];
-                        aec.process_frame(&mic_pcm, &self.ref_chunk_buffer[..256], &mut out_pcm);
-                        let (out_pairs, _) = chunk.as_chunks_mut::<2>();
-                        for (sample, out_bytes) in out_pcm.iter().zip(out_pairs.iter_mut()) {
-                            out_bytes.copy_from_slice(&sample.to_le_bytes());
+                    if self.ref_chunk_buffer.len() >= 256 {
+                        if aec.is_enabled() || aec.has_shared_telemetry() {
+                            let chunk = &mut ready_chunks[last];
+                            let mut mic_pcm = [0i16; 256];
+                            let (in_pairs, _) = chunk.as_chunks::<2>();
+                            for (in_bytes, sample) in in_pairs.iter().zip(mic_pcm.iter_mut()) {
+                                *sample = i16::from_le_bytes(*in_bytes);
+                            }
+                            let mut out_pcm = [0i16; 256];
+                            aec.process_frame(
+                                &mic_pcm,
+                                &self.ref_chunk_buffer[..256],
+                                &mut out_pcm,
+                            );
+                            if aec.is_enabled() {
+                                let (out_pairs, _) = chunk.as_chunks_mut::<2>();
+                                for (sample, out_bytes) in out_pcm.iter().zip(out_pairs.iter_mut())
+                                {
+                                    out_bytes.copy_from_slice(&sample.to_le_bytes());
+                                }
+                            }
                         }
                         self.ref_chunk_buffer.drain(..256);
                     }
@@ -207,6 +231,7 @@ pub struct AlsaCaptureConfig {
     pub gain: f32,
     pub custom_arecord_path: Option<PathBuf>,
     pub aec: AecConfig,
+    pub aec_telemetry: Option<Arc<SharedAecTelemetry>>,
 }
 
 impl Default for AlsaCaptureConfig {
@@ -218,6 +243,7 @@ impl Default for AlsaCaptureConfig {
             gain: 1.0,
             custom_arecord_path: None,
             aec: AecConfig::default(),
+            aec_telemetry: None,
         }
     }
 }
@@ -331,7 +357,7 @@ impl AlsaCapture {
             use std::io::Read;
             let mut reader = stdout;
             let mut decimator = Decimator::new(config.channel_mode, config.bit_shift, config.gain)
-                .with_aec(config.aec);
+                .with_aec_and_telemetry(config.aec, config.aec_telemetry);
             let mut buf = [0u8; 16384];
 
             while is_running_clone.load(Ordering::SeqCst) {

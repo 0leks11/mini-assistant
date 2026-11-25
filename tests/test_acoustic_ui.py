@@ -218,6 +218,25 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
       const req = JSON.parse(calls.find(c => c.method === 'POST').body);
       assert.equal(req.settings.threshold, 0.55);
       assert.equal(Object.keys(req.settings).length, 33, 'All 33 fields must be submitted');
+    } else if (input.case === 'aec_telemetry') {
+      current.aec = {
+        enabled: true,
+        dtd_status: 'ACTIVE',
+        erle_db: 29.4,
+        mic_rms_dbfs: -24.0,
+        ref_rms_dbfs: -26.0,
+        err_rms_dbfs: -53.4,
+        double_talk_active: false,
+        blocks_processed: 100,
+        adapted_blocks: 90
+      };
+      context.initAcousticLab(); await settle();
+      const get = id => document.getElementById(id);
+      assert.equal(get('aec-status-badge').textContent, 'ACTIVE');
+      assert.equal(get('aec-erle-value').textContent, '+29.4 дБ');
+      assert.equal(get('aec-levels-value').textContent, '-26 / -24 / -53');
+      assert.equal(get('aec-enabled-toggle').disabled, false);
+      assert.equal(get('aec-enabled-toggle').checked, true);
     } else throw new Error('Unknown case');
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });
@@ -298,6 +317,9 @@ class AcousticUiTests(unittest.TestCase):
             "echo_tail_ms": 400, "startup_suppression_ms": 200, "wake_chime": True,
         }
         self.run_case("all_33_controls", extra={"controls": controls_33, "defaults": defaults_33})
+
+    def test_aec_telemetry_rendering(self):
+        self.run_case("aec_telemetry")
 
 
 if __name__ == "__main__":

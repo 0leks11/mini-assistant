@@ -83,6 +83,10 @@ class StatefulAcousticHandler(http.server.BaseHTTPRequestHandler):
                 "paths": {
                     "/state": {"get": {"operationId": "get_acoustic_state"}},
                     "/schema": {"get": {"operationId": "get_openapi_schema"}},
+                    "/aec": {
+                        "get": {"operationId": "get_aec_telemetry"},
+                        "post": {"operationId": "set_aec_state"},
+                    },
                     "/profiles": {
                         "get": {"operationId": "list_acoustic_profiles"},
                         "post": {"operationId": "create_acoustic_profile"},

@@ -546,6 +546,8 @@ async fn main() -> Result<()> {
             let acoustic_settings = acoustics::effective_settings(&config)?;
             let (acoustic_lab, mut rx_calibration) =
                 acoustics::AcousticLab::new(acoustic_settings.clone());
+            let aec_telemetry = audio::SharedAecTelemetry::new(config.audio.aec.clone());
+            acoustic_lab.set_aec_telemetry(aec_telemetry.clone());
 
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
@@ -1820,6 +1822,7 @@ async fn main() -> Result<()> {
                         gain: 1.0,
                         custom_arecord_path: None,
                         aec: config.audio.aec.clone(),
+                        aec_telemetry: Some(aec_telemetry.clone()),
                     };
                     match audio::AlsaCapture::start(alsa_cfg, tx_raw_mic) {
                         Ok(c) => {

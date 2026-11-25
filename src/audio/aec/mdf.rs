@@ -295,4 +295,8 @@ impl PartitionedMdfFilter {
     pub fn is_double_talk(&self) -> bool {
         self.last_double_talk
     }
+
+    pub fn adapted_blocks(&self) -> usize {
+        self.adapted_blocks
+    }
 }

@@ -279,6 +279,8 @@ impl AuthManager {
                     | "/api/v1/calibration"
                     | "/api/v1/acoustics/events"
                     | "/api/v1/calibration/events"
+                    | "/api/v1/acoustics/aec"
+                    | "/api/v1/calibration/aec"
             );
 
         if is_acoustic_read {
@@ -311,6 +313,8 @@ impl AuthManager {
                     | "/api/v1/calibration/restore"
                     | "/api/v1/acoustics/test_session"
                     | "/api/v1/calibration/test_session"
+                    | "/api/v1/acoustics/aec"
+                    | "/api/v1/calibration/aec"
             );
 
         if is_acoustic_write {
