@@ -51,9 +51,9 @@ impl Default for AecConfig {
         Self {
             enabled: false,
             bulk_delay_samples: 16, // 1.00ms causal alignment (direct acoustic peak ~29 samples)
-            step_size: 0.25,
+            step_size: 0.75,
             power_leak: 0.92,
-            regularization: 2.0,
+            regularization: 0.02,
             max_attenuation_db: 30.0,
             res_enabled: true,
             res_floor_db: -18.0,

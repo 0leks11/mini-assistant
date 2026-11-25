@@ -26,9 +26,9 @@ pub struct MdfConfig {
 impl Default for MdfConfig {
     fn default() -> Self {
         Self {
-            step_size: 0.25,
+            step_size: 0.75,
             power_leak: 0.92,
-            regularization: 2.0,
+            regularization: 0.02,
             max_attenuation_db: 30.0,
             res: ResConfig::default(),
         }
@@ -130,13 +130,15 @@ impl PartitionedMdfFilter {
         self.x_freq[0].copy_from_slice(&self.fft_in_out);
 
         // 5. Update power spectral density across all active partitions: P_total(f)
+        // Fast attack (.max(total_pwr)) prevents cold-start/transient overshoot when PSD lags.
         let lambda = self.config.power_leak;
         for i in 0..FFT_SIZE {
             let mut total_pwr = 0.0f32;
             for k in 0..NUM_PARTITIONS {
                 total_pwr += self.x_freq[k][i].norm_sqr();
             }
-            self.power_spectrum[i] = lambda * self.power_spectrum[i] + (1.0 - lambda) * total_pwr;
+            let ema = lambda * self.power_spectrum[i] + (1.0 - lambda) * total_pwr;
+            self.power_spectrum[i] = ema.max(total_pwr);
         }
 
         // 6. Frequency-domain convolution: D_hat(f) = Sum_k W_k(f) * X_k(f)
