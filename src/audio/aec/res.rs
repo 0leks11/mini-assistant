@@ -37,9 +37,9 @@ impl Default for ResConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            floor_db: -18.0,
+            floor_db: -24.0,
             overdrive: 1.5,
-            leakage_factor: 0.10,
+            leakage_factor: 0.18,
             attack_smoothing: 0.50,
             release_smoothing: 0.85,
         }
@@ -115,7 +115,7 @@ impl ResidualEchoSuppressor {
         }
 
         // 1. Calculate raw Wiener gain per frequency bin in positive half-spectrum (0..HALF_FFT)
-        let eps = 1e-6f32;
+        let eps = 1e-11f32;
         let leakage = self.config.leakage_factor;
         let overdrive = self.config.overdrive;
         let min_g = self.min_gain;

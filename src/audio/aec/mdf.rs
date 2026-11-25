@@ -164,9 +164,6 @@ impl PartitionedMdfFilter {
                 self.fft_in_out[i] += w_k[i] * x_k[i];
             }
         }
-        // Save estimated echo spectrum before IFFT overwrites fft_in_out
-        self.d_hat_freq.copy_from_slice(&self.fft_in_out);
-
         // 7. IFFT to obtain time-domain estimated echo d_hat
         self.ifft
             .process_with_scratch(&mut self.fft_in_out, &mut self.scratch);
@@ -177,6 +174,8 @@ impl PartitionedMdfFilter {
         let mut e_linear_energy = 0.0f32;
         for i in 0..BLOCK_SIZE {
             let d_hat = self.fft_in_out[BLOCK_SIZE + i].re * ifft_scale;
+            self.d_hat_freq[i] = Complex32::default();
+            self.d_hat_freq[BLOCK_SIZE + i] = Complex32::new(d_hat, 0.0);
             let err = mic_block[i] - d_hat;
             out_err_block[i] = err;
             e_linear_energy += err * err;
@@ -217,13 +216,15 @@ impl PartitionedMdfFilter {
             self.coupling_gain_sq = 0.9 * self.coupling_gain_sq + 0.1 * inst_gain_sq;
         }
 
-        // 10. Compute linear error in frequency domain: E(f) = FFT([0_N, e(n)])
+        // 10. Compute linear error & linear echo spectra in frequency domain: FFT([0_N, x(n)])
         for (i, &err_val) in out_err_block.iter().enumerate().take(BLOCK_SIZE) {
             self.e_freq[i] = Complex32::default();
             self.e_freq[BLOCK_SIZE + i] = Complex32::new(err_val, 0.0);
         }
         self.fft
             .process_with_scratch(&mut self.e_freq, &mut self.scratch);
+        self.fft
+            .process_with_scratch(&mut self.d_hat_freq, &mut self.scratch);
 
         // 11. Apply Non-linear Residual Echo Suppression (RES Wiener Post-Filter)
         self.res.apply(

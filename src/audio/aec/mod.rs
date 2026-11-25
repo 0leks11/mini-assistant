@@ -39,7 +39,7 @@ fn default_true() -> bool {
 }
 
 fn default_res_floor_db() -> f32 {
-    -18.0
+    -24.0
 }
 
 fn default_res_overdrive() -> f32 {
@@ -56,7 +56,7 @@ impl Default for AecConfig {
             regularization: 0.02,
             max_attenuation_db: 30.0,
             res_enabled: true,
-            res_floor_db: -18.0,
+            res_floor_db: -24.0,
             res_overdrive: 1.5,
         }
     }
