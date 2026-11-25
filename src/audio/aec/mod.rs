@@ -214,7 +214,7 @@ impl AecProcessor {
             -120.0
         };
 
-        let double_talk_active = e_mic > (e_ref * 2.0 + 1e-3) && e_mic > 0.01;
+        let double_talk_active = self.filter.is_double_talk();
 
         AecMetrics {
             erle_db,

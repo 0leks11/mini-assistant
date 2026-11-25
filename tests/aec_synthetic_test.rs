@@ -301,3 +301,86 @@ fn test_res_post_filter_enhancement() {
         "Target ERLE with RES enabled must reach >= 25 dB"
     );
 }
+
+#[test]
+fn test_aec_realistic_low_coupling_double_talk() {
+    // Reproduces real GPT Mini + KRK 60W coupling (Mic/Ref ~ 0.10) with 2m user speech
+    let delay_samples = 16;
+    let config = AecConfig {
+        enabled: true,
+        bulk_delay_samples: delay_samples,
+        ..Default::default()
+    };
+    let mut aec = AecProcessor::new(config);
+
+    let fs = 16000.0f32;
+    let num_blocks = 120;
+    let total_samples = num_blocks * BLOCK_SIZE;
+    let mut far_end = Vec::with_capacity(total_samples);
+    for n in 0..total_samples {
+        let t = n as f32 / fs;
+        let s = (0.35 * (2.0 * PI * 220.0 * t).sin()
+            + 0.25 * (2.0 * PI * 587.0 * t).sin()
+            + 0.20 * (2.0 * PI * 1320.0 * t).sin())
+            * 0.3;
+        far_end.push(s);
+    }
+    // Non-resonant decaying RIR modeling ~0.10 acoustic coupling ratio (no artificial 254Hz/585Hz gain > 1)
+    let mut rir = vec![0.0f32; 280];
+    rir[29] = -0.07;
+    for t in 1..200 {
+        let decay = (-0.8 * (t as f32) / 50.0).exp();
+        rir[29 + t] = 0.015 * decay * ((t as f32 * 0.71).sin() + 0.5 * (t as f32 * 1.13).cos());
+    }
+    let echo = convolve(&far_end, &rir);
+
+    let far_end_pcm: Vec<i16> = far_end.iter().map(|&s| (s * 25000.0) as i16).collect();
+    let mut mic_pcm: Vec<i16> = echo.iter().map(|&s| (s * 25000.0) as i16).collect();
+
+    // Inject realistic 2m near-end speech (RMS ~ 700, well below DAC ref RMS ~ 2500) at blocks 85..100
+    for (i, sample) in mic_pcm
+        .iter_mut()
+        .enumerate()
+        .take(100 * BLOCK_SIZE)
+        .skip(85 * BLOCK_SIZE)
+    {
+        let t = i as f32 / fs;
+        let near_speech = (1000.0 * (2.0 * PI * 680.0 * t).sin()) as i16;
+        *sample = sample.saturating_add(near_speech);
+    }
+
+    let mut out_frame = vec![0i16; BLOCK_SIZE];
+    let mut single_talk_dt = 0usize;
+    let mut double_talk_detected = 0usize;
+    let mut speech_out_sq = 0.0f64;
+
+    for b in 0..num_blocks {
+        let s = b * BLOCK_SIZE;
+        let e = s + BLOCK_SIZE;
+        aec.process_frame(&mic_pcm[s..e], &far_end_pcm[s..e], &mut out_frame);
+        let dt = aec.get_metrics().double_talk_active;
+        if (40..80).contains(&b) && dt {
+            single_talk_dt += 1;
+        }
+        if (86..100).contains(&b) {
+            if dt {
+                double_talk_detected += 1;
+            }
+            speech_out_sq += out_frame
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum::<f64>();
+        }
+    }
+
+    let preserved_rms = (speech_out_sq / (14 * BLOCK_SIZE) as f64).sqrt();
+    assert_eq!(single_talk_dt, 0, "Pure echo must not falsely trigger DTD");
+    assert!(
+        double_talk_detected >= 10,
+        "DTD must trigger at real Mic/Ref~0.10 coupling (detected {double_talk_detected}/14)"
+    );
+    assert!(
+        preserved_rms > 600.0,
+        "Near-end 2m voice must be preserved without RES attenuation (rms={preserved_rms:.1})"
+    );
+}

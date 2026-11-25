@@ -57,7 +57,10 @@ pub struct PartitionedMdfFilter {
     energy_mic: f32,
     energy_ref: f32,
     energy_err: f32,
+    coupling_gain_sq: f32,
     adapted_blocks: usize,
+    dt_streak: usize,
+    last_double_talk: bool,
 }
 
 impl PartitionedMdfFilter {
@@ -88,7 +91,10 @@ impl PartitionedMdfFilter {
             energy_mic: 0.0,
             energy_ref: 0.0,
             energy_err: 0.0,
+            coupling_gain_sq: 1.0,
             adapted_blocks: 0,
+            dt_streak: 0,
+            last_double_talk: false,
         }
     }
 
@@ -132,6 +138,7 @@ impl PartitionedMdfFilter {
         // 5. Update power spectral density across all active partitions: P_total(f)
         // Fast attack (.max(total_pwr)) prevents cold-start/transient overshoot when PSD lags.
         let lambda = self.config.power_leak;
+        let mut sum_total_pwr = 0.0f32;
         for i in 0..FFT_SIZE {
             let mut total_pwr = 0.0f32;
             for k in 0..NUM_PARTITIONS {
@@ -139,7 +146,12 @@ impl PartitionedMdfFilter {
             }
             let ema = lambda * self.power_spectrum[i] + (1.0 - lambda) * total_pwr;
             self.power_spectrum[i] = ema.max(total_pwr);
+            sum_total_pwr += self.power_spectrum[i];
         }
+        let dynamic_reg = self
+            .config
+            .regularization
+            .max(0.05 * (sum_total_pwr / FFT_SIZE as f32));
 
         // 6. Frequency-domain convolution: D_hat(f) = Sum_k W_k(f) * X_k(f)
         for i in 0..FFT_SIZE {
@@ -171,13 +183,39 @@ impl PartitionedMdfFilter {
         }
 
         // 9. Double-talk protection:
-        // Detects near-end speech burst instantly (zero delay) by comparing instantaneous
-        // and smoothed error energy against reference echo energy.
+        // Compare residual error energy against BOTH coupling-scaled acoustic echo estimate
+        // (handles real Mic/Ref ~ 0.10 without freezing initial convergence) and Geigel ratio.
         let is_warmup = self.adapted_blocks <= 25;
-        let is_double_talk = !is_warmup
-            && (e_linear_energy > (e_ref * 1.5 + 1e-3)
-                || self.energy_err > (self.energy_ref * 1.5 + 1e-3))
+        let expected_echo_inst = e_ref * self.coupling_gain_sq;
+        let expected_echo_avg = self.energy_ref * self.coupling_gain_sq;
+        let dt_acoustic = (e_linear_energy > (expected_echo_inst * 2.0 + 0.003)
+            && e_mic > (expected_echo_inst * 1.8 + 0.003))
+            || (self.energy_err > (expected_echo_avg * 2.0 + 0.004)
+                && self.energy_mic > (expected_echo_avg * 1.8 + 0.004));
+        let dt_geigel = (e_linear_energy > (e_ref * 1.5 + 1e-3)
+            || self.energy_err > (self.energy_ref * 1.5 + 1e-3))
             && (e_linear_energy > 0.005 || self.energy_err > 0.01);
+        let raw_dt = !is_warmup && (dt_acoustic || dt_geigel);
+        let is_double_talk = if raw_dt {
+            self.dt_streak = self.dt_streak.saturating_add(1);
+            if self.dt_streak > 90 {
+                // Guard against deadlock if speaker position/volume jumps significantly
+                self.coupling_gain_sq = 1.0;
+                self.dt_streak = 0;
+                false
+            } else {
+                true
+            }
+        } else {
+            self.dt_streak = 0;
+            false
+        };
+        self.last_double_talk = is_double_talk;
+
+        if !is_double_talk && e_ref > 1e-3 && e_mic > 1e-5 && e_linear_energy < e_mic * 0.35 {
+            let inst_gain_sq = (e_mic / e_ref).clamp(0.002, 2.0);
+            self.coupling_gain_sq = 0.9 * self.coupling_gain_sq + 0.1 * inst_gain_sq;
+        }
 
         // 10. Compute linear error in frequency domain: E(f) = FFT([0_N, e(n)])
         for (i, &err_val) in out_err_block.iter().enumerate().take(BLOCK_SIZE) {
@@ -205,7 +243,7 @@ impl PartitionedMdfFilter {
             self.adapted_blocks = self.adapted_blocks.saturating_add(1);
 
             let mu = self.config.step_size;
-            let eps = self.config.regularization;
+            let eps = dynamic_reg;
 
             for k in 0..NUM_PARTITIONS {
                 let x_k = &self.x_freq[k];
@@ -251,5 +289,9 @@ impl PartitionedMdfFilter {
 
     pub fn energy_metrics(&self) -> (f32, f32, f32) {
         (self.energy_mic, self.energy_ref, self.energy_err)
+    }
+
+    pub fn is_double_talk(&self) -> bool {
+        self.last_double_talk
     }
 }
