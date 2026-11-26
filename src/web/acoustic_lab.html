@@ -116,21 +116,25 @@
       <form id="settings-form" novalidate>
         <div id="controls"><div class="card empty">Получаем параметры и допустимые диапазоны с GPT Mini…</div></div>
       </form>
-      <section class="card" aria-labelledby="profiles-title">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <section id="group" class="card" aria-labelledby="profiles-title">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap">
           <h2 id="profiles-title" style="margin:0">Профили помещений и сравнение</h2>
-          <span id="active-profile-badge" class="badge">Профиль: по умолчанию</span>
+          <span id="active-profile-badge" class="badge">Профиль: загрузка…</span>
         </div>
         <p class="section-desc">Сохраняйте проверенные наборы акустических параметров для разных комнат (например, «Гостиная с эхом», «Спальня с коврами»).</p>
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-          <label for="room-profiles-select" style="font-size:13px;color:var(--text-dim)">Комната:</label>
+          <label for="room-profiles-select" style="font-size:13px;color:var(--muted)">Комната:</label>
           <select id="room-profiles-select" style="background:#131a29;color:var(--text);border:1px solid #243048;border-radius:6px;padding:6px 10px;font-size:13px;min-width:180px">
             <option value="">— Сохранённые комнаты —</option>
           </select>
+          <button type="button" id="refresh-profiles-btn">Обновить</button>
           <button type="button" id="load-room-profile-btn" disabled>Загрузить в форму</button>
           <button type="button" id="activate-room-profile-btn" disabled>Активировать на Mini</button>
           <button type="button" id="preview-candidate-btn" title="Применить параметры в RAM на 30 секунд без записи на диск">Предпросмотр (30 сек)</button>
           <button type="button" id="save-room-profile-btn">Сохранить как комнату…</button>
+        </div>
+        <div id="profiles-list-summary" style="max-height:170px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:12px;font-size:12px">
+          <div class="empty">Загрузка сохранённых профилей…</div>
         </div>
         <div class="toolbar">
           <button type="button" id="export-btn" disabled>Скачать профиль</button>
@@ -140,6 +144,41 @@
         </div>
         <input type="file" id="profile-file" accept="application/json,.json" hidden>
         <p class="side-note">Значения по умолчанию — исходная точка, а не обещание лучшего распознавания. Подходящий профиль проверяется и на обращениях, и на обычном фоне.</p>
+      </section>
+
+      <!-- Master Volume, Audio Cue & Reference Playback Controls -->
+      <section id="playback-volume" class="card" aria-labelledby="playback-title">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap">
+          <h2 id="playback-title" style="margin:0">Громкость, сигналы готовности и фоновая музыка</h2>
+          <span id="soloist-state-badge" class="badge">Soloist: проверка…</span>
+        </div>
+        <p class="section-desc">Управление общей громкостью GPT Mini и Spotify Soloist (KRK/AUX), а также воспроизведение звукового бипа перед голосовой проверкой.</p>
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+          <label for="acoustic-volume-slider" style="font-size:13px;color:var(--muted)">Уровень (0–10):</label>
+          <input type="range" id="acoustic-volume-slider" min="0" max="10" step="1" value="1" style="flex:1;min-width:140px">
+          <output id="acoustic-volume-label" style="min-width:120px;font-size:13px">1 (Soloist 42%)</output>
+          <button type="button" id="apply-volume-btn">Применить громкость</button>
+          <span id="volume-lease-note" class="muted" style="font-size:12px"></span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+          <label for="cue-kind-select" style="font-size:13px;color:var(--muted)">Звуковой сигнал:</label>
+          <select id="cue-kind-select" style="max-width:260px">
+            <option value="ready">Готов к фразе (бип 880 Гц)</option>
+            <option value="double_beep">Двойной бип (подтверждение)</option>
+            <option value="ack">Короткий отклик (1200 Гц)</option>
+            <option value="tone">Чистый тон (880 Гц)</option>
+          </select>
+          <button type="button" id="play-cue-btn" class="primary">Подать сигнал (Бип)</button>
+          <span id="cue-status-text" class="muted" style="font-size:12px"></span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--line)">
+          <span id="soloist-track-info" style="flex:1;min-width:200px;font-size:13px;color:var(--muted)">Трек Soloist: —</span>
+          <button type="button" id="soloist-prev-btn">⏮</button>
+          <button type="button" id="soloist-play-btn">▶ Воспроизвести</button>
+          <button type="button" id="soloist-pause-btn">⏸ Пауза</button>
+          <button type="button" id="soloist-next-btn">⏭</button>
+          <button type="button" id="soloist-refresh-btn">↻</button>
+        </div>
       </section>
 
       <!-- Calibration Session & Measurements Runner -->
@@ -157,7 +196,7 @@
 
         <div id="owner-validation-notice" class="notice warning" role="alert" style="background:#2a1c06;border:1px solid #784a0c;color:#fcd34d;padding:12px;border-radius:8px;margin-bottom:14px;" hidden>
           <strong>⚠️ Требуется живой контроль владельца</strong>
-          <p style="margin:4px 0 8px 0;font-size:13px">Параметры кандидата применены в RAM. Произнесите проверочные фразы («Алиса…») с расстояния 1–3 метра для оценки слышимости в реальной комнате.</p>
+          <p style="margin:4px 0 8px 0;font-size:13px">Параметры кандидата применены в RAM. Произнесите проверочные фразы после звукового сигнала с расстояния 1–3 метра.</p>
           <button type="button" id="confirm-owner-btn" style="background:#f59e0b;color:#000;font-weight:600;padding:6px 12px;border-radius:6px;border:none;cursor:pointer">Подтвердить живой контроль</button>
         </div>
 
@@ -166,7 +205,7 @@
           <div>
             <label for="job-stimulus-origin" style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Источник стимула:</label>
             <select id="job-stimulus-origin">
-              <option value="external_user_position">Внешняя колонка 2м (external_user_position)</option>
+              <option value="external_user_position">Внешняя колонка / голос 2м (external_user_position)</option>
               <option value="own_output">Собственный динамик (own_output)</option>
               <option value="ambient">Шумовой фон комнаты (ambient)</option>
             </select>
@@ -176,6 +215,8 @@
             <select id="job-stimulus-signal">
               <option value="chirp_sweep">Chirp sweep (200..3000 Гц, -12 dBFS)</option>
               <option value="silence">Тишина (фоновый замер 2 сек)</option>
+              <option value="guided_phrase">Бип → ваша фраза 3.5с → Бип (guided)</option>
+              <option value="sample">Сэмпл из библиотеки (Sample WAV)</option>
             </select>
           </div>
           <div>
@@ -186,13 +227,27 @@
               <option value="none">Без звука (none)</option>
             </select>
           </div>
+          <div>
+            <label for="job-volume-pct" style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Громкость стимула/бипа (%):</label>
+            <input type="number" id="job-volume-pct" min="0" max="100" value="35">
+          </div>
+        </div>
+        <div id="job-sample-picker-wrap" style="margin-bottom:12px" hidden>
+          <label for="job-sample-id" style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">Выбранный WAV-сэмпл для воспроизведения через динамик Mini:</label>
+          <select id="job-sample-id">
+            <option value="">— Сначала обновите или загрузите сэмплы —</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:14px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+          <label class="switch"><input type="checkbox" id="job-cue-before"> Сигнал «Начинайте» перед записью</label>
+          <label class="switch"><input type="checkbox" id="job-cue-after"> Сигнал «Записано» после записи</label>
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
           <button type="button" id="start-job-btn" class="primary">Запустить измерение</button>
           <button type="button" id="cancel-job-btn" disabled>Остановить</button>
           <span id="job-status-text" style="font-size:13px;color:var(--muted)">Ожидание</span>
         </div>
-        <p class="side-note">Действительные capabilities: при отсутствии физического AUX-порта выбор AUX блокируется (без скрытого переключения на динамик). Громкость стимулов строго ограничена ≤ -6.0 dBFS.</p>
+        <p class="side-note">Стимулы <code>own_output</code> проходят через аппаратный loopback (Ch6) и подавляются M-AEC/RES — они измеряют защиту от самосрабатывания, а не распознавание вашей речи. Для прямой проверки WAV на детекторе KWS используйте кнопку «Проверить KWS» в библиотеке записей.</p>
       </section>
 
       <!-- Samples Library & Audio Player -->
@@ -202,7 +257,7 @@
           <span id="samples-count-badge" class="badge">0 записей</span>
         </div>
         <p class="section-desc">Записи слова вызова и шумов, изолированные по сплитам: калибровочные (calibration), обучающие (train) и проверочные (held_out).</p>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
           <label for="samples-split-select" style="font-size:13px;color:var(--muted)">Сплит:</label>
           <select id="samples-split-select" style="max-width:200px">
             <option value="calibration">Калибровка (calibration)</option>
@@ -210,6 +265,17 @@
             <option value="held_out">Проверочный (held_out)</option>
           </select>
           <button type="button" id="refresh-samples-btn">Обновить список</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;padding:10px;background:var(--surface2);border:1px solid var(--line);border-radius:8px">
+          <input type="file" id="upload-sample-file" accept=".wav,audio/wav,audio/x-wav" style="max-width:240px;font-size:12px">
+          <input type="text" id="upload-sample-name" placeholder="Название WAV (опц.)" style="color:var(--text);background:var(--surface);border:1px solid #3b4d65;border-radius:8px;padding:8px 10px;min-height:40px;font-size:13px">
+          <select id="upload-sample-label" style="max-width:175px">
+            <option value="positive">Слово вызова (positive)</option>
+            <option value="negative">Отрицательный (negative)</option>
+            <option value="own_output">Звук колонки (own_output)</option>
+            <option value="ambient">Фоновый шум (ambient)</option>
+          </select>
+          <button type="button" id="upload-sample-btn">Загрузить WAV (авто-16кГц)</button>
         </div>
         <div id="samples-list-container" style="max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:12px">
           <div class="empty">Загрузка записей…</div>
@@ -796,28 +862,199 @@ function initAcousticLab() {
   async function refreshProfilesList() {
     try {
       const res = await fetch("/api/v1/acoustics/profiles");
-      if (!res.ok) return;
+      const summary = el("profiles-list-summary");
+      const badge = el("active-profile-badge");
+      if (!res.ok) {
+        if (badge) { badge.textContent = `Профили: ошибка (${res.status})`; badge.dataset.tone = "bad"; }
+        if (summary) summary.innerHTML = `<div class="empty">Не удалось загрузить профили (HTTP ${res.status})</div>`;
+        return;
+      }
       const data = await res.json();
       cachedProfiles = data.profiles || [];
       const sel = el("room-profiles-select");
       if (sel) {
-        sel.innerHTML = '<option value="">— Сохранённые комнаты —</option>';
+        sel.replaceChildren();
+        const defOpt = document.createElement("option");
+        defOpt.value = "";
+        defOpt.textContent = `— Сохранённые комнаты (${cachedProfiles.length}) —`;
+        sel.append(defOpt);
         for (const p of cachedProfiles) {
           const opt = document.createElement("option");
           opt.value = p.id;
-          opt.textContent = `${p.name} [${p.status}]`;
-          sel.appendChild(opt);
+          opt.textContent = `${p.name} [${p.status}]${p.id === data.active_profile_id ? " ★" : ""}`;
+          sel.append(opt);
         }
       }
-      const badge = el("active-profile-badge");
-      if (badge && data.active_profile_id) {
-        const act = cachedProfiles.find(p => p.id === data.active_profile_id);
-        badge.textContent = act ? `Активен: ${act.name}` : `Активен: ${data.active_profile_id}`;
+      if (summary) {
+        if (cachedProfiles.length === 0) {
+          summary.innerHTML = '<div class="empty">Сохранённых профилей комнат пока нет</div>';
+        } else {
+          summary.replaceChildren();
+          for (const p of cachedProfiles) {
+            const isActive = p.id === data.active_profile_id;
+            const row = document.createElement("div");
+            row.style.display = "flex";
+            row.style.justifyContent = "space-between";
+            row.style.alignItems = "center";
+            row.style.gap = "8px";
+            row.style.padding = "6px 4px";
+            row.style.borderBottom = "1px solid var(--line)";
+            const info = document.createElement("span");
+            const s = p.settings || {};
+            info.textContent = `${isActive ? "★ " : ""}${p.name} [${p.status}] · thresh=${s.threshold ?? "?"} · gn=${s.gain_normalizer ?? "?"} · bp=${s.band_pass ?? "?"}`;
+            const loadBtn = document.createElement("button");
+            loadBtn.type = "button";
+            loadBtn.textContent = "Загрузить";
+            loadBtn.style.minHeight = "30px";
+            loadBtn.style.padding = "4px 10px";
+            loadBtn.style.fontSize = "12px";
+            loadBtn.addEventListener("click", () => {
+              if (sel) sel.value = p.id;
+              el("load-room-profile-btn").disabled = false;
+              el("activate-room-profile-btn").disabled = false;
+              if (p.settings) {
+                fillForm(p.settings, baseRevision, false);
+                message(`Профиль «${p.name}» загружен в форму.`, "good");
+              }
+            });
+            row.append(info, loadBtn);
+            summary.append(row);
+          }
+        }
+      }
+      if (badge) {
+        if (data.active_profile_id) {
+          const act = cachedProfiles.find(p => p.id === data.active_profile_id);
+          badge.textContent = act ? `Активен: ${act.name}` : `Активен: ${data.active_profile_id}`;
+          badge.dataset.tone = "good";
+        } else {
+          badge.textContent = `Профилей: ${cachedProfiles.length}`;
+          badge.dataset.tone = cachedProfiles.length > 0 ? "good" : "warn";
+        }
       }
     } catch (_) {}
   }
 
+  el("refresh-profiles-btn")?.addEventListener("click", refreshProfilesList);
   el("room-profiles-select").addEventListener("focus", refreshProfilesList);
+
+  const SOLOIST_LEVEL_PCT = [0, 42, 50, 57, 64, 71, 77, 83, 89, 95, 100];
+  function updateVolumeLabel(level, soloistPct) {
+    const lbl = el("acoustic-volume-label");
+    if (lbl) {
+      const pct = Number.isFinite(soloistPct) ? soloistPct : (SOLOIST_LEVEL_PCT[level] ?? 42);
+      lbl.textContent = `${level} (Soloist ${pct}%)`;
+    }
+  }
+
+  async function refreshVolumeState() {
+    try {
+      const res = await fetch("/api/v1/acoustics/volume");
+      if (!res.ok) return;
+      const data = await res.json();
+      const slider = el("acoustic-volume-slider");
+      if (slider && Number.isFinite(data.level)) slider.value = String(data.level);
+      updateVolumeLabel(data.level ?? 1, data.soloist_actual_pct ?? data.soloist_pct);
+      const leaseNote = el("volume-lease-note");
+      if (leaseNote) {
+        leaseNote.textContent = data.max_volume_pct != null ? `Лимит сессии: ≤ ${data.max_volume_pct}%` : "";
+      }
+    } catch (_) {}
+  }
+
+  async function refreshReferencePlayback() {
+    try {
+      const res = await fetch("/api/v1/acoustics/reference_playback");
+      const badge = el("soloist-state-badge");
+      const trackInfo = el("soloist-track-info");
+      if (!res.ok) {
+        if (badge) { badge.textContent = `Soloist: ошибка (${res.status})`; badge.dataset.tone = "bad"; }
+        return;
+      }
+      const data = await res.json();
+      if (!data.available) {
+        if (badge) { badge.textContent = "Soloist: недоступен"; badge.dataset.tone = "warn"; }
+        if (trackInfo) trackInfo.textContent = "Soloist не настроен на хосте";
+        return;
+      }
+      if (badge) {
+        badge.textContent = `Soloist: ${data.state} (${data.volume ?? "—"}%)`;
+        badge.dataset.tone = data.is_playing ? "good" : "warn";
+      }
+      if (trackInfo) {
+        trackInfo.textContent = data.track ? `Трек: ${data.track.artist} — ${data.track.name}` : `Состояние: ${data.state}`;
+      }
+    } catch (_) {}
+  }
+
+  el("acoustic-volume-slider")?.addEventListener("input", event => {
+    const lvl = Number(event.target.value);
+    updateVolumeLabel(lvl, SOLOIST_LEVEL_PCT[lvl]);
+  });
+
+  el("apply-volume-btn")?.addEventListener("click", async () => {
+    const lvl = Number(el("acoustic-volume-slider")?.value ?? 1);
+    try {
+      const res = await fetch("/api/v1/acoustics/volume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level: lvl })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Не удалось установить громкость");
+      const slider = el("acoustic-volume-slider");
+      if (slider) slider.value = String(data.level);
+      updateVolumeLabel(data.level, data.soloist_pct);
+      message(
+        data.clamped
+          ? `Громкость ограничена lease-лимитом до уровня ${data.level} (Soloist ${data.soloist_pct}%).`
+          : `Громкость установлена: уровень ${data.level} (Soloist ${data.soloist_pct}%).`,
+        data.clamped ? "warn" : "good"
+      );
+      refreshReferencePlayback();
+    } catch (e) { message(e.message, "bad"); }
+  });
+
+  el("play-cue-btn")?.addEventListener("click", async () => {
+    const kind = el("cue-kind-select")?.value || "ready";
+    const volPct = Number(el("job-volume-pct")?.value || 35);
+    const cueStatus = el("cue-status-text");
+    try {
+      const res = await fetch("/api/v1/acoustics/cue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, volume_pct: volPct })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Не удалось подать сигнал");
+      const info = `Бип «${data.cue.kind}» воспроизведён (${data.cue.played_ms} мс, ${data.cue.volume_pct}%)`;
+      if (cueStatus) cueStatus.textContent = info;
+      message(info, "good");
+    } catch (e) {
+      if (cueStatus) cueStatus.textContent = e.message;
+      message(e.message, "bad");
+    }
+  });
+
+  async function sendSoloistAction(action) {
+    try {
+      const res = await fetch("/api/v1/acoustics/reference_playback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || `Ошибка Soloist (${action})`);
+      message(`Soloist: команда «${action}» выполнена (${data.state}).`, "good");
+      refreshReferencePlayback();
+    } catch (e) { message(e.message, "bad"); }
+  }
+
+  el("soloist-prev-btn")?.addEventListener("click", () => sendSoloistAction("prev"));
+  el("soloist-play-btn")?.addEventListener("click", () => sendSoloistAction("play"));
+  el("soloist-pause-btn")?.addEventListener("click", () => sendSoloistAction("pause"));
+  el("soloist-next-btn")?.addEventListener("click", () => sendSoloistAction("next"));
+  el("soloist-refresh-btn")?.addEventListener("click", refreshReferencePlayback);
   el("room-profiles-select").addEventListener("change", event => {
     const selectedId = event.target.value;
     el("load-room-profile-btn").disabled = !selectedId;
@@ -1008,41 +1245,94 @@ function initAcousticLab() {
     } catch (e) { message(e.message, "bad"); }
   }
 
+  function renderEvalReport(ev) {
+    if (!ev) return;
+    el("eval-results-container").style.display = "block";
+    el("eval-recall").textContent = (Number(ev.recall || 0) * 100).toFixed(1) + "%";
+    const faRate = Number(ev.false_alarms_per_hour ?? ev.false_alarm_rate_per_hour ?? 0);
+    el("eval-fa-rate").textContent = faRate.toFixed(1);
+    el("eval-own-leaks").textContent = String(ev.own_output_leaks ?? 0);
+    el("eval-latency").textContent = ev.mean_latency_ms ? Number(ev.mean_latency_ms).toFixed(0) + " мс" : "—";
+    el("eval-rtf").textContent = Number(ev.realtime_factor || 0).toFixed(2);
+    el("eval-score").textContent = Number(ev.candidate_score || 0).toFixed(1);
+  }
+
+  async function evaluateSample(sampleId, sampleName) {
+    message(`Проверка KWS на сэмпле «${sampleName}»…`, "good");
+    try {
+      const payload = { sample_id: sampleId };
+      if (draft && latest?.controls && latest?.defaults) {
+        payload.settings = validateSettings(draft, latest.controls, latest.defaults);
+      }
+      const res = await fetch("/api/v1/acoustics/evaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Ошибка проверки KWS на сэмпле");
+      const ev = data.evaluation;
+      renderEvalReport(ev);
+      const r = (ev.sample_results && ev.sample_results[0]) || {};
+      const peakScore = Array.isArray(r.scores) && r.scores.length ? Math.max(...r.scores).toFixed(3) : "—";
+      const detCount = r.detections ?? 0;
+      message(`KWS «${sampleName}»: срабатываний ${detCount}, max score=${peakScore}, исход=${r.outcome || "—"}.`, detCount > 0 ? "good" : "warn");
+    } catch (e) { message(e.message, "bad"); }
+  }
+
   async function refreshSamples() {
     const split = el("samples-split-select")?.value || "calibration";
     try {
       const res = await fetch(`/api/v1/acoustics/samples?split=${split}`);
-      if (!res.ok) return;
-      const data = await res.json();
       const countBadge = el("samples-count-badge");
-      if (countBadge) countBadge.textContent = `${data.count || 0} записей`;
       const container = el("samples-list-container");
-      if (!container) return;
+      if (!res.ok) {
+        if (countBadge) { countBadge.textContent = `Ошибка (${res.status})`; countBadge.dataset.tone = "bad"; }
+        if (container) container.innerHTML = `<div class="empty">Не удалось загрузить сэмплы (HTTP ${res.status})</div>`;
+        return;
+      }
+      const data = await res.json();
+      if (countBadge) {
+        countBadge.textContent = `${data.count || 0} записей`;
+        countBadge.dataset.tone = (data.count || 0) > 0 ? "good" : "muted";
+      }
       const samples = data.samples || [];
+      const jobSampleSel = el("job-sample-id");
+      if (jobSampleSel) {
+        const prevVal = jobSampleSel.value;
+        jobSampleSel.replaceChildren();
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = samples.length ? "— Выберите WAV сэмпл —" : "— Нет сэмплов в выбранном сплите —";
+        jobSampleSel.append(placeholder);
+        for (const s of samples) {
+          const opt = document.createElement("option");
+          opt.value = s.id;
+          opt.textContent = `${s.name} [${s.label}, ${s.metrics?.duration_ms || 0} мс]`;
+          jobSampleSel.append(opt);
+        }
+        if (prevVal && samples.some(s => s.id === prevVal)) jobSampleSel.value = prevVal;
+      }
+      if (!container) return;
       if (samples.length === 0) {
         container.innerHTML = '<div class="empty">Нет записей в этом сплите</div>';
         return;
       }
-      container.innerHTML = "";
+      container.replaceChildren();
       for (const s of samples) {
         const item = document.createElement("div");
         item.style.display = "flex";
         item.style.justifyContent = "space-between";
         item.style.alignItems = "center";
+        item.style.gap = "8px";
         item.style.padding = "6px 8px";
         item.style.borderBottom = "1px solid var(--line)";
-        item.style.cursor = "pointer";
         item.style.fontSize = "13px";
-        item.title = "Нажмите для прослушивания аудиозаписи";
-        item.innerHTML = `<span>▶ <strong>${s.name}</strong> [${s.label}]</span><span style="display:flex;align-items:center;gap:8px"><span class="muted">${s.metrics?.duration_ms || 0} мс · SNR ${s.metrics?.snr_db?.toFixed(1) || '—'} dB</span><button type="button" class="sample-spec-btn" style="padding:2px 8px;font-size:11px">Спектр</button></span>`;
-        const specBtn = item.querySelector && item.querySelector(".sample-spec-btn");
-        if (specBtn) {
-          specBtn.addEventListener("click", (ev) => {
-            if (ev && ev.stopPropagation) ev.stopPropagation();
-            loadSampleSpectrogram(s.id, s.name);
-          });
-        }
-        item.addEventListener("click", () => {
+        const left = document.createElement("span");
+        left.textContent = `${s.name} [${s.label}]`;
+        left.style.cursor = "pointer";
+        left.title = "Нажмите для прослушивания аудиозаписи";
+        left.addEventListener("click", () => {
           const player = el("sample-audio-player");
           if (player) {
             player.src = `/api/v1/acoustics/samples/${s.id}/audio`;
@@ -1050,10 +1340,77 @@ function initAcousticLab() {
             message(`Воспроизведение записи «${s.name}»...`, "good");
           }
         });
-        container.appendChild(item);
+        const right = document.createElement("span");
+        right.style.display = "flex";
+        right.style.alignItems = "center";
+        right.style.gap = "6px";
+        const meta = document.createElement("span");
+        meta.className = "muted";
+        meta.textContent = `${s.metrics?.duration_ms || 0} мс · SNR ${Number.isFinite(s.metrics?.snr_db) ? s.metrics.snr_db.toFixed(1) : "—"} dB`;
+        const specBtn = document.createElement("button");
+        specBtn.type = "button";
+        specBtn.textContent = "Спектр";
+        specBtn.style.minHeight = "28px";
+        specBtn.style.padding = "2px 8px";
+        specBtn.style.fontSize = "11px";
+        specBtn.addEventListener("click", () => loadSampleSpectrogram(s.id, s.name));
+        const evalBtn = document.createElement("button");
+        evalBtn.type = "button";
+        evalBtn.textContent = "Проверить KWS";
+        evalBtn.style.minHeight = "28px";
+        evalBtn.style.padding = "2px 8px";
+        evalBtn.style.fontSize = "11px";
+        evalBtn.addEventListener("click", () => evaluateSample(s.id, s.name));
+        right.append(meta, specBtn, evalBtn);
+        item.append(left, right);
+        container.append(item);
       }
     } catch (_) {}
   }
+
+  function bytesToBase64(bytes) {
+    let bin = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+
+  el("upload-sample-btn")?.addEventListener("click", async () => {
+    const fileInput = el("upload-sample-file");
+    const file = fileInput?.files?.[0];
+    if (!file) {
+      message("Выберите WAV-файл для загрузки.", "warn");
+      return;
+    }
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const wavB64 = bytesToBase64(buf);
+      const customName = el("upload-sample-name")?.value?.trim();
+      const baseName = file.name ? file.name.replace(/\.[^.]+$/, "") : "uploaded_wav";
+      const label = el("upload-sample-label")?.value || "positive";
+      const split = el("samples-split-select")?.value || "calibration";
+      const res = await fetch("/api/v1/acoustics/samples", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: customName || baseName,
+          label,
+          split,
+          wav_base64: wavB64,
+          auto_convert: true
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || "Не удалось загрузить WAV");
+      const m = data.sample?.metrics || {};
+      message(`WAV «${data.sample?.name}» загружен (${m.sample_rate || 16000} Гц, ${m.channels || 1} кан., ${m.duration_ms || 0} мс).`, "good");
+      if (fileInput) fileInput.value = "";
+      if (el("upload-sample-name")) el("upload-sample-name").value = "";
+      refreshSamples();
+    } catch (e) { message(e.message, "bad"); }
+  });
 
   el("start-session-btn")?.addEventListener("click", async () => {
     const name = window.prompt("Название калибровочной сессии:", "Калибровка комнаты");
@@ -1119,16 +1476,46 @@ function initAcousticLab() {
     } catch (e) { message(e.message, "bad"); }
   });
 
+  el("job-stimulus-signal")?.addEventListener("change", () => {
+    const signalType = el("job-stimulus-signal").value;
+    const pickerWrap = el("job-sample-picker-wrap");
+    if (pickerWrap) pickerWrap.hidden = signalType !== "sample";
+    if (signalType === "guided_phrase") {
+      if (el("job-cue-before")) el("job-cue-before").checked = true;
+      if (el("job-cue-after")) el("job-cue-after").checked = true;
+      if (el("job-stimulus-origin")) el("job-stimulus-origin").value = "external_user_position";
+      if (el("job-output-route")) el("job-output-route").value = "none";
+    }
+  });
+
   el("start-job-btn")?.addEventListener("click", async () => {
     const origin = el("job-stimulus-origin").value;
     const signalType = el("job-stimulus-signal").value;
     const route = el("job-output-route").value;
+    const volPct = Math.max(0, Math.min(100, Number(el("job-volume-pct")?.value ?? 35)));
+    let cueBefore = !!el("job-cue-before")?.checked;
+    let cueAfter = !!el("job-cue-after")?.checked;
+    let preRollMs = 500;
+    let postRollMs = 1000;
 
     let stimulus;
     if (signalType === "silence") {
-      stimulus = { silence: { duration_ms: 2000 } };
+      stimulus = { type: "silence", duration_ms: 2000 };
+    } else if (signalType === "guided_phrase") {
+      stimulus = { type: "silence", duration_ms: 3500 };
+      cueBefore = true;
+      cueAfter = true;
+      preRollMs = 300;
+      postRollMs = 400;
+    } else if (signalType === "sample") {
+      const sampleId = el("job-sample-id")?.value;
+      if (!sampleId) {
+        message("Выберите WAV-сэмпл из списка для воспроизведения.", "warn");
+        return;
+      }
+      stimulus = { type: "sample", sample_id: sampleId };
     } else {
-      stimulus = { chirp_sweep: { start_hz: 200.0, end_hz: 3000.0, duration_ms: 500, volume_dbfs: -12.0 } };
+      stimulus = { type: "chirp_sweep", start_hz: 200.0, end_hz: 3000.0, duration_ms: 500, volume_dbfs: -12.0 };
     }
 
     try {
@@ -1136,16 +1523,25 @@ function initAcousticLab() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: `measure_${origin}`,
+          name: `measure_${origin}_${signalType}`,
           stimulus_origin: origin,
           output_route: route,
           stimulus,
-          volume_pct: 35
+          pre_roll_ms: preRollMs,
+          post_roll_ms: postRollMs,
+          volume_pct: volPct,
+          cue_before: cueBefore,
+          cue_after: cueAfter
         })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || "Ошибка запуска измерения");
-      message(`Измерение запущено (Job ID: ${data.job.job_id}). Синхронизация воспроизведения и записи...`, "good");
+      message(
+        cueBefore
+          ? `Бип подан — произнесите фразу! (Job ID: ${data.job.job_id})`
+          : `Измерение запущено (Job ID: ${data.job.job_id}). Синхронизация воспроизведения и записи...`,
+        "good"
+      );
       refreshJobs();
     } catch (e) { message(e.message, "bad"); }
   });
@@ -1167,21 +1563,16 @@ function initAcousticLab() {
     message("Оценка параметров на калибровочном корпусе...", "good");
     try {
       const settings = validateSettings(draft, latest.controls, latest.defaults);
+      const split = el("samples-split-select")?.value || "calibration";
       const res = await fetch("/api/v1/acoustics/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ settings, split: "calibration" })
+        body: JSON.stringify({ settings, split })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || "Ошибка оценки");
       const ev = data.evaluation;
-      el("eval-results-container").style.display = "block";
-      el("eval-recall").textContent = (ev.recall * 100).toFixed(1) + "%";
-      el("eval-fa-rate").textContent = ev.false_alarm_rate_per_hour.toFixed(1);
-      el("eval-own-leaks").textContent = String(ev.own_output_leaks);
-      el("eval-latency").textContent = ev.mean_latency_ms ? ev.mean_latency_ms.toFixed(0) + " мс" : "—";
-      el("eval-rtf").textContent = ev.realtime_factor.toFixed(2);
-      el("eval-score").textContent = ev.candidate_score.toFixed(1);
+      renderEvalReport(ev);
       message(`Оценка завершена: итоговый балл ${ev.candidate_score.toFixed(1)}, полнота ${(ev.recall * 100).toFixed(0)}%.`, "good");
     } catch (e) { message(e.message, "bad"); }
   });
@@ -1220,6 +1611,9 @@ function initAcousticLab() {
     }
   });
 
+  refreshProfilesList();
+  refreshVolumeState();
+  refreshReferencePlayback();
   refreshSessionStatus();
   refreshJobs();
   refreshSamples();

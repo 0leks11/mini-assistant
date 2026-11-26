@@ -255,6 +255,11 @@ pub fn generate_job_report(job: &JobDetail, captured_pcm: Option<&[i16]>) -> Job
         } => {
             format!("chirp_sweep:{}-{}Hz", start_hz, end_hz)
         }
+        StimulusSignal::ToneBeep {
+            freq_hz,
+            duration_ms,
+            ..
+        } => format!("tone_beep:{}Hz/{}ms", freq_hz, duration_ms),
         StimulusSignal::Silence { duration_ms } => format!("silence:{}ms", duration_ms),
     };
 
@@ -401,7 +406,8 @@ impl AcousticEvaluator {
         }
     }
 
-    /// Evaluates a candidate calibration profile across all non-archived samples of specified split.
+    /// Evaluates a candidate calibration profile across all non-archived samples of specified split,
+    /// or a single explicit `sample_id` if provided.
     pub fn evaluate_candidate(
         &self,
         config: &WakewordCalibrationConfig,
@@ -411,6 +417,20 @@ impl AcousticEvaluator {
         self.evaluate_detector_config(&detector_cfg, split)
     }
 
+    /// Evaluates a single sample ID against `config`.
+    pub fn evaluate_single_sample(
+        &self,
+        config: &WakewordCalibrationConfig,
+        sample_id: &str,
+    ) -> Result<CorpusEvaluationReport> {
+        let meta = self
+            .samples_store
+            .get_metadata(sample_id)
+            .ok_or_else(|| anyhow::anyhow!("Sample '{sample_id}' not found"))?;
+        let detector_cfg = config.to_detector_config();
+        self.evaluate_sample_list(&detector_cfg, meta.split, &[meta])
+    }
+
     /// Runs evaluation with a specific `PersonalDetectorConfig` across the corpus.
     pub fn evaluate_detector_config(
         &self,
@@ -418,6 +438,15 @@ impl AcousticEvaluator {
         split: SampleSplit,
     ) -> Result<CorpusEvaluationReport> {
         let samples = self.samples_store.list(false, Some(split), None);
+        self.evaluate_sample_list(detector_cfg, split, &samples)
+    }
+
+    fn evaluate_sample_list(
+        &self,
+        detector_cfg: &PersonalDetectorConfig,
+        split: SampleSplit,
+        samples: &[crate::acoustics::samples::SampleMetadata],
+    ) -> Result<CorpusEvaluationReport> {
         let evaluation_id = format!("eval_{}", uuid::Uuid::new_v4().simple());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -450,7 +479,7 @@ impl AcousticEvaluator {
             None
         };
 
-        for meta in &samples {
+        for meta in samples {
             let wav_bytes = match self.samples_store.get_wav_bytes(&meta.id) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -860,6 +889,8 @@ mod tests {
                 pre_roll_ms: 100,
                 post_roll_ms: 100,
                 volume_pct: 40,
+                cue_before: false,
+                cue_after: false,
             },
             playback_started_at_ms: Some(1150),
             playback_ended_at_ms: Some(1550),
@@ -906,6 +937,7 @@ mod tests {
                     }),
                     notes: None,
                     wav_base64: None,
+                    auto_convert: None,
                 },
                 &pos_wav,
             )
@@ -924,6 +956,7 @@ mod tests {
                     interval: None,
                     notes: None,
                     wav_base64: None,
+                    auto_convert: None,
                 },
                 &neg_wav,
             )
@@ -976,6 +1009,7 @@ mod tests {
                     interval: None,
                     notes: None,
                     wav_base64: None,
+                    auto_convert: None,
                 },
                 &pos_wav,
             )
@@ -999,7 +1033,59 @@ mod tests {
                     >= search_res.ranked_candidates[i + 1].candidate_score
             );
         }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
+    #[test]
+    fn test_evaluate_single_sample_targets_one_id() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("single_eval_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let store = Arc::new(SamplesStore::new(temp_dir.clone()).unwrap());
+        let pos_wav =
+            crate::acoustics::samples::encode_wav_pcm16_mono(&vec![3000i16; 8000]).unwrap();
+        let meta = store
+            .store_sample(
+                CreateSampleDto {
+                    name: "single_pos".into(),
+                    source: Some(SampleSource::Upload),
+                    label: SampleLabel::PositiveWakeWord,
+                    split: SampleSplit::Train,
+                    interval: None,
+                    notes: None,
+                    wav_base64: None,
+                    auto_convert: None,
+                },
+                &pos_wav,
+            )
+            .unwrap();
+        let other_wav =
+            crate::acoustics::samples::encode_wav_pcm16_mono(&vec![50i16; 8000]).unwrap();
+        store
+            .store_sample(
+                CreateSampleDto {
+                    name: "other_neg".into(),
+                    source: Some(SampleSource::Upload),
+                    label: SampleLabel::NegativeSpeech,
+                    split: SampleSplit::Train,
+                    interval: None,
+                    notes: None,
+                    wav_base64: None,
+                    auto_convert: None,
+                },
+                &other_wav,
+            )
+            .unwrap();
+
+        let evaluator = AcousticEvaluator::new(store, None);
+        let cfg = WakewordCalibrationConfig {
+            threshold: 0.35,
+            ..Default::default()
+        };
+        let rep = evaluator.evaluate_single_sample(&cfg, &meta.id).unwrap();
+        assert_eq!(rep.total_samples, 1);
+        assert_eq!(rep.sample_results[0].sample_id, meta.id);
+        assert_eq!(rep.positive_detected, 1);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -88,6 +88,8 @@ pub struct CreateSampleDto {
     pub interval: Option<SampleInterval>,
     pub notes: Option<String>,
     pub wav_base64: Option<String>,
+    #[serde(default)]
+    pub auto_convert: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +208,100 @@ pub fn compute_sha256_hex(data: &[u8]) -> String {
         "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
     )
+}
+
+/// Normalizes an uploaded WAV (mono or multi-channel, Int 8/16/24/32-bit or Float 32-bit, any rate)
+/// into strict 16 kHz mono PCM16 WAV for unified storage and KWS evaluation.
+pub fn normalize_wav_to_16k_mono_pcm16(bytes: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        bytes.len() >= 44,
+        "Audio file too small to contain valid WAV header"
+    );
+    ensure!(
+        bytes.len() <= 16 * 1024 * 1024,
+        "Raw WAV upload exceeds 16 MB safety ceiling"
+    );
+
+    let cursor = Cursor::new(bytes);
+    let mut reader = WavReader::new(cursor).context("Invalid WAV header or format")?;
+    let spec = reader.spec();
+    ensure!(
+        (1..=8).contains(&spec.channels),
+        "Expected 1..=8 audio channels, got {}",
+        spec.channels
+    );
+    ensure!(
+        (8_000..=96_000).contains(&spec.sample_rate),
+        "Expected sample rate in 8000..=96000 Hz, got {} Hz",
+        spec.sample_rate
+    );
+
+    let interleaved: Vec<f32> = match spec.sample_format {
+        SampleFormat::Float => {
+            ensure!(
+                spec.bits_per_sample == 32,
+                "Expected 32-bit float WAV, got {} bits",
+                spec.bits_per_sample
+            );
+            reader
+                .samples::<f32>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("Truncated or corrupted float WAV data")?
+        }
+        SampleFormat::Int => {
+            ensure!(
+                matches!(spec.bits_per_sample, 8 | 16 | 24 | 32),
+                "Unsupported integer WAV bit depth: {}",
+                spec.bits_per_sample
+            );
+            let scale = (1u64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|r| r.map(|v| (v as f32 / scale).clamp(-1.0, 1.0)))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("Truncated or corrupted integer WAV data")?
+        }
+    };
+
+    let ch = spec.channels as usize;
+    let frame_count = interleaved.len() / ch;
+    ensure!(frame_count > 0, "WAV file contains no audio frames");
+
+    let mut mono = Vec::with_capacity(frame_count);
+    for frame in interleaved.chunks_exact(ch) {
+        let sum: f32 = frame.iter().copied().sum();
+        mono.push((sum / ch as f32).clamp(-1.0, 1.0));
+    }
+
+    let out_len = ((frame_count as f64) * (TARGET_SAMPLE_RATE as f64) / (spec.sample_rate as f64))
+        .round() as usize;
+    ensure!(out_len > 0, "Resampled WAV has zero length");
+    let max_samples = (TARGET_SAMPLE_RATE * MAX_SAMPLE_DURATION_SECS) as usize;
+    ensure!(
+        out_len <= max_samples,
+        "Normalized clip duration exceeds {} s limit",
+        MAX_SAMPLE_DURATION_SECS
+    );
+
+    let pcm16: Vec<i16> = if spec.sample_rate == TARGET_SAMPLE_RATE {
+        mono.into_iter()
+            .map(|s| (s * 32767.0).clamp(-32768.0, 32767.0).round() as i16)
+            .collect()
+    } else {
+        let ratio = (frame_count - 1) as f64 / (out_len.saturating_sub(1).max(1) as f64);
+        let mut resampled = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            let pos = i as f64 * ratio;
+            let idx = (pos.floor() as usize).min(frame_count - 1);
+            let next = (idx + 1).min(frame_count - 1);
+            let frac = (pos - idx as f64) as f32;
+            let val = mono[idx] + frac * (mono[next] - mono[idx]);
+            resampled.push((val * 32767.0).clamp(-32768.0, 32767.0).round() as i16);
+        }
+        resampled
+    };
+
+    encode_wav_pcm16_mono(&pcm16)
 }
 
 /// Strictly validates that the provided audio bytes conform to mono PCM16 16000Hz WAV,
@@ -884,6 +980,7 @@ mod tests {
                     }),
                     notes: Some("Обучающий эталон".into()),
                     wav_base64: None,
+                    auto_convert: None,
                 },
                 &wav_bytes,
             )
@@ -900,6 +997,7 @@ mod tests {
                     interval: None,
                     notes: Some("Строго контрольная выборка".into()),
                     wav_base64: None,
+                    auto_convert: None,
                 },
                 &wav_bytes,
             )
@@ -967,5 +1065,32 @@ mod tests {
         // Band 3 covers 750..1000 Hz, band 4 covers 1000..1250 Hz (1 kHz hits bin 32 -> band 3/4)
         let mid_frame = &spec.frames_db[spec.frames_db.len() / 2];
         assert!(mid_frame[3].max(mid_frame[4]) > -15.0);
+    }
+
+    #[test]
+    fn test_normalize_stereo_48k_float_wav_to_16k_mono_pcm16() {
+        let mut cursor = Cursor::new(Vec::new());
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        {
+            let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+            for i in 0..24000 {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * (i as f32 / 48000.0)).sin() * 0.4;
+                writer.write_sample(s).unwrap();
+                writer.write_sample(s).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        let converted = normalize_wav_to_16k_mono_pcm16(&cursor.into_inner()).expect("normalize");
+        let (pcm, metrics) = validate_and_analyze_wav(&converted, None).expect("strict valid");
+        assert_eq!(metrics.sample_rate, 16000);
+        assert_eq!(metrics.channels, 1);
+        assert_eq!(metrics.bits_per_sample, 16);
+        assert_eq!(pcm.len(), 8000);
+        assert!(!metrics.is_clipped);
     }
 }

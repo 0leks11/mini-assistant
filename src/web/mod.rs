@@ -313,6 +313,8 @@ impl ControlCenterServer {
         let mut content_type = String::new();
         let mut host = None;
         let mut origin = None;
+        let mut referer = None;
+        let mut sec_fetch_site = None;
         let mut json_content = false;
         let mut if_match = None;
         let mut auth_header = None;
@@ -322,6 +324,10 @@ impl ControlCenterServer {
                 let k_trim = k.trim();
                 if k_trim.eq_ignore_ascii_case("origin") {
                     origin = Some(v.trim().to_string());
+                } else if k_trim.eq_ignore_ascii_case("referer") {
+                    referer = Some(v.trim().to_string());
+                } else if k_trim.eq_ignore_ascii_case("sec-fetch-site") {
+                    sec_fetch_site = Some(v.trim().to_ascii_lowercase());
                 } else if k_trim.eq_ignore_ascii_case("content-type") {
                     content_type = v.trim().to_string();
                     json_content = content_type.split(';').next() == Some("application/json");
@@ -386,10 +392,20 @@ impl ControlCenterServer {
             _ => self.redirect_uri.clone(),
         };
 
-        let same_origin = origin.as_ref().is_some_and(|o| {
-            host.as_ref()
-                .is_some_and(|h| o == &format!("http://{h}") || o == &format!("https://{h}"))
-        });
+        let host_matches_url = |url_val: &str, h: &str| {
+            let rest = url_val
+                .strip_prefix("http://")
+                .or_else(|| url_val.strip_prefix("https://"));
+            rest.is_some_and(|r| r == h || r.starts_with(&format!("{h}/")))
+        };
+        let same_origin = origin
+            .as_ref()
+            .is_some_and(|o| host.as_ref().is_some_and(|h| host_matches_url(o, h)))
+            || ((method == "GET" || method == "HEAD")
+                && (sec_fetch_site.as_deref() == Some("same-origin")
+                    || referer
+                        .as_ref()
+                        .is_some_and(|r| host.as_ref().is_some_and(|h| host_matches_url(r, h)))));
 
         let identity = match self
             .auth_manager
@@ -722,8 +738,13 @@ impl ControlCenterServer {
                 self.handle_api_list_jobs(&mut stream).await?;
             }
             ("POST", "/api/v1/acoustics/jobs") | ("POST", "/api/v1/calibration/jobs") => {
-                self.handle_api_create_job(&mut stream, body, idempotency_key.as_deref())
-                    .await?;
+                self.handle_api_create_job(
+                    &mut stream,
+                    body,
+                    idempotency_key.as_deref(),
+                    &identity,
+                )
+                .await?;
             }
             (m, p)
                 if p.starts_with("/api/v1/acoustics/jobs/")
@@ -765,6 +786,27 @@ impl ControlCenterServer {
             }
             ("POST", "/api/v1/acoustics/search") | ("POST", "/api/v1/calibration/search") => {
                 self.handle_api_search(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/acoustics/cue") | ("POST", "/api/v1/calibration/cue") => {
+                self.handle_api_post_cue(&mut stream, body, &identity)
+                    .await?;
+            }
+            ("GET", "/api/v1/acoustics/volume") | ("GET", "/api/v1/calibration/volume") => {
+                self.handle_api_get_acoustics_volume(&mut stream, &identity)
+                    .await?;
+            }
+            ("POST", "/api/v1/acoustics/volume") | ("POST", "/api/v1/calibration/volume") => {
+                self.handle_api_post_acoustics_volume(&mut stream, body, &identity)
+                    .await?;
+            }
+            ("GET", "/api/v1/acoustics/reference_playback")
+            | ("GET", "/api/v1/calibration/reference_playback") => {
+                self.handle_api_get_reference_playback(&mut stream).await?;
+            }
+            ("POST", "/api/v1/acoustics/reference_playback")
+            | ("POST", "/api/v1/calibration/reference_playback") => {
+                self.handle_api_post_reference_playback(&mut stream, body, &identity)
+                    .await?;
             }
 
             // Acoustic Calibration Sessions
@@ -2333,7 +2375,7 @@ impl ControlCenterServer {
         raw_body: &[u8],
         query: Option<&str>,
     ) -> Result<()> {
-        let (dto, wav_bytes) = if content_type.starts_with("application/json") {
+        let (dto, raw_wav_bytes, auto_convert) = if content_type.starts_with("application/json") {
             let req: crate::acoustics::samples::CreateSampleDto = match serde_json::from_str(body) {
                 Ok(v) => v,
                 Err(e) => {
@@ -2371,7 +2413,8 @@ impl ControlCenterServer {
                         .await;
                 }
             };
-            (req, bytes)
+            let auto_conv = req.auto_convert.unwrap_or(false);
+            (req, bytes, auto_conv)
         } else if content_type.starts_with("audio/wav")
             || content_type.starts_with("application/octet-stream")
         {
@@ -2424,6 +2467,10 @@ impl ControlCenterServer {
                 }),
                 _ => None,
             };
+            let auto_conv = query.is_some_and(|q| {
+                q.split('&')
+                    .any(|p| p == "auto_convert=true" || p == "auto_convert=1")
+            });
 
             let dto = crate::acoustics::samples::CreateSampleDto {
                 name,
@@ -2433,8 +2480,9 @@ impl ControlCenterServer {
                 interval,
                 notes: None,
                 wav_base64: None,
+                auto_convert: Some(auto_conv),
             };
-            (dto, raw_body.to_vec())
+            (dto, raw_body.to_vec(), auto_conv)
         } else {
             return self
                 .send_json_status(
@@ -2443,6 +2491,26 @@ impl ControlCenterServer {
                     &serde_json::json!({"status": "error", "message": "Expected Content-Type application/json or audio/wav"}),
                 )
                 .await;
+        };
+
+        let wav_bytes = if auto_convert {
+            match crate::acoustics::samples::normalize_wav_to_16k_mono_pcm16(&raw_wav_bytes) {
+                Ok(converted) => converted,
+                Err(e) => {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "400 Bad Request",
+                            &serde_json::json!({
+                                "status": "error",
+                                "message": format!("WAV normalization failed: {e}")
+                            }),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            raw_wav_bytes
         };
 
         match self.samples_store.store_sample(dto, &wav_bytes) {
@@ -2593,8 +2661,9 @@ impl ControlCenterServer {
         stream: &mut TcpStream,
         body: &str,
         idempotency_key: Option<&str>,
+        identity: &RequestIdentity,
     ) -> Result<()> {
-        let dto: crate::acoustics::jobs::CreateJobDto = match serde_json::from_str(body) {
+        let mut dto: crate::acoustics::jobs::CreateJobDto = match serde_json::from_str(body) {
             Ok(d) => d,
             Err(e) => {
                 return self
@@ -2609,6 +2678,9 @@ impl ControlCenterServer {
                     .await;
             }
         };
+        if let Some(max_pct) = self.auth_manager.max_volume_pct(identity) {
+            dto.volume_pct = dto.volume_pct.min(max_pct);
+        }
 
         match self.job_runner.start_job(dto, idempotency_key) {
             Ok(summary) => {
@@ -2627,53 +2699,7 @@ impl ControlCenterServer {
                 )
                 .await
             }
-            Err(crate::acoustics::jobs::JobError::Conflict(e)) => {
-                self.send_json_status(
-                    stream,
-                    "409 Conflict",
-                    &serde_json::json!({
-                        "status": "error",
-                        "code": "conflict",
-                        "message": e,
-                    }),
-                )
-                .await
-            }
-            Err(crate::acoustics::jobs::JobError::Unsupported(e)) => {
-                self.send_json_status(
-                    stream,
-                    "422 Unprocessable Entity",
-                    &serde_json::json!({
-                        "status": "error",
-                        "code": "unsupported",
-                        "message": e,
-                    }),
-                )
-                .await
-            }
-            Err(crate::acoustics::jobs::JobError::Validation(e)) => {
-                self.send_json_status(
-                    stream,
-                    "400 Bad Request",
-                    &serde_json::json!({
-                        "status": "error",
-                        "code": "validation",
-                        "message": e,
-                    }),
-                )
-                .await
-            }
-            Err(e) => {
-                self.send_json_status(
-                    stream,
-                    "500 Internal Server Error",
-                    &serde_json::json!({
-                        "status": "error",
-                        "message": e.to_string(),
-                    }),
-                )
-                .await
-            }
+            Err(err) => self.send_job_error(stream, err).await,
         }
     }
 
@@ -2829,11 +2855,14 @@ impl ControlCenterServer {
             settings: Option<crate::acoustics::AcousticSettingsDto>,
             #[serde(default)]
             split: Option<String>,
+            #[serde(default)]
+            sample_id: Option<String>,
         }
 
         let req: EvaluateReq = serde_json::from_str(body).unwrap_or(EvaluateReq {
             settings: None,
             split: None,
+            sample_id: None,
         });
 
         let split = match req.split.as_deref() {
@@ -2859,7 +2888,13 @@ impl ControlCenterServer {
             Some(self.wakeword_model_path.clone()),
         );
 
-        match evaluator.evaluate_candidate(&config, split) {
+        let eval_res = if let Some(ref sid) = req.sample_id {
+            evaluator.evaluate_single_sample(&config, sid)
+        } else {
+            evaluator.evaluate_candidate(&config, split)
+        };
+
+        match eval_res {
             Ok(report) => {
                 self.send_json(
                     stream,
@@ -2946,6 +2981,500 @@ impl ControlCenterServer {
                 .await
             }
         }
+    }
+
+    async fn send_job_error(
+        &self,
+        stream: &mut TcpStream,
+        err: crate::acoustics::jobs::JobError,
+    ) -> Result<()> {
+        let (status, code, message) = match err {
+            crate::acoustics::jobs::JobError::Conflict(e) => ("409 Conflict", Some("conflict"), e),
+            crate::acoustics::jobs::JobError::Unsupported(e) => {
+                ("422 Unprocessable Entity", Some("unsupported"), e)
+            }
+            crate::acoustics::jobs::JobError::Validation(e) => {
+                ("400 Bad Request", Some("validation"), e)
+            }
+            crate::acoustics::jobs::JobError::NotFound(e) => {
+                ("404 Not Found", Some("not_found"), e)
+            }
+            e => ("500 Internal Server Error", None, e.to_string()),
+        };
+        let mut payload = serde_json::json!({
+            "status": "error",
+            "message": message,
+        });
+        if let Some(c) = code {
+            payload["code"] = serde_json::json!(c);
+        }
+        self.send_json_status(stream, status, &payload).await
+    }
+
+    fn max_level_for_soloist_cap(cap: u8) -> u8 {
+        (0u8..=10)
+            .rev()
+            .find(|&l| volume::soloist_percent_for_level(l) <= cap)
+            .unwrap_or(0)
+    }
+
+    fn clamp_calibrated_volume(
+        requested_level: Option<u8>,
+        requested_pct: Option<u8>,
+        lease_cap: Option<u8>,
+    ) -> (u8, u8, bool) {
+        match (requested_level, requested_pct) {
+            (Some(lvl), None) => {
+                let req_lvl = lvl.min(10);
+                let req_pct = volume::soloist_percent_for_level(req_lvl);
+                let eff_lvl = match lease_cap {
+                    Some(cap) => req_lvl.min(Self::max_level_for_soloist_cap(cap)),
+                    None => req_lvl,
+                };
+                let eff_pct = volume::soloist_percent_for_level(eff_lvl);
+                let clamped = eff_lvl < req_lvl || lease_cap.is_some_and(|cap| req_pct > cap);
+                (eff_lvl, eff_pct, clamped)
+            }
+            (opt_lvl, Some(pct)) => {
+                let req_pct = pct.min(100);
+                let eff_pct = lease_cap.map_or(req_pct, |cap| req_pct.min(cap));
+                let base_lvl = opt_lvl
+                    .map_or_else(|| volume::level_for_soloist_percent(eff_pct), |l| l.min(10));
+                let mut eff_lvl = match lease_cap {
+                    Some(cap) => base_lvl.min(Self::max_level_for_soloist_cap(cap)),
+                    None => base_lvl,
+                };
+                if eff_pct == 0 {
+                    eff_lvl = 0;
+                }
+                let clamped = eff_pct < req_pct || opt_lvl.is_some_and(|l| eff_lvl < l.min(10));
+                (eff_lvl, eff_pct, clamped)
+            }
+            (None, None) => {
+                let cur = volume::current_level();
+                (cur, volume::soloist_percent_for_level(cur), false)
+            }
+        }
+    }
+
+    fn soloist_state_name(state: &PlaybackState) -> String {
+        match state {
+            PlaybackState::Playing => "playing".to_string(),
+            PlaybackState::Paused => "paused".to_string(),
+            PlaybackState::Stopped => "stopped".to_string(),
+            PlaybackState::Unknown(other) => other.clone(),
+        }
+    }
+
+    async fn handle_api_post_cue(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        let req: crate::acoustics::jobs::CueRequestDto = if body.trim().is_empty() {
+            serde_json::from_str("{}").unwrap()
+        } else {
+            match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "400 Bad Request",
+                            &serde_json::json!({
+                                "status": "error",
+                                "message": format!("Invalid cue request JSON: {e}"),
+                            }),
+                        )
+                        .await;
+                }
+            }
+        };
+
+        let lease_cap = self.auth_manager.max_volume_pct(identity);
+        match self.job_runner.play_cue(&req, lease_cap).await {
+            Ok(result) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "cue": result,
+                    }),
+                )
+                .await
+            }
+            Err(err) => self.send_job_error(stream, err).await,
+        }
+    }
+
+    async fn handle_api_get_acoustics_volume(
+        &self,
+        stream: &mut TcpStream,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        let level = volume::current_level();
+        let soloist_pct = volume::soloist_percent_for_level(level);
+        let soloist_actual_pct = if let Some(ref soloist) = self.soloist_client {
+            tokio::time::timeout(Duration::from_secs(2), soloist.get_status())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|s| s.volume)
+        } else {
+            None
+        };
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "level": level,
+                "soloist_pct": soloist_pct,
+                "soloist_actual_pct": soloist_actual_pct,
+                "soloist_available": self.soloist_client.is_some(),
+                "ducked": self.ducker.is_ducked(),
+                "max_volume_pct": self.auth_manager.max_volume_pct(identity),
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_post_acoustics_volume(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct AcousticsVolumeReq {
+            #[serde(default)]
+            level: Option<u8>,
+            #[serde(default)]
+            soloist_pct: Option<u8>,
+            #[serde(default)]
+            volume_pct: Option<u8>,
+        }
+
+        let req: AcousticsVolumeReq = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Invalid volume JSON: {e}"),
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        let req_pct = req.soloist_pct.or(req.volume_pct);
+        if req.level.is_none() && req_pct.is_none() {
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "Specify 'level' (0..=10) or 'soloist_pct' / 'volume_pct' (0..=100)",
+                    }),
+                )
+                .await;
+        }
+
+        let lease_cap = self.auth_manager.max_volume_pct(identity);
+        let (applied_level, applied_pct, clamped) =
+            Self::clamp_calibrated_volume(req.level, req_pct, lease_cap);
+
+        self.ducker.cancel();
+        let effective_level = volume::set_volume_level(applied_level);
+
+        let mut soloist_updated = false;
+        let mut soloist_error: Option<String> = None;
+        if let Some(ref soloist) = self.soloist_client {
+            match tokio::time::timeout(Duration::from_secs(2), soloist.set_volume(applied_pct))
+                .await
+            {
+                Ok(Ok(())) => {
+                    soloist_updated = true;
+                }
+                Ok(Err(e)) => {
+                    warn!(err = %e, "Acoustics volume: failed to update Soloist volume");
+                    soloist_error = Some(e.to_string());
+                }
+                Err(_) => {
+                    warn!("Acoustics volume: Soloist set_volume timed out");
+                    soloist_error = Some("Soloist set_volume timed out".to_string());
+                }
+            }
+        }
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "level": effective_level,
+                "soloist_pct": applied_pct,
+                "clamped": clamped,
+                "max_volume_pct": lease_cap,
+                "soloist_updated": soloist_updated,
+                "soloist_available": self.soloist_client.is_some(),
+                "soloist_error": soloist_error,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_get_reference_playback(&self, stream: &mut TcpStream) -> Result<()> {
+        let Some(ref soloist) = self.soloist_client else {
+            return self
+                .send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "available": false,
+                        "state": "unavailable",
+                        "is_playing": false,
+                        "is_active": false,
+                        "volume": null,
+                        "position_ms": 0,
+                        "duration_ms": 0,
+                        "track": null,
+                    }),
+                )
+                .await;
+        };
+
+        match tokio::time::timeout(Duration::from_secs(2), soloist.get_status()).await {
+            Ok(Ok(st)) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "available": true,
+                        "state": Self::soloist_state_name(&st.state),
+                        "is_playing": st.is_actually_playing(),
+                        "is_active": st.is_active,
+                        "volume": st.volume,
+                        "position_ms": st.position_ms,
+                        "duration_ms": st.duration_ms,
+                        "track": st.track,
+                    }),
+                )
+                .await
+            }
+            Ok(Err(e)) => {
+                self.send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({
+                        "status": "error",
+                        "available": false,
+                        "message": format!("Soloist status unavailable: {e}"),
+                    }),
+                )
+                .await
+            }
+            Err(_) => {
+                self.send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({
+                        "status": "error",
+                        "available": false,
+                        "message": "Soloist status query timed out",
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_post_reference_playback(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+        identity: &RequestIdentity,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct RefPlaybackReq {
+            action: String,
+            #[serde(default)]
+            uri: Option<String>,
+            #[serde(default)]
+            volume_pct: Option<u8>,
+        }
+
+        let req: RefPlaybackReq = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Invalid reference_playback JSON: {e}"),
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        let action = req.action.trim().to_ascii_lowercase();
+        if !matches!(
+            action.as_str(),
+            "play" | "resume" | "pause" | "next" | "prev" | "previous" | "volume" | "status"
+        ) {
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("Unsupported action '{}'; expected play|resume|pause|next|prev|volume|status", req.action),
+                    }),
+                )
+                .await;
+        }
+
+        if action == "status" {
+            return self.handle_api_get_reference_playback(stream).await;
+        }
+
+        let Some(ref soloist) = self.soloist_client else {
+            return self
+                .send_json_status(
+                    stream,
+                    "503 Service Unavailable",
+                    &serde_json::json!({
+                        "status": "error",
+                        "available": false,
+                        "message": "Soloist client is not configured on this host",
+                    }),
+                )
+                .await;
+        };
+
+        let lease_cap = self.auth_manager.max_volume_pct(identity);
+        let mut clamped = false;
+        let mut applied_pct = req.volume_pct.map(|p| {
+            let clamped_val = lease_cap.map_or(p.min(100), |cap| p.min(100).min(cap));
+            if clamped_val < p.min(100) {
+                clamped = true;
+            }
+            clamped_val
+        });
+
+        if action == "volume" {
+            let target_pct = match applied_pct {
+                Some(v) => v,
+                None => {
+                    return self
+                        .send_json_status(
+                            stream,
+                            "400 Bad Request",
+                            &serde_json::json!({
+                                "status": "error",
+                                "message": "action='volume' requires 'volume_pct' (0..=100)",
+                            }),
+                        )
+                        .await;
+                }
+            };
+            self.ducker.cancel();
+            if let Err(e) = soloist.set_volume(target_pct).await {
+                return self
+                    .send_json_status(
+                        stream,
+                        "503 Service Unavailable",
+                        &serde_json::json!({
+                            "status": "error",
+                            "available": true,
+                            "message": format!("Soloist set_volume failed: {e}"),
+                        }),
+                    )
+                    .await;
+            }
+        } else {
+            if let Some(target_pct) = applied_pct {
+                self.ducker.cancel();
+                let _ = soloist.set_volume(target_pct).await;
+            } else if matches!(action.as_str(), "play" | "resume") {
+                if let Some(cap) = lease_cap {
+                    if let Ok(Ok(cur)) =
+                        tokio::time::timeout(Duration::from_secs(2), soloist.get_status()).await
+                    {
+                        if cur.volume > cap {
+                            clamped = true;
+                            applied_pct = Some(cap);
+                            self.ducker.cancel();
+                            let _ = soloist.set_volume(cap).await;
+                        }
+                    }
+                }
+            }
+
+            let op_res = match action.as_str() {
+                "play" | "resume" => {
+                    if let Some(ref uri) = req.uri {
+                        soloist.play_uri(uri).await
+                    } else {
+                        soloist.resume().await
+                    }
+                }
+                "pause" => soloist.pause().await,
+                "next" => soloist.next().await,
+                "prev" | "previous" => soloist.previous().await,
+                _ => Ok(()),
+            };
+
+            if let Err(e) = op_res {
+                return self
+                    .send_json_status(
+                        stream,
+                        "503 Service Unavailable",
+                        &serde_json::json!({
+                            "status": "error",
+                            "available": true,
+                            "message": format!("Soloist command '{action}' failed: {e}"),
+                        }),
+                    )
+                    .await;
+            }
+        }
+
+        let st_opt = tokio::time::timeout(Duration::from_secs(2), soloist.get_status())
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "available": true,
+                "clamped": clamped,
+                "applied_volume_pct": applied_pct.or_else(|| st_opt.as_ref().map(|s| s.volume)),
+                "max_volume_pct": lease_cap,
+                "state": st_opt
+                    .as_ref()
+                    .map(|s| Self::soloist_state_name(&s.state))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                "is_playing": st_opt.as_ref().is_some_and(|s| s.is_actually_playing()),
+                "is_active": st_opt.as_ref().is_some_and(|s| s.is_active),
+                "volume": st_opt.as_ref().map(|s| s.volume),
+                "position_ms": st_opt.as_ref().map(|s| s.position_ms).unwrap_or(0),
+                "duration_ms": st_opt.as_ref().map(|s| s.duration_ms).unwrap_or(0),
+                "track": st_opt.and_then(|s| s.track),
+            }),
+        )
+        .await
     }
 
     async fn handle_api_get_openapi(&self, stream: &mut TcpStream) -> Result<()> {
@@ -6183,6 +6712,246 @@ capture_device = "hw:0,2"
         let cfg_text = std::fs::read_to_string(&cfg_file).unwrap();
         assert!(cfg_text.contains("[audio.aec]"));
         assert!(cfg_text.contains("enabled = true"));
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_http_cue_volume_same_origin_and_convert() {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("mini_test_cue_web_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let auth_manager = Arc::new(AuthManager::new(Some("owner_secret_cue".to_string())));
+        let lease = crate::web::auth::CalibrationLease {
+            max_volume_pct: 50,
+            ..Default::default()
+        };
+        let (_, cal_token) = auth_manager.issue_calibration_token(
+            "calib_cue_agent".into(),
+            std::time::Duration::from_secs(3600),
+            Scope::all(),
+            lease,
+        );
+        let token = &cal_token.token;
+
+        let samples_store = Arc::new(
+            crate::acoustics::samples::SamplesStore::new(temp_dir.join("samples")).unwrap(),
+        );
+        let profiles_store = Arc::new(
+            crate::acoustics::profiles::ProfilesStore::new(temp_dir.join("profiles.json")).unwrap(),
+        );
+        let (lab, _rx) =
+            crate::acoustics::AcousticLab::new(crate::config::WakewordCalibrationConfig::default());
+        let sink = Arc::new(crate::acoustics::jobs::MockPlaybackSink::new(false));
+        let job_runner = crate::acoustics::jobs::AcousticJobRunner::new(
+            samples_store.clone(),
+            lab.clone(),
+            None,
+            sink,
+        );
+
+        let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
+        let server = Arc::new(
+            ControlCenterServer::new(
+                Some(temp_dir.join("config.toml")),
+                "client_id".to_string(),
+                "http://127.0.0.1/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                None,
+                ducker,
+            )
+            .with_auth_manager(auth_manager.clone())
+            .with_samples_store(samples_store)
+            .with_profiles_store(profiles_store)
+            .with_acoustic_lab(lab)
+            .with_job_runner(job_runner),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let _ = server.run(listener, shutdown_rx).await;
+            })
+        };
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let s = String::from_utf8_lossy(&buf);
+            let code = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse::<u16>()
+                .unwrap_or(0);
+            let json_body = s
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b.trim()).ok())
+                .unwrap_or(serde_json::Value::Null);
+            (code, json_body)
+        }
+
+        // 1. Anonymous GET without browser origin headers -> 401
+        let req_anon = format!(
+            "GET /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\n\r\n"
+        );
+        let (code, _) = send_req(local_addr, &req_anon).await;
+        assert_eq!(code, 401);
+
+        // 2. Browser same-origin GET via Sec-Fetch-Site or matching Referer -> 200
+        let req_sec_fetch = format!(
+            "GET /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {local_addr}\r\nSec-Fetch-Site: same-origin\r\nConnection: close\r\n\r\n"
+        );
+        let (code, prof_resp) = send_req(local_addr, &req_sec_fetch).await;
+        assert_eq!(code, 200);
+        assert_eq!(prof_resp["status"], "ok");
+
+        let req_referer = format!(
+            "GET /api/v1/acoustics/samples HTTP/1.1\r\nHost: {local_addr}\r\nReferer: http://{local_addr}/acoustics\r\nConnection: close\r\n\r\n"
+        );
+        let (code, samp_resp) = send_req(local_addr, &req_referer).await;
+        assert_eq!(code, 200);
+        assert_eq!(samp_resp["status"], "ok");
+
+        // Cross-site Referer stays blocked -> 401
+        let req_evil = format!(
+            "GET /api/v1/acoustics/profiles HTTP/1.1\r\nHost: {local_addr}\r\nReferer: http://evil.example/acoustics\r\nConnection: close\r\n\r\n"
+        );
+        let (code, _) = send_req(local_addr, &req_evil).await;
+        assert_eq!(code, 401);
+
+        // 3. POST /cue anonymous -> 401; calibrated clamps volume_pct to lease cap 50
+        let cue_body = r#"{"kind":"double_beep","volume_pct":80}"#;
+        let req_cue_anon = format!(
+            "POST /api/v1/acoustics/cue HTTP/1.1\r\nHost: {local_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cue_body}",
+            cue_body.len()
+        );
+        let (code, _) = send_req(local_addr, &req_cue_anon).await;
+        assert_eq!(code, 401);
+
+        let req_cue_cal = format!(
+            "POST /api/v1/acoustics/cue HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cue_body}",
+            cue_body.len()
+        );
+        let (code, cue_resp) = send_req(local_addr, &req_cue_cal).await;
+        assert_eq!(code, 200);
+        assert_eq!(cue_resp["cue"]["volume_pct"], 50);
+        assert_eq!(cue_resp["cue"]["kind"], "double_beep");
+        assert!(cue_resp["cue"]["peak_amplitude"].as_i64().unwrap() > 0);
+
+        // 4. GET & POST /volume with calibration lease clamp vs owner
+        let req_vol_get = format!(
+            "GET /api/v1/acoustics/volume HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let (code, vol_get) = send_req(local_addr, &req_vol_get).await;
+        assert_eq!(code, 200);
+        assert_eq!(vol_get["max_volume_pct"], 50);
+
+        let vol_high = r#"{"level":8}"#;
+        let req_vol_cal = format!(
+            "POST /api/v1/acoustics/volume HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{vol_high}",
+            vol_high.len()
+        );
+        let (code, vol_cal_resp) = send_req(local_addr, &req_vol_cal).await;
+        assert_eq!(code, 200);
+        assert_eq!(vol_cal_resp["clamped"], true);
+        assert_eq!(vol_cal_resp["level"], 2);
+        assert_eq!(vol_cal_resp["soloist_pct"], 50);
+
+        let vol_owner = r#"{"level":1}"#;
+        let req_vol_owner = format!(
+            "POST /api/v1/acoustics/volume HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer owner_secret_cue\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{vol_owner}",
+            vol_owner.len()
+        );
+        let (code, vol_owner_resp) = send_req(local_addr, &req_vol_owner).await;
+        assert_eq!(code, 200);
+        assert_eq!(vol_owner_resp["clamped"], false);
+        assert_eq!(vol_owner_resp["level"], 1);
+        assert_eq!(vol_owner_resp["soloist_pct"], 42);
+
+        // 5. GET & POST /reference_playback (soloist_client is None -> GET available=false, POST 503)
+        let req_ref_get = format!(
+            "GET /api/v1/acoustics/reference_playback HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let (code, ref_get) = send_req(local_addr, &req_ref_get).await;
+        assert_eq!(code, 200);
+        assert_eq!(ref_get["available"], false);
+
+        let ref_play = r#"{"action":"play"}"#;
+        let req_ref_post = format!(
+            "POST /api/v1/acoustics/reference_playback HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ref_play}",
+            ref_play.len()
+        );
+        let (code, _) = send_req(local_addr, &req_ref_post).await;
+        assert_eq!(code, 503);
+
+        // 6. Auto-convert stereo 48kHz PCM16 WAV on upload + single-sample evaluate
+        let mut stereo_samples = Vec::with_capacity(4800 * 2);
+        for i in 0..4800usize {
+            let v = ((i as f32 * 0.05).sin() * 12000.0) as i16;
+            stereo_samples.push(v);
+            stereo_samples.push(v);
+        }
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav_cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut wav_cursor, spec).unwrap();
+            for s in stereo_samples {
+                writer.write_sample(s).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        let wav_b64 = base64::engine::general_purpose::STANDARD.encode(wav_cursor.into_inner());
+        let upload_body = serde_json::json!({
+            "name": "studio_48k_stereo_probe",
+            "label": "positive",
+            "split": "calibration",
+            "wav_base64": wav_b64,
+            "auto_convert": true
+        })
+        .to_string();
+        let req_upload = format!(
+            "POST /api/v1/acoustics/samples HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{upload_body}",
+            upload_body.len()
+        );
+        let (code, up_resp) = send_req(local_addr, &req_upload).await;
+        assert_eq!(code, 200);
+        let sample_id = up_resp["sample"]["id"].as_str().unwrap().to_string();
+        assert_eq!(up_resp["sample"]["metrics"]["sample_rate"], 16000);
+        assert_eq!(up_resp["sample"]["metrics"]["channels"], 1);
+
+        let eval_body = serde_json::json!({ "sample_id": sample_id }).to_string();
+        let req_eval = format!(
+            "POST /api/v1/acoustics/evaluate HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{eval_body}",
+            eval_body.len()
+        );
+        let (code, eval_resp) = send_req(local_addr, &req_eval).await;
+        assert_eq!(code, 200);
+        assert_eq!(eval_resp["evaluation"]["total_samples"], 1);
+        assert_eq!(
+            eval_resp["evaluation"]["sample_results"][0]["sample_id"],
+            sample_id
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;

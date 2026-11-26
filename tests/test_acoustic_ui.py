@@ -93,9 +93,61 @@ let calls = []; let postError = null;
 const clone = value => JSON.parse(JSON.stringify(value));
 const context = {
   console, document, AbortController, Blob, URL, setTimeout, clearTimeout,
+  btoa: bytes => Buffer.from(bytes, 'binary').toString('base64'),
   setInterval() { return 1; }, clearInterval() {},
   window:{addEventListener() {},print() {}},
   fetch: async (url, options = {}) => {
+    if (input.case === 'profiles_cue_volume_upload') {
+      const method = options.method || 'GET';
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ url, method, body });
+      if (url === '/api/v1/acoustics') return { ok: true, status: 200, json: async () => clone(current) };
+      if (url === '/api/v1/acoustics/profiles') {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            status: 'ok',
+            active_profile_id: 'prof_1',
+            profiles: [
+              { id: 'prof_1', name: 'Холл 2м', status: 'draft', settings: clone(current.saved) },
+              { id: 'prof_2', name: 'Гостиная 2м', status: 'draft', settings: clone(current.defaults) }
+            ]
+          })
+        };
+      }
+      if (url === '/api/v1/acoustics/volume') {
+        if (method === 'POST') return { ok: true, status: 200, json: async () => ({ status: 'ok', level: body.level, soloist_pct: 57, clamped: false }) };
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', level: 1, soloist_pct: 42, soloist_actual_pct: 42, max_volume_pct: 70 }) };
+      }
+      if (url === '/api/v1/acoustics/cue') {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', cue: { kind: body.kind, played_ms: 180, volume_pct: body.volume_pct ?? 35, peak_amplitude: 6500 } }) };
+      }
+      if (url === '/api/v1/acoustics/reference_playback') {
+        if (method === 'POST') return { ok: true, status: 200, json: async () => ({ status: 'ok', available: true, state: 'playing', is_playing: true, volume: 42 }) };
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', available: true, state: 'paused', is_playing: false, volume: 42, track: { artist: 'Art', name: 'Song' } }) };
+      }
+      if (url.startsWith('/api/v1/acoustics/samples') && method === 'GET') {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            status: 'ok', count: 1,
+            samples: [{ id: 'smp_1', name: 'studio_kw', label: 'positive', metrics: { duration_ms: 950, snr_db: 18.4 } }]
+          })
+        };
+      }
+      if (url === '/api/v1/acoustics/samples' && method === 'POST') {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', sample: { id: 'smp_2', name: body.name, metrics: { sample_rate: 16000, channels: 1, duration_ms: 500 } } }) };
+      }
+      if (url === '/api/v1/acoustics/evaluate' && method === 'POST') {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', evaluation: { recall: 1.0, false_alarms_per_hour: 0.0, own_output_leaks: 0, mean_latency_ms: 120, realtime_factor: 0.15, candidate_score: 96.0, sample_results: [{ sample_id: body.sample_id, detections: 1, scores: [0.61], outcome: 'detected' }] } }) };
+      }
+      if (url === '/api/v1/acoustics/jobs') {
+        if (method === 'POST') return { ok: true, status: 201, json: async () => ({ status: 'ok', job: { job_id: 'job_guided_1', state: 'pending' } }) };
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', active_job: null, aux_supported: false, history: [] }) };
+      }
+      if (url === '/api/v1/acoustics/sessions') return { ok: true, status: 200, json: async () => ({ status: 'ok', session: null }) };
+      throw new Error('Unexpected mock url: ' + url);
+    }
     assert.equal(url, '/api/v1/acoustics');
     calls.push({method:options.method || 'GET',body:options.body});
     if (options.method === 'POST') {
@@ -250,6 +302,57 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
       assert.equal(get('band-erle-full').textContent, '+29.4 дБ');
       assert.equal(get('aec-enabled-toggle').disabled, false);
       assert.equal(get('aec-enabled-toggle').checked, true);
+    } else if (input.case === 'profiles_cue_volume_upload') {
+      context.initAcousticLab(); await settle();
+      const get = id => document.getElementById(id);
+      assert.equal(get('room-profiles-select').children.length, 3);
+      assert.ok(get('active-profile-badge').textContent.includes('Холл 2м'));
+      assert.equal(get('profiles-list-summary').children.length, 2);
+      assert.equal(get('acoustic-volume-label').textContent, '1 (Soloist 42%)');
+      assert.equal(get('volume-lease-note').textContent, 'Лимит сессии: ≤ 70%');
+      assert.ok(get('soloist-state-badge').textContent.includes('paused'));
+
+      get('acoustic-volume-slider').value = '3';
+      await get('apply-volume-btn').click();
+      await settle();
+      assert.ok(calls.some(c => c.url === '/api/v1/acoustics/volume' && c.method === 'POST' && c.body.level === 3));
+
+      await get('play-cue-btn').click();
+      await settle();
+      assert.ok(calls.some(c => c.url === '/api/v1/acoustics/cue' && c.method === 'POST' && c.body.kind === 'ready'));
+      assert.ok(get('cue-status-text').textContent.includes('180 мс'));
+
+      await get('soloist-play-btn').click();
+      await settle();
+      assert.ok(calls.some(c => c.url === '/api/v1/acoustics/reference_playback' && c.method === 'POST' && c.body.action === 'play'));
+
+      get('upload-sample-file').files = [{ name: 'studio.wav', arrayBuffer: async () => new Uint8Array([82, 73, 70, 70]).buffer }];
+      get('upload-sample-label').value = 'positive';
+      await get('upload-sample-btn').click();
+      await settle();
+      const uploadCall = calls.find(c => c.url === '/api/v1/acoustics/samples' && c.method === 'POST');
+      assert.ok(uploadCall);
+      assert.equal(uploadCall.body.auto_convert, true);
+      assert.equal(uploadCall.body.name, 'studio');
+
+      const firstRow = get('samples-list-container').children[0];
+      const evalBtn = firstRow.children[1].children[2];
+      await evalBtn.click();
+      await settle();
+      const evalCall = calls.find(c => c.url === '/api/v1/acoustics/evaluate' && c.method === 'POST');
+      assert.ok(evalCall);
+      assert.equal(evalCall.body.sample_id, 'smp_1');
+      assert.equal(get('eval-recall').textContent, '100.0%');
+
+      get('job-stimulus-signal').value = 'guided_phrase';
+      await get('job-stimulus-signal').fire('change');
+      await get('start-job-btn').click();
+      await settle();
+      const jobCall = calls.find(c => c.url === '/api/v1/acoustics/jobs' && c.method === 'POST');
+      assert.ok(jobCall);
+      assert.equal(jobCall.body.cue_before, true);
+      assert.equal(jobCall.body.cue_after, true);
+      assert.equal(jobCall.body.stimulus.type, 'silence');
     } else throw new Error('Unknown case');
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });
@@ -333,6 +436,9 @@ class AcousticUiTests(unittest.TestCase):
 
     def test_aec_telemetry_rendering(self):
         self.run_case("aec_telemetry")
+
+    def test_profiles_cue_volume_upload_and_guided_job(self):
+        self.run_case("profiles_cue_volume_upload")
 
 
 if __name__ == "__main__":

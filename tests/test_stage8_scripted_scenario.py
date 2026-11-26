@@ -125,6 +125,15 @@ class StatefulAcousticHandler(http.server.BaseHTTPRequestHandler):
                     "/jobs/{id}/cancel": {"post": {"operationId": "cancel_acoustic_job"}},
                     "/evaluate": {"post": {"operationId": "evaluate_acoustic_candidate"}},
                     "/search": {"post": {"operationId": "search_acoustic_candidates"}},
+                    "/cue": {"post": {"operationId": "play_acoustic_cue"}},
+                    "/volume": {
+                        "get": {"operationId": "get_speaker_volume"},
+                        "post": {"operationId": "set_speaker_volume"},
+                    },
+                    "/reference_playback": {
+                        "get": {"operationId": "get_reference_playback"},
+                        "post": {"operationId": "control_reference_playback"},
+                    },
                 },
             }
             self._send_json(200, spec)
@@ -451,6 +460,8 @@ class TestStage8AcousticScenarioAndDrift(unittest.TestCase):
             "list_samples",
             "upload_sample",
             "delete_sample",
+            # Composite MCP wrapper around POST /jobs with cue_before/cue_after
+            "prompt_and_capture_phrase",
         })
 
         mcp_tools = {t["name"] for t in mcp_acoustic_agent.TOOLS}

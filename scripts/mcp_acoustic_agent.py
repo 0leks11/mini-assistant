@@ -227,6 +227,7 @@ class GptMiniAcousticClient:
         wav_bytes: Optional[bytes] = None,
         interval: Optional[Dict[str, int]] = None,
         notes: Optional[str] = None,
+        auto_convert: bool = False,
     ) -> Dict[str, Any]:
         if wav_bytes is not None:
             wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
@@ -246,6 +247,8 @@ class GptMiniAcousticClient:
             payload["interval"] = interval
         if notes:
             payload["notes"] = notes
+        if auto_convert:
+            payload["auto_convert"] = True
         return self._request("POST", "/api/v1/acoustics/samples", data=payload)
 
     def update_sample(
@@ -289,6 +292,8 @@ class GptMiniAcousticClient:
         volume_pct: int = 40,
         name: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        cue_before: bool = False,
+        cue_after: bool = False,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "stimulus_origin": stimulus_origin,
@@ -300,6 +305,10 @@ class GptMiniAcousticClient:
         }
         if name is not None:
             payload["name"] = name
+        if cue_before:
+            payload["cue_before"] = True
+        if cue_after:
+            payload["cue_after"] = True
         headers = {}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
@@ -327,11 +336,86 @@ class GptMiniAcousticClient:
         self,
         settings: Optional[Dict[str, Any]] = None,
         split: str = "calibration",
+        sample_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"split": split}
         if settings is not None:
             payload["settings"] = settings
+        if sample_id is not None:
+            payload["sample_id"] = sample_id
         return self._request("POST", "/api/v1/acoustics/evaluate", data=payload)
+
+    def play_acoustic_cue(
+        self,
+        kind: str = "ready",
+        freq_hz: Optional[float] = None,
+        duration_ms: Optional[int] = None,
+        volume_dbfs: Optional[float] = None,
+        volume_pct: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"kind": kind}
+        if freq_hz is not None:
+            payload["freq_hz"] = freq_hz
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if volume_dbfs is not None:
+            payload["volume_dbfs"] = volume_dbfs
+        if volume_pct is not None:
+            payload["volume_pct"] = volume_pct
+        return self._request("POST", "/api/v1/acoustics/cue", data=payload)
+
+    def prompt_and_capture_phrase(
+        self,
+        duration_ms: int = 3500,
+        pre_roll_ms: int = 300,
+        post_roll_ms: int = 400,
+        volume_pct: int = 40,
+        name: Optional[str] = None,
+        cue_before: bool = True,
+        cue_after: bool = True,
+    ) -> Dict[str, Any]:
+        return self.start_acoustic_job(
+            stimulus_origin="external_user_position",
+            output_route="none",
+            stimulus={"type": "silence", "duration_ms": duration_ms},
+            pre_roll_ms=pre_roll_ms,
+            post_roll_ms=post_roll_ms,
+            volume_pct=volume_pct,
+            name=name or "guided_user_phrase",
+            cue_before=cue_before,
+            cue_after=cue_after,
+        )
+
+    def get_speaker_volume(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/acoustics/volume")
+
+    def set_speaker_volume(
+        self,
+        level: Optional[int] = None,
+        soloist_pct: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if level is not None:
+            payload["level"] = level
+        if soloist_pct is not None:
+            payload["soloist_pct"] = soloist_pct
+        return self._request("POST", "/api/v1/acoustics/volume", data=payload)
+
+    def control_reference_playback(
+        self,
+        action: str = "status",
+        uri: Optional[str] = None,
+        volume_pct: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        act = (action or "status").strip().lower()
+        if act == "status":
+            return self._request("GET", "/api/v1/acoustics/reference_playback")
+        payload: Dict[str, Any] = {"action": act}
+        if uri is not None:
+            payload["uri"] = uri
+        if volume_pct is not None:
+            payload["volume_pct"] = volume_pct
+        return self._request("POST", "/api/v1/acoustics/reference_playback", data=payload)
 
     def search_acoustic_candidates(
         self,
@@ -690,6 +774,7 @@ TOOLS = [
                 "label": {"type": "string", "enum": ["positive", "negative", "own_output", "ambient"], "description": "Sample classification label"},
                 "split": {"type": "string", "enum": ["train", "calibration", "held_out"], "description": "Target dataset split (held-out is strictly isolated from training)"},
                 "wav_base64_or_path": {"type": "string", "description": "Base64-encoded WAV audio data or local file path to WAV file"},
+                "auto_convert": {"type": "boolean", "description": "Auto-convert stereo/other sample rates or float32 WAV to 16kHz mono PCM16"},
                 "interval": {
                     "type": "object",
                     "properties": {
@@ -780,7 +865,7 @@ TOOLS = [
                 },
                 "stimulus": {
                     "type": "object",
-                    "description": "Stimulus signal: sample ({type: 'sample', sample_id: '...'}), chirp_sweep ({type: 'chirp_sweep', start_hz: 200, end_hz: 2000, duration_ms: 1000, volume_dbfs: -12.0}), or silence ({type: 'silence', duration_ms: 1000})",
+                    "description": "Stimulus signal: sample ({type: 'sample', sample_id: '...'}), chirp_sweep ({type: 'chirp_sweep', start_hz: 200, end_hz: 2000, duration_ms: 1000, volume_dbfs: -12.0}), tone_beep ({type: 'tone_beep', freq_hz: 880, duration_ms: 180, volume_dbfs: -14.0}), or silence ({type: 'silence', duration_ms: 1000})",
                 },
                 "pre_roll_ms": {
                     "type": "integer",
@@ -793,6 +878,14 @@ TOOLS = [
                 "volume_pct": {
                     "type": "integer",
                     "description": "Volume percentage for playback (0-80%, default 40)",
+                },
+                "cue_before": {
+                    "type": "boolean",
+                    "description": "Play an audible ready beep before microphone capture opens for user phrase",
+                },
+                "cue_after": {
+                    "type": "boolean",
+                    "description": "Play an audible completion double-beep after capture finishes",
                 },
                 "name": {
                     "type": "string",
@@ -869,6 +962,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["calibration", "train", "held_out"],
                     "description": "Corpus split to evaluate against (default: calibration)",
+                },
+                "sample_id": {
+                    "type": "string",
+                    "description": "Optional single sample ID to evaluate directly instead of a whole split",
                 },
             },
             "additionalProperties": False,
@@ -1029,6 +1126,80 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "play_acoustic_cue",
+        "description": "Play an audible tone cue on GPT Mini speaker to signal user readiness or confirmation (kind: ready|ack|double_beep|tone).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["ready", "ack", "double_beep", "tone"],
+                    "description": "Cue pattern (default: ready)",
+                },
+                "freq_hz": {"type": "number", "description": "Optional tone frequency in Hz (200-4000)"},
+                "duration_ms": {"type": "integer", "description": "Optional single beep duration in ms (40-1500)"},
+                "volume_dbfs": {"type": "number", "description": "Optional signal gain in dBFS (-40..-6)"},
+                "volume_pct": {"type": "integer", "description": "Optional speaker output percentage (0-100, clamped by lease)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "prompt_and_capture_phrase",
+        "description": "Play a ready beep on GPT Mini, capture user speech for duration_ms via synchronized recording job, and play an acknowledgment double-beep when finished.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "duration_ms": {"type": "integer", "description": "Capture window duration in ms (500-10000, default 3500)"},
+                "pre_roll_ms": {"type": "integer", "description": "Pre-roll capture ms (default 300)"},
+                "post_roll_ms": {"type": "integer", "description": "Post-roll tail capture ms (default 400)"},
+                "volume_pct": {"type": "integer", "description": "Cue volume percentage (default 40)"},
+                "name": {"type": "string", "description": "Optional friendly recording job name"},
+                "cue_before": {"type": "boolean", "description": "Play ready beep before capture (default true)"},
+                "cue_after": {"type": "boolean", "description": "Play double-beep after capture (default true)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_speaker_volume",
+        "description": "Read current GPT Mini master speaker volume (0-10), mapped Soloist %, live Soloist %, ducking status, and lease max_volume_pct cap.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_speaker_volume",
+        "description": "Set GPT Mini master speaker volume (0-10) and/or Spotify Soloist volume percent (0-100), clamped by active calibration lease.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Master speaker level (0-10)"},
+                "soloist_pct": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Soloist playback volume % (0-100)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "control_reference_playback",
+        "description": "Query or control Spotify Soloist reference playback on KRK/AUX (status, play, resume, pause, next, prev, volume), respecting calibration lease max_volume_pct.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "play", "resume", "pause", "next", "prev", "previous", "volume"],
+                    "description": "Playback action (default: status)",
+                },
+                "uri": {"type": "string", "description": "Optional Spotify track/playlist URI for play"},
+                "volume_pct": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Optional Soloist volume % (clamped by lease)"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -1147,6 +1318,7 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
                 wav_base64_or_path=wav_arg,
                 interval=args.get("interval"),
                 notes=args.get("notes"),
+                auto_convert=bool(args.get("auto_convert", False)),
             )
         elif tool_name == "update_sample":
             result = client.update_sample(
@@ -1173,6 +1345,8 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
                 volume_pct=args.get("volume_pct", 40),
                 name=args.get("name"),
                 idempotency_key=args.get("idempotency_key"),
+                cue_before=bool(args.get("cue_before", False)),
+                cue_after=bool(args.get("cue_after", False)),
             )
         elif tool_name == "get_acoustic_job":
             result = client.get_acoustic_job(job_id=args.get("job_id", ""))
@@ -1189,6 +1363,7 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             result = client.evaluate_acoustic_candidate(
                 settings=args.get("settings"),
                 split=args.get("split", "calibration"),
+                sample_id=args.get("sample_id"),
             )
         elif tool_name == "search_acoustic_candidates":
             result = client.search_acoustic_candidates(
@@ -1232,6 +1407,37 @@ def handle_request(client: GptMiniAcousticClient, req: Dict[str, Any]) -> None:
             )
         elif tool_name == "cancel_acoustic_session":
             result = client.cancel_acoustic_session(session_id=args.get("session_id", ""))
+        elif tool_name == "play_acoustic_cue":
+            result = client.play_acoustic_cue(
+                kind=args.get("kind", "ready"),
+                freq_hz=args.get("freq_hz"),
+                duration_ms=args.get("duration_ms"),
+                volume_dbfs=args.get("volume_dbfs"),
+                volume_pct=args.get("volume_pct"),
+            )
+        elif tool_name == "prompt_and_capture_phrase":
+            result = client.prompt_and_capture_phrase(
+                duration_ms=args.get("duration_ms", 3500),
+                pre_roll_ms=args.get("pre_roll_ms", 300),
+                post_roll_ms=args.get("post_roll_ms", 400),
+                volume_pct=args.get("volume_pct", 40),
+                name=args.get("name"),
+                cue_before=bool(args.get("cue_before", True)),
+                cue_after=bool(args.get("cue_after", True)),
+            )
+        elif tool_name == "get_speaker_volume":
+            result = client.get_speaker_volume()
+        elif tool_name == "set_speaker_volume":
+            result = client.set_speaker_volume(
+                level=args.get("level"),
+                soloist_pct=args.get("soloist_pct"),
+            )
+        elif tool_name == "control_reference_playback":
+            result = client.control_reference_playback(
+                action=args.get("action", "status"),
+                uri=args.get("uri"),
+                volume_pct=args.get("volume_pct"),
+            )
         else:
             send_response(
                 {

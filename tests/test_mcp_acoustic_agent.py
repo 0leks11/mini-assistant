@@ -125,6 +125,11 @@ class TestMcpAcousticAgent(unittest.TestCase):
         self.assertIn("get_acoustic_job_report", tool_names)
         self.assertIn("evaluate_acoustic_candidate", tool_names)
         self.assertIn("search_acoustic_candidates", tool_names)
+        self.assertIn("play_acoustic_cue", tool_names)
+        self.assertIn("prompt_and_capture_phrase", tool_names)
+        self.assertIn("get_speaker_volume", tool_names)
+        self.assertIn("set_speaker_volume", tool_names)
+        self.assertIn("control_reference_playback", tool_names)
 
         # 3. Call get_acoustic_status
         proc.stdin.write(
@@ -277,6 +282,141 @@ class TestMcpAcousticAgent(unittest.TestCase):
         resp9 = json.loads(proc.stdout.readline())
         self.assertEqual(resp9["id"], 9)
         self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/search")
+
+        # 10. Call play_acoustic_cue
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "play_acoustic_cue",
+                        "arguments": {"kind": "ready", "volume_pct": 40},
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp10 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp10["id"], 10)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/cue")
+        self.assertIn('"kind": "ready"', self.mock_server.last_body)
+
+        # 11. Call prompt_and_capture_phrase
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "prompt_and_capture_phrase",
+                        "arguments": {"duration_ms": 2500, "name": "guided_marker_1"},
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp11 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp11["id"], 11)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/jobs")
+        self.assertIn('"cue_before": true', self.mock_server.last_body)
+        self.assertIn('"cue_after": true', self.mock_server.last_body)
+
+        # 12. Call get_speaker_volume & set_speaker_volume
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "tools/call",
+                    "params": {"name": "get_speaker_volume", "arguments": {}},
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp12 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp12["id"], 12)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/volume")
+
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 13,
+                    "method": "tools/call",
+                    "params": {"name": "set_speaker_volume", "arguments": {"level": 2}},
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp13 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp13["id"], 13)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/volume")
+        self.assertIn('"level": 2', self.mock_server.last_body)
+
+        # 14. Call control_reference_playback (status GET & play POST)
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 14,
+                    "method": "tools/call",
+                    "params": {"name": "control_reference_playback", "arguments": {"action": "status"}},
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp14 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp14["id"], 14)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/reference_playback")
+
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 15,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "control_reference_playback",
+                        "arguments": {"action": "play", "volume_pct": 42},
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp15 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp15["id"], 15)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/reference_playback")
+        self.assertIn('"action": "play"', self.mock_server.last_body)
+
+        # 16. Call evaluate_acoustic_candidate targeting single sample_id
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 16,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "evaluate_acoustic_candidate",
+                        "arguments": {"sample_id": "smp_unit_1"},
+                    },
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        resp16 = json.loads(proc.stdout.readline())
+        self.assertEqual(resp16["id"], 16)
+        self.assertEqual(self.mock_server.last_path, "/api/v1/acoustics/evaluate")
+        self.assertIn('"sample_id": "smp_unit_1"', self.mock_server.last_body)
 
         # Clean shutdown
         proc.stdin.close()

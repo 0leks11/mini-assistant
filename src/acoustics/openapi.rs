@@ -295,6 +295,37 @@ pub fn generate_openapi_spec() -> Value {
                     "operationId": "search_acoustic_candidates",
                     "responses": { "200": { "description": "Ranked candidates report" } }
                 }
+            },
+            "/cue": {
+                "post": {
+                    "summary": "Play an audible ready/ack/custom tone cue on GPT Mini built-in speaker",
+                    "operationId": "play_acoustic_cue",
+                    "responses": { "200": { "description": "Cue played" }, "409": { "description": "Active job running" } }
+                }
+            },
+            "/volume": {
+                "get": {
+                    "summary": "Get current master speaker volume level (0-10) and Soloist percent",
+                    "operationId": "get_speaker_volume",
+                    "responses": { "200": { "description": "Current volume state" } }
+                },
+                "post": {
+                    "summary": "Set master speaker volume level (0-10) or Soloist percent (bounded by calibration lease)",
+                    "operationId": "set_speaker_volume",
+                    "responses": { "200": { "description": "Updated volume state" } }
+                }
+            },
+            "/reference_playback": {
+                "get": {
+                    "summary": "Get Spotify Soloist reference playback status",
+                    "operationId": "get_reference_playback",
+                    "responses": { "200": { "description": "Soloist playback status" } }
+                },
+                "post": {
+                    "summary": "Control Spotify Soloist reference playback (play/pause/next/prev/volume)",
+                    "operationId": "control_reference_playback",
+                    "responses": { "200": { "description": "Updated playback status" } }
+                }
             }
         },
         "components": {
@@ -327,7 +358,8 @@ pub fn generate_openapi_spec() -> Value {
                         "name": { "type": "string" },
                         "label": { "type": "string", "enum": ["positive", "negative", "own_output", "ambient"] },
                         "split": { "type": "string", "enum": ["calibration", "train", "held_out"] },
-                        "wav_base64": { "type": "string" }
+                        "wav_base64": { "type": "string" },
+                        "auto_convert": { "type": "boolean" }
                     }
                 },
                 "CreateJobDto": {
@@ -338,7 +370,9 @@ pub fn generate_openapi_spec() -> Value {
                         "stimulus_origin": { "type": "string", "enum": ["external_user_position", "own_output", "ambient"] },
                         "output_route": { "type": "string", "enum": ["built_in", "aux_out", "none"] },
                         "stimulus": { "type": "object" },
-                        "volume_pct": { "type": "integer", "minimum": 0, "maximum": 100 }
+                        "volume_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
+                        "cue_before": { "type": "boolean" },
+                        "cue_after": { "type": "boolean" }
                     }
                 },
                 "CreateSessionDto": {

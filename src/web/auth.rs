@@ -227,6 +227,18 @@ impl AuthManager {
         }
     }
 
+    /// Returns calibration lease maximum volume ceiling (%) for Calibration tokens, or `None` for Owner.
+    pub fn max_volume_pct(&self, identity: &RequestIdentity) -> Option<u8> {
+        match identity {
+            RequestIdentity::Calibration { token, .. } => {
+                let tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+                tokens.get(token).map(|c| c.lease.max_volume_pct)
+            }
+            RequestIdentity::Owner => None,
+            RequestIdentity::Anonymous => Some(0),
+        }
+    }
+
     /// Check if a request with given identity is allowed to access the specified endpoint.
     pub fn authorize_route(
         &self,
@@ -281,6 +293,10 @@ impl AuthManager {
                     | "/api/v1/calibration/events"
                     | "/api/v1/acoustics/aec"
                     | "/api/v1/calibration/aec"
+                    | "/api/v1/acoustics/volume"
+                    | "/api/v1/calibration/volume"
+                    | "/api/v1/acoustics/reference_playback"
+                    | "/api/v1/calibration/reference_playback"
             );
 
         if is_acoustic_read {
@@ -315,10 +331,26 @@ impl AuthManager {
                     | "/api/v1/calibration/test_session"
                     | "/api/v1/acoustics/aec"
                     | "/api/v1/calibration/aec"
+                    | "/api/v1/acoustics/cue"
+                    | "/api/v1/calibration/cue"
+                    | "/api/v1/acoustics/volume"
+                    | "/api/v1/calibration/volume"
+                    | "/api/v1/acoustics/reference_playback"
+                    | "/api/v1/calibration/reference_playback"
             );
 
         if is_acoustic_write {
-            if identity.has_scope(Scope::AcousticsWrite) {
+            if identity.has_scope(Scope::AcousticsWrite)
+                || (matches!(
+                    path,
+                    "/api/v1/acoustics/cue"
+                        | "/api/v1/calibration/cue"
+                        | "/api/v1/acoustics/volume"
+                        | "/api/v1/calibration/volume"
+                        | "/api/v1/acoustics/reference_playback"
+                        | "/api/v1/calibration/reference_playback"
+                ) && identity.has_scope(Scope::Jobs))
+            {
                 return Ok(());
             }
             if matches!(identity, RequestIdentity::Anonymous) {
@@ -834,5 +866,50 @@ mod tests {
                 .unwrap_err(),
             AuthError::LeaseRevoked
         );
+    }
+
+    #[test]
+    fn test_cue_volume_and_reference_playback_authorization() {
+        let auth = AuthManager::new(Some("owner_tok".to_string()));
+        let mut lease = create_test_lease(5);
+        lease.max_volume_pct = 45;
+        let (token, _) = auth.issue_calibration_token(
+            "cue-vol-agent".to_string(),
+            Duration::from_secs(3600),
+            Scope::all(),
+            lease,
+        );
+        let cal_ident = auth
+            .authenticate(Some(&format!("Bearer {token}")), false)
+            .unwrap();
+        let anon_ident = RequestIdentity::Anonymous;
+        let owner_ident = RequestIdentity::Owner;
+
+        assert_eq!(auth.max_volume_pct(&cal_ident), Some(45));
+        assert_eq!(auth.max_volume_pct(&owner_ident), None);
+        assert_eq!(auth.max_volume_pct(&anon_ident), Some(0));
+
+        for (method, path) in [
+            ("POST", "/api/v1/acoustics/cue"),
+            ("GET", "/api/v1/acoustics/volume"),
+            ("POST", "/api/v1/acoustics/volume"),
+            ("GET", "/api/v1/acoustics/reference_playback"),
+            ("POST", "/api/v1/acoustics/reference_playback"),
+            ("POST", "/api/v1/calibration/cue"),
+            ("POST", "/api/v1/calibration/volume"),
+        ] {
+            assert!(
+                auth.authorize_route(&cal_ident, method, path).is_ok(),
+                "cal_ident should be allowed on {method} {path}"
+            );
+            assert_eq!(
+                auth.authorize_route(&anon_ident, method, path)
+                    .unwrap_err()
+                    .0,
+                "401 Unauthorized",
+                "anon_ident must be rejected on {method} {path}"
+            );
+            assert!(auth.authorize_route(&owner_ident, method, path).is_ok());
+        }
     }
 }

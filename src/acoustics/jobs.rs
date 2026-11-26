@@ -60,9 +60,49 @@ pub enum StimulusSignal {
         duration_ms: u32,
         volume_dbfs: f32,
     },
+    ToneBeep {
+        freq_hz: f32,
+        duration_ms: u32,
+        volume_dbfs: f32,
+    },
     Silence {
         duration_ms: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CueKind {
+    Ready,
+    Ack,
+    DoubleBeep,
+    Tone,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CueRequestDto {
+    #[serde(default = "default_cue_kind")]
+    pub kind: CueKind,
+    #[serde(default)]
+    pub freq_hz: Option<f32>,
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+    #[serde(default)]
+    pub volume_dbfs: Option<f32>,
+    #[serde(default)]
+    pub volume_pct: Option<u8>,
+}
+
+fn default_cue_kind() -> CueKind {
+    CueKind::Ready
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CuePlaybackResult {
+    pub kind: CueKind,
+    pub played_ms: u32,
+    pub volume_pct: u8,
+    pub peak_amplitude: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +129,10 @@ pub struct CreateJobDto {
     pub post_roll_ms: u32,
     #[serde(default = "default_volume")]
     pub volume_pct: u8,
+    #[serde(default)]
+    pub cue_before: bool,
+    #[serde(default)]
+    pub cue_after: bool,
 }
 
 fn default_pre_roll() -> u32 {
@@ -406,6 +450,71 @@ pub fn generate_chirp_pcm(
     out
 }
 
+/// Appends a smooth raised-cosine windowed pure sine tone to `out`.
+fn append_windowed_tone(
+    out: &mut Vec<i16>,
+    freq_hz: f64,
+    duration_ms: u32,
+    linear_amp: f64,
+    sample_rate: u32,
+) {
+    let num_samples = ((sample_rate as f64) * (duration_ms as f64) / 1000.0).round() as usize;
+    if num_samples == 0 {
+        return;
+    }
+    let fade = ((sample_rate as f64) * 0.010)
+        .round()
+        .min((num_samples / 3) as f64) as usize;
+    for i in 0..num_samples {
+        let t = i as f64 / sample_rate as f64;
+        let mut val = (linear_amp * (2.0 * PI * freq_hz * t).sin()).clamp(-32768.0, 32767.0);
+        if i < fade && fade > 0 {
+            val *= 0.5 * (1.0 - (PI * i as f64 / fade as f64).cos());
+        } else if i >= num_samples.saturating_sub(fade) && fade > 0 {
+            let idx = num_samples - 1 - i;
+            val *= 0.5 * (1.0 - (PI * idx as f64 / fade as f64).cos());
+        }
+        out.push(val.round() as i16);
+    }
+}
+
+/// Generates a crisp, click-free acoustic prompt/acknowledgement tone clamped <= -6.0 dBFS.
+pub fn generate_cue_pcm(
+    kind: CueKind,
+    freq_hz: Option<f32>,
+    duration_ms: Option<u32>,
+    volume_dbfs: Option<f32>,
+    sample_rate: u32,
+) -> Vec<i16> {
+    let vol_dbfs = volume_dbfs
+        .unwrap_or(-12.0)
+        .clamp(-40.0, MAX_CHIRP_VOLUME_DBFS);
+    let linear_amp = (10.0_f64.powf(vol_dbfs as f64 / 20.0) * 32767.0).clamp(0.0, 16384.0);
+    let gap_samples = |ms: u32| ((sample_rate as f64) * (ms as f64) / 1000.0).round() as usize;
+    let mut out = Vec::new();
+    match kind {
+        CueKind::Ready => {
+            append_windowed_tone(&mut out, 659.25, 90, linear_amp, sample_rate);
+            out.resize(out.len() + gap_samples(30), 0);
+            append_windowed_tone(&mut out, 880.0, 140, linear_amp, sample_rate);
+        }
+        CueKind::Ack => {
+            append_windowed_tone(&mut out, 1046.5, 110, linear_amp, sample_rate);
+        }
+        CueKind::DoubleBeep => {
+            append_windowed_tone(&mut out, 880.0, 80, linear_amp, sample_rate);
+            out.resize(out.len() + gap_samples(50), 0);
+            append_windowed_tone(&mut out, 880.0, 80, linear_amp, sample_rate);
+        }
+        CueKind::Tone => {
+            let hz = freq_hz.unwrap_or(880.0).clamp(100.0, 6000.0) as f64;
+            let ms = duration_ms.unwrap_or(180).clamp(50, 2000);
+            append_windowed_tone(&mut out, hz, ms, linear_amp, sample_rate);
+        }
+    }
+    out
+}
+
 /// Autonomous Acoustic Job Runner.
 /// Orchestrates capture pre-roll, stimulus emission, playback drain, and post-roll tail.
 pub struct AcousticJobRunner {
@@ -492,6 +601,8 @@ impl AcousticJobRunner {
                     pre_roll_ms: 500,
                     post_roll_ms: 1000,
                     volume_pct: 40,
+                    cue_before: false,
+                    cue_after: false,
                 },
                 playback_started_at_ms: summary.started_at_ms,
                 playback_ended_at_ms: summary.completed_at_ms,
@@ -554,6 +665,51 @@ impl AcousticJobRunner {
                 "No active acoustic job to cancel".into(),
             ))
         }
+    }
+
+    /// Plays a brief bounded cue beep/tone through the built-in playback sink (fails with Conflict if a job is running).
+    pub async fn play_cue(
+        &self,
+        req: &CueRequestDto,
+        lease_max_volume_pct: Option<u8>,
+    ) -> Result<CuePlaybackResult, JobError> {
+        {
+            let guard = self.active_job.lock().unwrap();
+            if let Some(ref current) = *guard {
+                if matches!(
+                    current.summary.state,
+                    JobState::Pending | JobState::Preparing | JobState::Running
+                ) {
+                    return Err(JobError::Conflict(format!(
+                        "Job '{}' is already running",
+                        current.summary.job_id
+                    )));
+                }
+            }
+        }
+        let max_vol = lease_max_volume_pct
+            .unwrap_or(MAX_VOLUME_PCT)
+            .min(MAX_VOLUME_PCT);
+        let vol_pct = req.volume_pct.unwrap_or(45).min(max_vol);
+        let pcm = generate_cue_pcm(
+            req.kind,
+            req.freq_hz,
+            req.duration_ms,
+            req.volume_dbfs,
+            TARGET_SAMPLE_RATE,
+        );
+        let played_ms = ((pcm.len() as f64 / TARGET_SAMPLE_RATE as f64) * 1000.0).round() as u32;
+        let peak_amplitude = pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+        self.playback_sink
+            .play_pcm(&pcm, TARGET_SAMPLE_RATE, OutputRoute::BuiltIn, vol_pct)
+            .await
+            .map_err(|e| JobError::Execution(format!("Cue playback failed: {e}")))?;
+        Ok(CuePlaybackResult {
+            kind: req.kind,
+            played_ms,
+            volume_pct: vol_pct,
+            peak_amplitude,
+        })
     }
 
     /// Starts an acoustic job. Enforces mutual exclusion: fails with 409 Conflict if active.
@@ -627,6 +783,35 @@ impl AcousticJobRunner {
                     *end_hz,
                     *duration_ms,
                     *volume_dbfs,
+                    TARGET_SAMPLE_RATE,
+                )
+            }
+            StimulusSignal::ToneBeep {
+                freq_hz,
+                duration_ms,
+                volume_dbfs,
+            } => {
+                if *freq_hz < 100.0 || *freq_hz > 6000.0 {
+                    return Err(JobError::Validation(
+                        "Tone beep frequency must be within [100.0, 6000.0] Hz".into(),
+                    ));
+                }
+                if *duration_ms < 50 || *duration_ms > 2000 {
+                    return Err(JobError::Validation(
+                        "Tone beep duration must be between 50ms and 2000ms".into(),
+                    ));
+                }
+                if *volume_dbfs > MAX_CHIRP_VOLUME_DBFS {
+                    return Err(JobError::Validation(format!(
+                        "Tone beep volume ({:.1} dBFS) exceeds maximum safe limit ({:.1} dBFS)",
+                        volume_dbfs, MAX_CHIRP_VOLUME_DBFS
+                    )));
+                }
+                generate_cue_pcm(
+                    CueKind::Tone,
+                    Some(*freq_hz),
+                    Some(*duration_ms),
+                    Some(*volume_dbfs),
                     TARGET_SAMPLE_RATE,
                 )
             }
@@ -738,6 +923,24 @@ impl AcousticJobRunner {
         stimulus_samples: Vec<i16>,
     ) {
         let started_ms = now_timestamp_ms();
+
+        // 0. Optional pre-capture ready cue (plays and drains before mic window opens)
+        if dto.cue_before {
+            let cue_pcm = generate_cue_pcm(CueKind::Ready, None, None, None, TARGET_SAMPLE_RATE);
+            let cue_vol = dto.volume_pct.clamp(40, MAX_VOLUME_PCT);
+            if let Err(e) = self
+                .playback_sink
+                .play_pcm(&cue_pcm, TARGET_SAMPLE_RATE, OutputRoute::BuiltIn, cue_vol)
+                .await
+            {
+                warn!(job_id, error = %e, "Pre-capture cue playback warning");
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if self.cancel_flag.load(Ordering::SeqCst) {
+                self.finalize_cancelled(&job_id, "Cancelled after pre-capture cue");
+                return;
+            }
+        }
 
         // 1. Enable test session in AcousticLab (gates KWS from cloud turn, records raw detections)
         self.lab.set_test_session(true);
@@ -889,6 +1092,7 @@ impl AcousticJobRunner {
                 dto.output_route, dto.volume_pct, total_capture_ms
             )),
             wav_base64: None,
+            auto_convert: None,
         };
 
         let stored_sample_id = match self.samples_store.store_sample(sample_dto, &wav_bytes) {
@@ -912,6 +1116,32 @@ impl AcousticJobRunner {
 
         // 9. Reset test session in AcousticLab
         self.lab.set_test_session(false);
+
+        // 9b. Optional post-capture confirmation pip so user hears receipt
+        if dto.cue_after && !self.cancel_flag.load(Ordering::SeqCst) {
+            let heard_audio = captured_metrics
+                .as_ref()
+                .is_some_and(|m| m.rms_level >= 5.0 && !m.is_clipped);
+            let cue_pcm = if heard_audio {
+                generate_cue_pcm(CueKind::Ack, None, None, None, TARGET_SAMPLE_RATE)
+            } else {
+                generate_cue_pcm(
+                    CueKind::Tone,
+                    Some(440.0),
+                    Some(120),
+                    None,
+                    TARGET_SAMPLE_RATE,
+                )
+            };
+            let cue_vol = dto.volume_pct.clamp(40, MAX_VOLUME_PCT);
+            if let Err(e) = self
+                .playback_sink
+                .play_pcm(&cue_pcm, TARGET_SAMPLE_RATE, OutputRoute::BuiltIn, cue_vol)
+                .await
+            {
+                warn!(job_id, error = %e, "Post-capture cue playback warning");
+            }
+        }
 
         // 10. Mark Completed and record into history
         let completed_ms = now_timestamp_ms();
@@ -1040,6 +1270,8 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 100,
             volume_pct: 40,
+            cue_before: false,
+            cue_after: false,
         };
         let err = runner.start_job(aux_dto, None).unwrap_err();
         assert!(matches!(err, JobError::Unsupported(_)));
@@ -1058,6 +1290,8 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 100,
             volume_pct: 30,
+            cue_before: false,
+            cue_after: false,
         };
 
         let summary = runner
@@ -1078,6 +1312,8 @@ mod tests {
             pre_roll_ms: 100,
             post_roll_ms: 100,
             volume_pct: 30,
+            cue_before: false,
+            cue_after: false,
         };
         let conflict_err = runner.start_job(conflict_dto, None).unwrap_err();
         assert!(matches!(conflict_err, JobError::Conflict(_)));
@@ -1111,6 +1347,8 @@ mod tests {
             pre_roll_ms: 500,
             post_roll_ms: 500,
             volume_pct: 0,
+            cue_before: false,
+            cue_after: false,
         };
 
         let summary = runner.start_job(job_dto, None).unwrap();
@@ -1123,6 +1361,58 @@ mod tests {
             cancelled.error.as_deref(),
             Some("Interrupted by user action")
         );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn test_play_cue_and_guided_capture_with_cues() {
+        let temp = std::env::temp_dir().join(format!("test_cue_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp);
+        let samples_store = Arc::new(SamplesStore::new(temp.clone()).unwrap());
+        let (lab, _rx) = AcousticLab::new(WakewordCalibrationConfig::default());
+        let sink = Arc::new(MockPlaybackSink::new(false));
+        let runner = AcousticJobRunner::new(samples_store, lab, None, sink.clone());
+
+        // 1. Standalone ready cue respects lease cap (max_volume_pct = 30)
+        let cue_res = runner
+            .play_cue(
+                &CueRequestDto {
+                    kind: CueKind::Ready,
+                    freq_hz: None,
+                    duration_ms: None,
+                    volume_dbfs: Some(-10.0),
+                    volume_pct: Some(75),
+                },
+                Some(30),
+            )
+            .await
+            .expect("play_cue must succeed");
+        assert_eq!(cue_res.volume_pct, 30);
+        assert!(cue_res.played_ms >= 240);
+        assert!(cue_res.peak_amplitude > 0 && cue_res.peak_amplitude <= 16384);
+
+        // 2. Guided job with cue_before + cue_after plays cue before & fallback after
+        let dto = CreateJobDto {
+            name: Some("guided_user_phrase".into()),
+            stimulus_origin: StimulusOrigin::ExternalUserPosition,
+            output_route: OutputRoute::None,
+            stimulus: StimulusSignal::Silence { duration_ms: 150 },
+            pre_roll_ms: 100,
+            post_roll_ms: 100,
+            volume_pct: 40,
+            cue_before: true,
+            cue_after: true,
+        };
+        runner.start_job(dto, None).expect("start guided job");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let records = sink.played_records();
+        // 1 from standalone play_cue + 2 from cue_before/cue_after
+        assert_eq!(
+            records.len(),
+            3,
+            "Expected standalone + before + after cues: {records:?}"
+        );
+        assert_eq!(runner.snapshot().history[0].state, JobState::Completed);
         let _ = std::fs::remove_dir_all(&temp);
     }
 }
