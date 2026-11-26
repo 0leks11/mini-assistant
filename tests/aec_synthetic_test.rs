@@ -384,3 +384,125 @@ fn test_aec_realistic_low_coupling_double_talk() {
         "Near-end 2m voice must be preserved without RES attenuation (rms={preserved_rms:.1})"
     );
 }
+
+#[test]
+fn test_aec_no_divergence_on_idle_then_speech_and_soft_tts_fade() {
+    let config = AecConfig {
+        enabled: true,
+        bulk_delay_samples: 16,
+        ..Default::default()
+    };
+    let mut aec = AecProcessor::new(config);
+    let mut out = vec![0i16; BLOCK_SIZE];
+
+    // 1. 700 silent idle blocks must neither consume warmup nor destabilize state
+    let silence_ref = vec![0i16; BLOCK_SIZE];
+    let ambient_mic = vec![2i16; BLOCK_SIZE];
+    for _ in 0..700 {
+        aec.process_frame(&ambient_mic, &silence_ref, &mut out);
+        assert_eq!(out, ambient_mic);
+    }
+
+    // 2. Near-end speech active while soft TTS ref fades in slowly
+    let total_samples = 16000 * 4;
+    let mut mic_pcm = vec![2i16; total_samples];
+    let mut ref_pcm = vec![0i16; total_samples];
+    for i in 0..total_samples {
+        let t = i as f32 / 16000.0;
+        let near = if t < 1.8 {
+            (130.0 * (2.0 * PI * 220.0 * t).sin() + 100.0 * (2.0 * PI * 440.0 * t).sin()) as i16
+        } else {
+            0
+        };
+        let ref_s = if (0.2..3.2).contains(&t) {
+            let ramp = ((t - 0.2) / 0.25).min(1.0);
+            ramp * 650.0 * ((2.0 * PI * 190.0 * t).sin() + 0.5 * (2.0 * PI * 530.0 * t).sin())
+        } else {
+            0.0
+        };
+        ref_pcm[i] = ref_s as i16;
+        let echo = if i >= 16 {
+            (0.05 * ref_pcm[i - 16] as f32) as i16
+        } else {
+            0
+        };
+        mic_pcm[i] = mic_pcm[i].saturating_add(near).saturating_add(echo);
+    }
+
+    let mut worst_erle = 999.0f32;
+    let mut max_out_rms = 0.0f32;
+    for b in 0..(total_samples / BLOCK_SIZE) {
+        let s = b * BLOCK_SIZE;
+        let e = s + BLOCK_SIZE;
+        aec.process_frame(&mic_pcm[s..e], &ref_pcm[s..e], &mut out);
+        let rms = (out
+            .iter()
+            .map(|&v| f32::from(v) * f32::from(v))
+            .sum::<f32>()
+            / BLOCK_SIZE as f32)
+            .sqrt();
+        max_out_rms = max_out_rms.max(rms);
+        worst_erle = worst_erle.min(aec.get_metrics().erle_db);
+    }
+
+    assert!(
+        worst_erle >= -2.5,
+        "AEC must never suffer sustained divergence during speech + TTS ramp (worst_erle={worst_erle:.2} dB)"
+    );
+    assert!(
+        max_out_rms < 250.0,
+        "Output RMS must not blow up past user voice level (max_out_rms={max_out_rms:.1})"
+    );
+}
+
+#[test]
+fn test_aec_recovers_after_sudden_path_collapse_and_inversion() {
+    let delay_samples = 16;
+    let config = AecConfig {
+        enabled: true,
+        bulk_delay_samples: delay_samples,
+        ..Default::default()
+    };
+    let mut aec = AecProcessor::new(config);
+    let total_samples = 16000 * 6;
+    let mut ref_pcm = Vec::with_capacity(total_samples);
+    for i in 0..total_samples {
+        let t = i as f32 / 16000.0;
+        let s = 3200.0
+            * ((2.0 * PI * 250.0 * t).sin()
+                + 0.6 * (2.0 * PI * 610.0 * t).sin()
+                + 0.4 * (2.0 * PI * 1450.0 * t).sin()
+                + 0.3 * (2.0 * PI * 2700.0 * t).sin());
+        ref_pcm.push(s as i16);
+    }
+
+    // Converge on strong room coupling (0.4x) for 2s, then collapse & invert (-0.05x) for 4s
+    let mut mic_pcm = vec![0i16; total_samples];
+    for i in delay_samples..total_samples {
+        let gain = if i < 16000 * 2 { 0.40 } else { -0.05 };
+        mic_pcm[i] = (gain * ref_pcm[i - delay_samples] as f32) as i16;
+    }
+
+    let mut out = vec![0i16; BLOCK_SIZE];
+    let mut late_mic_energy = 0.0f64;
+    let mut late_err_energy = 0.0f64;
+    let num_blocks = total_samples / BLOCK_SIZE;
+
+    for b in 0..num_blocks {
+        let s = b * BLOCK_SIZE;
+        let e = s + BLOCK_SIZE;
+        aec.process_frame(&mic_pcm[s..e], &ref_pcm[s..e], &mut out);
+        if b >= num_blocks - 40 {
+            for i in 0..BLOCK_SIZE {
+                late_mic_energy += f64::from(mic_pcm[s + i]).powi(2);
+                late_err_energy += f64::from(out[i]).powi(2);
+            }
+        }
+    }
+
+    let recovery_erle = 10.0 * (late_mic_energy / late_err_energy.max(1.0)).log10();
+    assert!(
+        recovery_erle >= 15.0,
+        "AEC must recover and re-converge after sudden coupling collapse/inversion (got {recovery_erle:.2} dB)"
+    );
+}

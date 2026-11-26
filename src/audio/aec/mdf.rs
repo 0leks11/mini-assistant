@@ -60,6 +60,7 @@ pub struct PartitionedMdfFilter {
     coupling_gain_sq: f32,
     adapted_blocks: usize,
     dt_streak: usize,
+    diverge_streak: usize,
     last_double_talk: bool,
     // Compact 32-band (0..8 kHz) & 6-band ERLE live telemetry (EMA smoothed, zero extra FFTs)
     band_before_pwr: [f32; 6],
@@ -99,6 +100,7 @@ impl PartitionedMdfFilter {
             coupling_gain_sq: 1.0,
             adapted_blocks: 0,
             dt_streak: 0,
+            diverge_streak: 0,
             last_double_talk: false,
             band_before_pwr: [1e-12; 6],
             band_after_pwr: [1e-12; 6],
@@ -181,6 +183,7 @@ impl PartitionedMdfFilter {
         // 8. Subtract estimated echo in time domain: e(n) = y(n) - d_hat[BLOCK_SIZE + n]
         // Overlap-save discards the first N samples; second N samples contain linear convolution result.
         let mut e_linear_energy = 0.0f32;
+        let mut d_hat_energy = 0.0f32;
         for i in 0..BLOCK_SIZE {
             let d_hat = self.fft_in_out[BLOCK_SIZE + i].re * ifft_scale;
             self.d_hat_freq[i] = Complex32::default();
@@ -188,22 +191,52 @@ impl PartitionedMdfFilter {
             let err = mic_block[i] - d_hat;
             out_err_block[i] = err;
             e_linear_energy += err * err;
+            d_hat_energy += d_hat * d_hat;
+        }
+
+        // Preserve bit-exact passthrough and avoid consuming warmup blocks when reference is silent.
+        let has_ref = e_ref > 1e-6;
+        if !has_ref && self.energy_ref <= 1e-6 && d_hat_energy <= 1e-12 {
+            out_err_block.copy_from_slice(mic_block);
+            self.diverge_streak = 0;
+            self.dt_streak = 0;
+            self.last_double_talk = false;
+            self.energy_err = 0.9 * self.energy_err + 0.1 * e_mic;
+            return;
+        }
+
+        // 8b. Anti-divergence guard: if subtraction amplifies energy well above raw mic,
+        // clamp downstream audio back to raw mic immediately and reset diverging filter weights.
+        let is_diverging =
+            e_linear_energy > (e_mic * 2.0 + 2e-5) && d_hat_energy > (e_mic * 0.5 + 2e-5);
+        let severe_divergence =
+            e_linear_energy > (e_mic * 8.0 + 1e-4) && d_hat_energy > (e_mic * 2.0 + 1e-4);
+        let mut reset_weights = false;
+        if is_diverging {
+            self.diverge_streak = self.diverge_streak.saturating_add(1);
+            if severe_divergence || self.diverge_streak >= 4 {
+                reset_weights = true;
+            }
+        } else {
+            self.diverge_streak = 0;
         }
 
         // 9. Double-talk protection:
-        // Compare residual error energy against BOTH coupling-scaled acoustic echo estimate
-        // (handles real Mic/Ref ~ 0.10 without freezing initial convergence) and Geigel ratio.
+        // Compare near-end error (bounded by e_mic so diverged d_hat cannot lock DTD)
+        // against coupling-scaled acoustic echo estimate and Geigel ratio.
         let is_warmup = self.adapted_blocks <= 25;
+        let e_near = e_linear_energy.min(e_mic);
+        let e_near_avg = self.energy_err.min(self.energy_mic);
         let expected_echo_inst = e_ref * self.coupling_gain_sq;
         let expected_echo_avg = self.energy_ref * self.coupling_gain_sq;
-        let dt_acoustic = (e_linear_energy > (expected_echo_inst * 2.0 + 0.003)
-            && e_mic > (expected_echo_inst * 1.8 + 0.003))
-            || (self.energy_err > (expected_echo_avg * 2.0 + 0.004)
-                && self.energy_mic > (expected_echo_avg * 1.8 + 0.004));
-        let dt_geigel = (e_linear_energy > (e_ref * 1.5 + 1e-3)
-            || self.energy_err > (self.energy_ref * 1.5 + 1e-3))
-            && (e_linear_energy > 0.005 || self.energy_err > 0.01);
-        let raw_dt = !is_warmup && (dt_acoustic || dt_geigel);
+        let dt_acoustic = (e_near > (expected_echo_inst * 2.0 + 3e-4)
+            && e_mic > (expected_echo_inst * 1.8 + 3e-4))
+            || (e_near_avg > (expected_echo_avg * 2.0 + 4e-4)
+                && self.energy_mic > (expected_echo_avg * 1.8 + 4e-4));
+        let dt_geigel = (e_near > (e_ref.max(self.energy_ref) * 1.5 + 3e-4)
+            || e_near_avg > (self.energy_ref * 1.5 + 4e-4))
+            && (e_near > 3e-4 || e_near_avg > 5e-4);
+        let raw_dt = has_ref && !is_warmup && (dt_acoustic || dt_geigel);
         let is_double_talk = if raw_dt {
             self.dt_streak = self.dt_streak.saturating_add(1);
             if self.dt_streak > 90 {
@@ -220,9 +253,38 @@ impl PartitionedMdfFilter {
         };
         self.last_double_talk = is_double_talk;
 
-        if !is_double_talk && e_ref > 1e-3 && e_mic > 1e-5 && e_linear_energy < e_mic * 0.35 {
+        if has_ref
+            && !is_double_talk
+            && !is_diverging
+            && e_ref > 1e-3
+            && e_mic > 1e-5
+            && e_linear_energy < e_mic * 0.35
+        {
             let inst_gain_sq = (e_mic / e_ref).clamp(0.002, 2.0);
             self.coupling_gain_sq = 0.9 * self.coupling_gain_sq + 0.1 * inst_gain_sq;
+        }
+
+        if reset_weights {
+            for w_k in &mut self.w_freq {
+                w_k.fill(Complex32::default());
+            }
+            self.d_hat_freq.fill(Complex32::default());
+            self.res.reset();
+            self.diverge_streak = 0;
+            self.dt_streak = 0;
+            self.adapted_blocks = 0;
+            self.coupling_gain_sq = 0.1;
+            self.last_double_talk = false;
+            out_err_block.copy_from_slice(mic_block);
+            self.energy_err = 0.9 * self.energy_err + 0.1 * e_mic;
+            for (i, &val) in mic_block.iter().enumerate().take(BLOCK_SIZE) {
+                self.e_freq[i] = Complex32::default();
+                self.e_freq[BLOCK_SIZE + i] = Complex32::new(val, 0.0);
+            }
+            self.fft
+                .process_with_scratch(&mut self.e_freq, &mut self.scratch);
+            self.update_spectral_telemetry(false, true);
+            return;
         }
 
         // 10. Compute linear error & linear echo spectra in frequency domain: FFT([0_N, x(n)])
@@ -235,24 +297,31 @@ impl PartitionedMdfFilter {
         self.fft
             .process_with_scratch(&mut self.d_hat_freq, &mut self.scratch);
 
-        // 11. Apply Non-linear Residual Echo Suppression (RES Wiener Post-Filter)
-        self.res.apply(
-            &self.e_freq,
-            &self.d_hat_freq,
-            is_double_talk,
-            is_warmup,
-            out_err_block,
-        );
+        if is_diverging {
+            // Protect KWS and upstream speech by passing raw mic through during transitional divergence,
+            // while keeping linear e_freq intact below so NLMS can self-correct before streak reset.
+            out_err_block.copy_from_slice(mic_block);
+            self.energy_err = 0.9 * self.energy_err + 0.1 * e_mic;
+        } else {
+            // 11. Apply Non-linear Residual Echo Suppression (RES Wiener Post-Filter)
+            self.res.apply(
+                &self.e_freq,
+                &self.d_hat_freq,
+                is_double_talk,
+                is_warmup,
+                out_err_block,
+            );
 
-        // 11b. Aggregate 32 display bands (250 Hz/band) & 6 standard bands from linear spectra
-        self.update_spectral_telemetry(is_double_talk, is_warmup);
+            // 11b. Aggregate 32 display bands (250 Hz/band) & 6 standard bands from linear spectra
+            self.update_spectral_telemetry(is_double_talk, is_warmup);
 
-        // 12. Update final error energy for ERLE and telemetry metrics
-        let e_block_energy: f32 = out_err_block.iter().map(|&s| s * s).sum();
-        self.energy_err = 0.9 * self.energy_err + 0.1 * e_block_energy;
+            // 12. Update final error energy for ERLE and telemetry metrics
+            let e_block_energy: f32 = out_err_block.iter().map(|&s| s * s).sum();
+            self.energy_err = 0.9 * self.energy_err + 0.1 * e_block_energy;
+        }
 
         // 13. Weight adaptation (Constrained Partitioned Frequency-Domain LMS):
-        if !is_double_talk {
+        if has_ref && !is_double_talk {
             self.adapted_blocks = self.adapted_blocks.saturating_add(1);
 
             let mu = self.config.step_size;
