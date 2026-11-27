@@ -12,6 +12,7 @@ mod audio;
 pub mod bluetooth;
 pub mod buttons;
 mod config;
+mod credentials;
 mod gemini;
 mod ha;
 mod interaction;
@@ -143,7 +144,8 @@ async fn run_preflight_check(
         .context("Preflight FAIL: Configuration load error")?;
     eprintln!("✅ [OK] Config loaded successfully");
     eprintln!("       Assistant Name: {}", config.assistant.name);
-    let voice = config.voice_settings()?;
+    let cred_store = credentials::CredentialsStore::for_config(config_path);
+    let voice = config.voice_settings_with_store(&cred_store)?;
     let provider = voice.provider;
     eprintln!(
         "       Voice provider: {} ({})",
@@ -385,21 +387,31 @@ async fn main() -> Result<()> {
                 None => start_audio_output(&config.audio, dry_run)?,
             };
 
-            let voice = config.voice_settings()?;
-            let provider = voice.provider;
-            let api_key = match voice.api_key {
-                Some(key) => key,
-                None => {
-                    if alarm_runner.is_some() {
-                        warn!("No provider key configured; continuing with local alarms");
-                        return wait_for_alarm_shutdown().await;
+            let cfg_path_buf = config_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    if std::path::Path::new("config.toml").exists() {
+                        Some(std::path::PathBuf::from("config.toml"))
+                    } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists()
+                    {
+                        Some(std::path::PathBuf::from(
+                            "/data/opt/mini-assistant/config.toml",
+                        ))
+                    } else {
+                        None
                     }
-                    warn!("{} is not configured", provider.key_env());
-                    info!("Waiting for signal (Ctrl-C to stop)...");
-                    tokio::signal::ctrl_c().await?;
-                    return Ok(());
-                }
-            };
+                });
+            let cred_store = credentials::CredentialsStore::for_config(cfg_path_buf.as_deref());
+            let voice = config.voice_settings_with_store(&cred_store)?;
+            let provider = voice.provider;
+            let cloud_api_key = voice.api_key.clone();
+            if cloud_api_key.is_none() {
+                warn!(
+                    "{} is not configured; Web UI :8080 and local services will start in setup mode",
+                    provider.key_env()
+                );
+            }
             info!(
                 "Voice provider: {} (voice: {})",
                 provider.name(),
@@ -465,17 +477,9 @@ async fn main() -> Result<()> {
             let spotify_client_holder =
                 Arc::new(tokio::sync::RwLock::new(None::<spotify::SpotifyApiClient>));
 
-            let spotify_client_id = spotify_cfg
-                .client_id
-                .clone()
-                .or_else(|| std::env::var("SPOTIFY_CLIENT_ID").ok())
-                .unwrap_or_default();
-
-            let spotify_refresh_token = spotify_cfg
-                .refresh_token
-                .clone()
-                .or_else(|| std::env::var("SPOTIFY_REFRESH_TOKEN").ok())
-                .or_else(|| spotify::load_persisted_token(&spotify_cfg.token_file));
+            let (resolved_sp_id, spotify_refresh_token, _sp_label) =
+                cred_store.resolve_spotify_credentials(&spotify_cfg);
+            let spotify_client_id = resolved_sp_id.unwrap_or_default();
 
             if let Some(rt) = spotify_refresh_token {
                 if !spotify_client_id.trim().is_empty() {
@@ -548,21 +552,18 @@ async fn main() -> Result<()> {
             let web_port = spotify_cfg.web_port;
             let srv_client_id = spotify_client_id.clone();
             let srv_redirect_uri = format!("http://10.77.0.111:{}/spotify/callback", web_port);
-            let cfg_path_buf = config_path
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    if std::path::Path::new("config.toml").exists() {
-                        Some(std::path::PathBuf::from("config.toml"))
-                    } else if std::path::Path::new("/data/opt/mini-assistant/config.toml").exists()
-                    {
-                        Some(std::path::PathBuf::from(
-                            "/data/opt/mini-assistant/config.toml",
-                        ))
-                    } else {
-                        None
-                    }
-                });
+            let initial_voice_state = if cloud_api_key.is_some() {
+                credentials::VoiceRuntimeState::new("connecting", None)
+            } else {
+                credentials::VoiceRuntimeState::new(
+                    "needs_auth",
+                    Some(format!(
+                        "Требуется вход или API-ключ для {}",
+                        provider.name()
+                    )),
+                )
+            };
+            let voice_runtime_state = Arc::new(tokio::sync::RwLock::new(initial_voice_state));
             let wakeword_enabled = acoustic_settings.enabled;
             let web_server = web::ControlCenterServer::new(
                 cfg_path_buf,
@@ -573,6 +574,8 @@ async fn main() -> Result<()> {
                 music_ducker.clone(),
             )
             .with_token_path(spotify_cfg.token_file.clone())
+            .with_credentials_store(cred_store.clone())
+            .with_voice_runtime_state(voice_runtime_state.clone())
             .with_initial_led_color(config.assistant.led_color.clone())
             .with_wakeword_support(
                 Some(hardware_recorder.clone()),
@@ -1192,21 +1195,13 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            let (tx_session_status, rx_session_status) =
-                tokio::sync::oneshot::channel::<Arc<std::sync::atomic::AtomicU8>>();
             let shared_session_status = Arc::new(std::sync::atomic::AtomicU8::new(
-                gemini::live_client::SessionStatus::Connecting as u8,
+                if cloud_api_key.is_some() {
+                    gemini::live_client::SessionStatus::Connecting as u8
+                } else {
+                    gemini::live_client::SessionStatus::Stopped as u8
+                },
             ));
-            let status_updater = shared_session_status.clone();
-            tokio::spawn(async move {
-                if let Ok(handle) = rx_session_status.await {
-                    loop {
-                        let val = handle.load(std::sync::atomic::Ordering::SeqCst);
-                        status_updater.store(val, std::sync::atomic::Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            });
             let mic_authorization = authorization.clone();
             let playback_for_mic = playback.clone();
             let alarm_for_mic = alarm_runner.as_ref().map(|runner| runner.player.clone());
@@ -1709,137 +1704,46 @@ async fn main() -> Result<()> {
                 }
             });
 
-            // Startup DNS wait has an overall deadline; it never grants a turn.
-            if !dry_run {
-                let ready = wait_until_ready(std::time::Duration::from_secs(30), || async {
-                    tokio::net::lookup_host(provider.host())
-                        .await
-                        .is_ok_and(|mut addresses| addresses.next().is_some())
-                })
-                .await;
-                if !ready {
-                    warn!("DNS readiness deadline reached; connection may fail and retry");
-                }
-            }
-
-            info!("Connecting to {}", provider.name());
-            let model = voice.model.to_owned();
-            let voice_name = voice.voice.to_owned();
-            let cancellation_epoch = playback.cancellation_epoch_handle();
-            let connection = match provider {
-                VoiceProvider::Gemini => gemini::GeminiLiveClient::connect(
-                    gemini::LiveClientConfig {
-                        api_key,
-                        model,
-                        voice_name,
-                        system_instruction,
-                        has_ha_tools: ha_tools_enabled,
-                        has_weather_tools: weather_tools_enabled,
-                        has_alarm_tools: alarm_tools_enabled,
-                        has_spotify_tools: spotify_tools_enabled,
-                        has_volume_tools: volume_tools_enabled,
-                        has_bluetooth_tools: true,
-                        has_stop_dialogue: any_tools_enabled,
-                        endpoint: None,
-                        cancellation_epoch: Some(cancellation_epoch),
-                        authorization: Some(authorization.clone()),
-                        suppress_followup: Some(suppress_followup.clone()),
-                    },
-                    rx_cloud_mic,
-                    tx_speaker,
-                    any_tools_enabled.then_some(tool_call_tx),
-                    on_interrupted,
-                )
-                .await
-                .map(VoiceClient::Gemini),
-                VoiceProvider::Openai => openai::OpenAiRealtimeClient::connect(
-                    gemini::LiveClientConfig {
-                        api_key,
-                        model,
-                        voice_name,
-                        system_instruction,
-                        has_ha_tools: ha_tools_enabled,
-                        has_weather_tools: weather_tools_enabled,
-                        has_alarm_tools: alarm_tools_enabled,
-                        has_spotify_tools: spotify_tools_enabled,
-                        has_volume_tools: volume_tools_enabled,
-                        has_bluetooth_tools: true,
-                        has_stop_dialogue: any_tools_enabled,
-                        endpoint: None,
-                        cancellation_epoch: Some(cancellation_epoch),
-                        authorization: Some(authorization.clone()),
-                        suppress_followup: Some(suppress_followup.clone()),
-                    },
-                    rx_cloud_mic,
-                    tx_speaker,
-                    any_tools_enabled.then_some(tool_call_tx),
-                    on_interrupted,
-                )
-                .await
-                .map(VoiceClient::Openai),
-            };
-            let mut voice_client = match connection {
-                Ok(client) => client,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to start {}", provider.name()))
-                }
-            };
-            let _ = tx_session_status.send(voice_client.status_handle());
-
-            // 12. Start Audio Capture (direct ALSA hw:0,2 8ch PDM)
+            // 12. Start Audio Capture (direct ALSA hw:0,2 8ch PDM) before cloud connection so
+            // Web UI :8080, Acoustics Lab, and local Wake-Word recording stay live without API keys.
             let mut alsa_capture: Option<audio::AlsaCapture> = None;
+            if dry_run {
+                info!("Dry-run active: skipping hardware microphone capture");
+            } else {
+                info!(
+                    "Initializing microphone capture (backend: {})...",
+                    config.audio.capture_backend
+                );
 
-            let capture_result = async {
-                if dry_run {
-                    info!("Dry-run active: skipping hardware microphone capture");
-                } else {
-                    info!(
-                        "Initializing microphone capture (backend: {})...",
-                        config.audio.capture_backend
-                    );
+                let mic_channel_mode = match std::env::var("MINI_MIC_CHANNEL").as_deref() {
+                    Ok("avg4") => audio::ChannelMode::Avg4,
+                    Ok("ch1") => audio::ChannelMode::Ch(1),
+                    Ok("ch2") => audio::ChannelMode::Ch(2),
+                    Ok("ch3") => audio::ChannelMode::Ch(3),
+                    _ => audio::ChannelMode::Ch0,
+                };
+                info!(
+                    ?mic_channel_mode,
+                    "Configured microphone channel extraction (default: Ch0 primary mic)"
+                );
 
-                    let mic_channel_mode = match std::env::var("MINI_MIC_CHANNEL").as_deref() {
-                        Ok("avg4") => audio::ChannelMode::Avg4,
-                        Ok("ch1") => audio::ChannelMode::Ch(1),
-                        Ok("ch2") => audio::ChannelMode::Ch(2),
-                        Ok("ch3") => audio::ChannelMode::Ch(3),
-                        _ => audio::ChannelMode::Ch0,
-                    };
-                    info!(
-                        ?mic_channel_mode,
-                        "Configured microphone channel extraction (default: Ch0 primary mic)"
-                    );
-
-                    let alsa_cfg = audio::AlsaCaptureConfig {
-                        device: config.audio.capture_device.clone(),
-                        channel_mode: mic_channel_mode,
-                        bit_shift: 16,
-                        gain: 1.0,
-                        custom_arecord_path: None,
-                        aec: config.audio.aec.clone(),
-                        aec_telemetry: Some(aec_telemetry.clone()),
-                    };
-                    match audio::AlsaCapture::start(alsa_cfg, tx_raw_mic) {
-                        Ok(c) => {
-                            info!(
-                                "Started direct ALSA microphone capture from {} (8ch S32_LE 48kHz)",
-                                config.audio.capture_device
-                            );
-                            alsa_capture = Some(c);
-                        }
-                        Err(e) => {
-                            return Err(e).context("ALSA capture unavailable");
-                        }
-                    }
-                }
-
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = capture_result {
-                voice_client.stop().await;
-                return Err(error);
+                let alsa_cfg = audio::AlsaCaptureConfig {
+                    device: config.audio.capture_device.clone(),
+                    channel_mode: mic_channel_mode,
+                    bit_shift: 16,
+                    gain: 1.0,
+                    custom_arecord_path: None,
+                    aec: config.audio.aec.clone(),
+                    aec_telemetry: Some(aec_telemetry.clone()),
+                };
+                alsa_capture = Some(
+                    audio::AlsaCapture::start(alsa_cfg, tx_raw_mic)
+                        .context("ALSA capture unavailable")?,
+                );
+                info!(
+                    "Started direct ALSA microphone capture from {} (8ch S32_LE 48kHz)",
+                    config.audio.capture_device
+                );
             }
 
             // Accepted model packets retain their cancellation epoch through actual drain.
@@ -1874,6 +1778,241 @@ async fn main() -> Result<()> {
                 }
             });
 
+            // 13. Connect active voice cloud engine concurrently so :8080 stays responsive even on auth failure.
+            let model = voice.model.to_owned();
+            let voice_name = voice.voice.to_owned();
+            let cancellation_epoch = playback.cancellation_epoch_handle();
+            let (voice_shutdown_tx, mut voice_shutdown_rx) = tokio::sync::watch::channel(false);
+            let cloud_status_out = shared_session_status.clone();
+            let cloud_runtime_state = voice_runtime_state.clone();
+            let cloud_auth = authorization.clone();
+            let cloud_suppress = suppress_followup.clone();
+            let cloud_connector_handle = tokio::spawn(async move {
+                use std::sync::atomic::Ordering;
+
+                let mut rx_cloud_mic = rx_cloud_mic;
+                let Some(api_key) = cloud_api_key else {
+                    cloud_status_out.store(
+                        gemini::live_client::SessionStatus::Stopped as u8,
+                        Ordering::SeqCst,
+                    );
+                    *cloud_runtime_state.write().await = credentials::VoiceRuntimeState::new(
+                        "needs_auth",
+                        Some(format!(
+                            "Требуется вход или API-ключ для {}",
+                            provider.name()
+                        )),
+                    );
+                    loop {
+                        tokio::select! {
+                            _ = voice_shutdown_rx.changed() => break,
+                            msg = rx_cloud_mic.recv() => {
+                                if msg.is_none() { break; }
+                            }
+                        }
+                    }
+                    return;
+                };
+
+                if !dry_run {
+                    let dns_fut = wait_until_ready(std::time::Duration::from_secs(30), || async {
+                        tokio::net::lookup_host(provider.host())
+                            .await
+                            .is_ok_and(|mut addresses| addresses.next().is_some())
+                    });
+                    tokio::select! {
+                        ready = dns_fut => {
+                            if !ready {
+                                warn!("DNS readiness deadline reached; connection may fail and retry");
+                            }
+                        }
+                        _ = voice_shutdown_rx.changed() => return,
+                    }
+                }
+
+                let mut backoff_secs = 5u64;
+                loop {
+                    if *voice_shutdown_rx.borrow() {
+                        return;
+                    }
+                    cloud_status_out.store(
+                        gemini::live_client::SessionStatus::Connecting as u8,
+                        Ordering::SeqCst,
+                    );
+                    *cloud_runtime_state.write().await =
+                        credentials::VoiceRuntimeState::new("connecting", None);
+                    info!("Connecting to {}", provider.name());
+
+                    let (tx_session, rx_session) = mpsc::channel::<gemini::UserAudio>(100);
+                    let cfg = gemini::LiveClientConfig {
+                        api_key: api_key.clone(),
+                        model: model.clone(),
+                        voice_name: voice_name.clone(),
+                        system_instruction: system_instruction.clone(),
+                        has_ha_tools: ha_tools_enabled,
+                        has_weather_tools: weather_tools_enabled,
+                        has_alarm_tools: alarm_tools_enabled,
+                        has_spotify_tools: spotify_tools_enabled,
+                        has_volume_tools: volume_tools_enabled,
+                        has_bluetooth_tools: true,
+                        has_stop_dialogue: any_tools_enabled,
+                        endpoint: None,
+                        cancellation_epoch: Some(cancellation_epoch.clone()),
+                        authorization: Some(cloud_auth.clone()),
+                        suppress_followup: Some(cloud_suppress.clone()),
+                    };
+
+                    let conn_fut = async {
+                        match provider {
+                            VoiceProvider::Gemini => gemini::GeminiLiveClient::connect(
+                                cfg,
+                                rx_session,
+                                tx_speaker.clone(),
+                                any_tools_enabled.then_some(tool_call_tx.clone()),
+                                on_interrupted.clone(),
+                            )
+                            .await
+                            .map(VoiceClient::Gemini),
+                            VoiceProvider::Openai => openai::OpenAiRealtimeClient::connect(
+                                cfg,
+                                rx_session,
+                                tx_speaker.clone(),
+                                any_tools_enabled.then_some(tool_call_tx.clone()),
+                                on_interrupted.clone(),
+                            )
+                            .await
+                            .map(VoiceClient::Openai),
+                        }
+                    };
+
+                    let voice_client_opt = tokio::select! {
+                        res = conn_fut => Some(res),
+                        _ = voice_shutdown_rx.changed() => None,
+                    };
+                    let Some(connection) = voice_client_opt else {
+                        return;
+                    };
+
+                    match connection {
+                        Ok(mut voice_client) => {
+                            let client_status = voice_client.status_handle();
+                            let initial_st = gemini::live_client::SessionStatus::from(
+                                client_status.load(Ordering::SeqCst),
+                            );
+                            cloud_status_out.store(initial_st as u8, Ordering::SeqCst);
+                            if initial_st == gemini::live_client::SessionStatus::Ready {
+                                *cloud_runtime_state.write().await =
+                                    credentials::VoiceRuntimeState::new("ready", None);
+                            }
+
+                            let mut status_tick =
+                                tokio::time::interval(std::time::Duration::from_millis(150));
+                            let mut last_state = initial_st;
+                            loop {
+                                tokio::select! {
+                                    _ = voice_shutdown_rx.changed() => {
+                                        voice_client.stop().await;
+                                        return;
+                                    }
+                                    _ = status_tick.tick() => {
+                                        let st = gemini::live_client::SessionStatus::from(
+                                            client_status.load(Ordering::SeqCst),
+                                        );
+                                        if st != last_state {
+                                            last_state = st;
+                                            cloud_status_out.store(st as u8, Ordering::SeqCst);
+                                            let (s_str, s_det) = match st {
+                                                gemini::live_client::SessionStatus::Connecting => {
+                                                    ("connecting", None)
+                                                }
+                                                gemini::live_client::SessionStatus::Ready => {
+                                                    ("ready", None)
+                                                }
+                                                gemini::live_client::SessionStatus::Degraded => (
+                                                    "degraded",
+                                                    Some("Переподключение к облаку...".to_string()),
+                                                ),
+                                                gemini::live_client::SessionStatus::Stopped => {
+                                                    ("stopped", None)
+                                                }
+                                            };
+                                            *cloud_runtime_state.write().await =
+                                                credentials::VoiceRuntimeState::new(s_str, s_det);
+                                        }
+                                    }
+                                    maybe_pcm = rx_cloud_mic.recv() => {
+                                        match maybe_pcm {
+                                            Some(msg) => {
+                                                if tx_session.send(msg).await.is_err() {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                                }
+                                            }
+                                            None => {
+                                                voice_client.stop().await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let err_lower = format!("{error:#}").to_lowercase();
+                            warn!("Failed to start {} ({:#})", provider.name(), error);
+                            cloud_status_out.store(
+                                gemini::live_client::SessionStatus::Stopped as u8,
+                                Ordering::SeqCst,
+                            );
+
+                            let is_auth_rejection = err_lower.contains("rejected")
+                                || err_lower.contains("401")
+                                || err_lower.contains("403")
+                                || err_lower.contains("unauthorized")
+                                || err_lower.contains("permission_denied")
+                                || err_lower.contains("invalid_api_key")
+                                || err_lower.contains("incorrect api key")
+                                || err_lower.contains("api key")
+                                || err_lower.contains("authentication");
+
+                            if is_auth_rejection {
+                                *cloud_runtime_state.write().await =
+                                    credentials::VoiceRuntimeState::new(
+                                        "auth_error",
+                                        Some(format!(
+                                            "Ошибка авторизации {}: проверьте ключ или вход на :8080",
+                                            provider.name()
+                                        )),
+                                    );
+                                loop {
+                                    tokio::select! {
+                                        _ = voice_shutdown_rx.changed() => return,
+                                        msg = rx_cloud_mic.recv() => {
+                                            if msg.is_none() { return; }
+                                        }
+                                    }
+                                }
+                            } else {
+                                *cloud_runtime_state.write().await =
+                                    credentials::VoiceRuntimeState::new(
+                                        "degraded",
+                                        Some(format!(
+                                            "Нет связи с {}. Повтор через {} с...",
+                                            provider.name(),
+                                            backoff_secs
+                                        )),
+                                    );
+                                tokio::select! {
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {
+                                        backoff_secs = (backoff_secs * 2).min(30);
+                                    }
+                                    _ = voice_shutdown_rx.changed() => return,
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
             info!(
                 "Voice pipeline ready (ha_tools: {}, weather_tools: {}, alarm_tools: {}, spotify_tools: {})",
                 ha_tools_enabled, weather_tools_enabled, alarm_tools_enabled, spotify_tools_enabled
@@ -1883,7 +2022,9 @@ async fn main() -> Result<()> {
             wait_for_shutdown().await?;
             info!("Shutting down mini-assistant...");
 
-            voice_client.stop().await;
+            let _ = voice_shutdown_tx.send(true);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), cloud_connector_handle)
+                .await;
 
             if let Some(mut cap) = alsa_capture {
                 cap.stop();

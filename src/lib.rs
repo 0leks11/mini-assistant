@@ -4,6 +4,7 @@ pub mod audio;
 pub mod bluetooth;
 pub mod buttons;
 pub mod config;
+pub mod credentials;
 pub mod gemini;
 pub mod ha;
 pub mod interaction;

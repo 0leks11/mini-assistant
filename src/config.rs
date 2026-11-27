@@ -581,6 +581,20 @@ fn default_vad_threshold() -> f32 {
 
 impl Config {
     pub fn voice_settings(&self) -> Result<VoiceSettings<'_>> {
+        self.resolve_voice_settings_inner(None)
+    }
+
+    pub fn voice_settings_with_store(
+        &self,
+        store: &crate::credentials::CredentialsStore,
+    ) -> Result<VoiceSettings<'_>> {
+        self.resolve_voice_settings_inner(Some(store))
+    }
+
+    fn resolve_voice_settings_inner(
+        &self,
+        store: Option<&crate::credentials::CredentialsStore>,
+    ) -> Result<VoiceSettings<'_>> {
         let provider = self.assistant.provider;
         let (model, voice, configured_key) = match provider {
             VoiceProvider::Gemini => {
@@ -610,10 +624,15 @@ impl Config {
             !model.trim().is_empty() && !voice.trim().is_empty(),
             "Voice model and voice must be nonempty"
         );
-        let api_key = configured_key
-            .map(str::to_owned)
-            .or_else(|| std::env::var(provider.key_env()).ok())
-            .filter(|key| !key.trim().is_empty());
+        let api_key = match store {
+            Some(s) => s
+                .resolve_voice_credential(provider, configured_key)
+                .map(|resolved| resolved.secret),
+            None => configured_key
+                .map(str::to_owned)
+                .or_else(|| std::env::var(provider.key_env()).ok())
+                .filter(|key| !key.trim().is_empty()),
+        };
         Ok(VoiceSettings {
             provider,
             model,

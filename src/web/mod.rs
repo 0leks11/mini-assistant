@@ -9,6 +9,8 @@
 //! - One-click Assistant restart & Linux SoC reboot
 
 use crate::audio::volume;
+use crate::config::{Config, VoiceProvider};
+use crate::credentials::{CredentialsStore, VoiceRuntimeState};
 use crate::spotify::crypto::pkce_code_challenge;
 use crate::spotify::web_api::SpotifyApiClient;
 use crate::spotify::{
@@ -64,6 +66,9 @@ pub struct ControlCenterServer {
     samples_store: Arc<crate::acoustics::samples::SamplesStore>,
     job_runner: Arc<crate::acoustics::jobs::AcousticJobRunner>,
     session_manager: Arc<crate::acoustics::sessions::AcousticSessionManager>,
+    credentials_store: Option<CredentialsStore>,
+    voice_runtime_state: Arc<RwLock<VoiceRuntimeState>>,
+    exit_on_restart: bool,
 }
 
 impl ControlCenterServer {
@@ -128,6 +133,7 @@ impl ControlCenterServer {
             );
             let _ = session_manager.clear_recovery();
         }
+        let credentials_store = Some(CredentialsStore::for_config(config_path.as_deref()));
         Self {
             config_path,
             spotify_client,
@@ -150,7 +156,26 @@ impl ControlCenterServer {
             samples_store,
             job_runner,
             session_manager,
+            credentials_store,
+            voice_runtime_state: Arc::new(RwLock::new(VoiceRuntimeState::new("starting", None))),
+            exit_on_restart: !cfg!(test),
         }
+    }
+
+    pub fn with_credentials_store(mut self, store: CredentialsStore) -> Self {
+        self.credentials_store = Some(store);
+        self
+    }
+
+    pub fn with_voice_runtime_state(mut self, state: Arc<RwLock<VoiceRuntimeState>>) -> Self {
+        self.voice_runtime_state = state;
+        self
+    }
+
+    fn resolve_credentials_store(&self) -> CredentialsStore {
+        self.credentials_store
+            .clone()
+            .unwrap_or_else(|| CredentialsStore::for_config(self.resolve_config_path().as_deref()))
     }
 
     pub fn with_session_manager(
@@ -955,6 +980,13 @@ impl ControlCenterServer {
 
         let cur_wakeword = self.read_active_wakeword_name();
         let wakeword_session_active = self.wakeword_session.read().await.is_some();
+        let voice_runtime = self.voice_runtime_state.read().await.clone();
+        let parsed_cfg = self
+            .resolve_config_path()
+            .and_then(|p| Config::load_from(Some(&p)).ok());
+        let auth_summary = self
+            .resolve_credentials_store()
+            .auth_summary(parsed_cfg.as_ref());
 
         let resp = serde_json::json!({
             "status": "ok",
@@ -962,6 +994,8 @@ impl ControlCenterServer {
             "version": "0.1.0",
             "provider": cur_provider,
             "voice": cur_voice,
+            "voice_runtime": voice_runtime,
+            "auth": auth_summary,
             "volume": cur_vol,
             "led_color": cur_led,
             "wakeword": {
@@ -1049,15 +1083,23 @@ impl ControlCenterServer {
             "Callirrhoe".to_string()
         };
 
+        let cred_store = self.resolve_credentials_store();
+        let parsed_cfg = self
+            .resolve_config_path()
+            .and_then(|p| Config::load_from(Some(&p)).ok());
+
         let matched_voice = match target_provider.as_str() {
             "openai" => {
-                let has_openai_key = std::env::var("OPENAI_API_KEY")
-                    .map(|k| !k.trim().is_empty())
-                    .unwrap_or(false);
-                if !has_openai_key {
+                let cfg_openai_key = parsed_cfg
+                    .as_ref()
+                    .and_then(|c| c.openai.as_ref()?.api_key.as_deref());
+                let has_openai_cred = cred_store
+                    .resolve_voice_credential(VoiceProvider::Openai, cfg_openai_key)
+                    .is_some();
+                if !has_openai_cred {
                     let err = serde_json::json!({
                         "status": "error",
-                        "message": "Для использования OpenAI необходимо указать OPENAI_API_KEY в файле .env на устройстве"
+                        "message": "Для использования OpenAI выполните вход или укажите API-ключ на этой странице"
                     });
                     return self.send_json_status(stream, "400 Bad Request", &err).await;
                 }
@@ -1098,12 +1140,14 @@ impl ControlCenterServer {
                 "Voice & provider setting updated in config.toml"
             );
 
-            // Respawn assistant cleanly in 500ms via supervisor
-            tokio::spawn(async {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                info!("Restarting assistant process to apply new voice & provider...");
-                std::process::exit(0);
-            });
+            if self.exit_on_restart {
+                // Respawn assistant cleanly in 500ms via supervisor
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    info!("Restarting assistant process to apply new voice & provider...");
+                    std::process::exit(0);
+                });
+            }
         }
 
         self.send_json(
@@ -1153,11 +1197,13 @@ impl ControlCenterServer {
         )
         .await?;
 
-        tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            info!("Restarting assistant process by user request from Web UI");
-            std::process::exit(0);
-        });
+        if self.exit_on_restart {
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                info!("Restarting assistant process by user request from Web UI");
+                std::process::exit(0);
+            });
+        }
         Ok(())
     }
 
@@ -7102,6 +7148,146 @@ capture_device = "hw:0,2"
             eval_resp["evaluation"]["sample_results"][0]["sample_id"],
             sample_id
         );
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_http_status_auth_and_voice_switch_with_credentials_store() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("http_auth_phase2_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_file = temp_dir.join("config.toml");
+        std::fs::write(
+            &cfg_file,
+            r#"[assistant]
+name = "Мини"
+provider = "gemini"
+voice = "Aoede"
+languages = ["ru-RU"]
+
+[gemini]
+model = "models/gemini-3.8-live"
+
+[audio]
+capture_device = "hw:0,2"
+playback_device = "default"
+sample_rate = 16000
+channels = 1
+"#,
+        )
+        .unwrap();
+
+        let cred_store = CredentialsStore::new(temp_dir.join("credentials.json"));
+        let runtime_state = Arc::new(RwLock::new(VoiceRuntimeState::new(
+            "needs_auth",
+            Some("Требуется ключ".into()),
+        )));
+        let auth_manager = Arc::new(AuthManager::new(Some("owner-p2-secret".into())));
+        let ducker = Arc::new(MusicDucker::new());
+        let sp_client = Arc::new(RwLock::new(None));
+
+        let srv = Arc::new(
+            ControlCenterServer::new(
+                Some(cfg_file.clone()),
+                String::new(),
+                "http://127.0.0.1:8080/spotify/callback".into(),
+                sp_client,
+                None,
+                ducker,
+            )
+            .with_auth_manager(auth_manager)
+            .with_credentials_store(cred_store.clone())
+            .with_voice_runtime_state(runtime_state),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _ = srv.run(listener, shutdown_rx).await;
+        });
+
+        async fn send_req(addr: std::net::SocketAddr, req: &str) -> (u16, serde_json::Value) {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            let txt = String::from_utf8_lossy(&buf);
+            let code = txt
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let body = txt.split("\r\n\r\n").nth(1).unwrap_or("{}");
+            (code, serde_json::from_str(body).unwrap_or_default())
+        }
+
+        // 1. /api/v1/status stays live in needs_auth and hides secrets
+        let (code, st) = send_req(
+            addr,
+            &format!("GET /api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(st["voice_runtime"]["status"], "needs_auth");
+        assert_eq!(st["auth"]["openai"]["configured"], false);
+
+        // 2. Switching to OpenAI without credentials fails cleanly with 400
+        let body = r#"{"provider":"openai","voice":"alloy"}"#;
+        let (code, err) = send_req(
+            addr,
+            &format!(
+                "POST /api/v1/voice HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p2-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 400);
+        assert_eq!(err["status"], "error");
+
+        // 3. Store OpenAI credential in credentials.json -> status masks it & switch succeeds
+        cred_store
+            .set_provider(
+                VoiceProvider::Openai,
+                crate::credentials::ProviderCredentials {
+                    auth_mode: crate::credentials::AuthMode::ApiKey,
+                    api_key: Some("sk-proj-secret12345678".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let (code, st2) = send_req(
+            addr,
+            &format!("GET /api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(st2["auth"]["openai"]["configured"], true);
+        assert_eq!(st2["auth"]["openai"]["masked_hint"], "sk-p...5678");
+        assert!(!st2.to_string().contains("secret12345678"));
+
+        let (code, ok_resp) = send_req(
+            addr,
+            &format!(
+                "POST /api/v1/voice HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p2-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(ok_resp["provider"], "openai");
+        assert_eq!(ok_resp["voice"], "alloy");
+
+        let updated_cfg = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(updated_cfg.contains("provider = \"openai\""));
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;

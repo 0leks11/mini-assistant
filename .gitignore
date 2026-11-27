@@ -27,6 +27,8 @@ config.toml
 client_secret*.json
 token.json
 tokens.json
+*credentials*.json
+credentials.json
 *.auth
 *.ppn
 .credentials/
