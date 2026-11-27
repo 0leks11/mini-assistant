@@ -412,12 +412,6 @@ impl OpenAiRealtimeClient {
                 .parse()
                 .context("Invalid authorization header")?,
         );
-        req.headers_mut().insert(
-            "OpenAI-Beta",
-            "realtime=v1"
-                .parse()
-                .context("Invalid OpenAI-Beta header")?,
-        );
         let (ws_stream, _) = connect_async(req)
             .await
             .context("Failed to connect to OpenAI Realtime WebSocket")?;
@@ -635,12 +629,6 @@ async fn run_single_session(
         format!("Bearer {}", cfg.api_key)
             .parse()
             .context("Invalid authorization header")?,
-    );
-    req.headers_mut().insert(
-        "OpenAI-Beta",
-        "realtime=v1"
-            .parse()
-            .context("Invalid OpenAI-Beta header")?,
     );
 
     let (ws_stream, _) = match connect_async(req).await {
