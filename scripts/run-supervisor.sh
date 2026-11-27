@@ -1,10 +1,14 @@
 #!/bin/sh
 # run-supervisor.sh — Supervisor daemon for GPT Mini
 # MINI_VOICE_PAUSE_GUARD
-[ ! -e /bkupgrade/data/opt/mini-assistant/voice.paused ] || exit 0
-DIR="/data/opt/mini-assistant"
+PAUSE_GUARD="${MINI_PAUSE_GUARD:-/bkupgrade/data/opt/mini-assistant/voice.paused}"
+[ ! -e "$PAUSE_GUARD" ] || exit 0
+DIR="${MINI_SUPERVISOR_DIR:-/data/opt/mini-assistant}"
 DAEMON="$DIR/mini-assistant"
 LOGFILE="$DIR/assistant.log"
+IFACE="${MINI_WIFI_IFACE:-wlan0}"
+CA_BUNDLE="${MINI_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+SPOTIFY_CHECK_URL="${MINI_SPOTIFY_CHECK_URL:-https://apresolve.spotify.com}"
 cd "$DIR" || exit 1
 
 echo "[$(date -Iseconds 2>/dev/null || date)] Supervisor started on GPT Mini" >> "$LOGFILE"
@@ -25,29 +29,55 @@ if [ -x "$DIR/bcm-attach" ] && ! ps | grep -v grep | grep -q "$DIR/bcm-attach"; 
     setsid "$DIR/bcm-attach" > "$DIR/bcm-attach.log" 2>&1 &
 fi
 
-# 4. Wait for valid system time (year >= 2026) so TLS certificates validate cleanly
+# Returns 0 when Wi-Fi interface has an IPv4 address and a default gateway (not bare fe80:: link-local).
+network_ipv4_ready() {
+    ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q 'inet ' \
+        && ip -4 route show default 2>/dev/null | grep -q '^default '
+}
+
+# Returns 0 when IPv4, NTP clock, DNS, and HTTPS reachability to Spotify endpoints are ready.
+spotify_network_ready() {
+    local year
+    network_ipv4_ready || return 1
+    year=$(date +%Y 2>/dev/null || echo 2015)
+    [ "$year" -ge 2026 ] || return 1
+    nslookup apresolve.spotify.com >/dev/null 2>&1 || return 1
+    if [ -r "$CA_BUNDLE" ]; then
+        wget --ca-certificate="$CA_BUNDLE" -T 4 -t 1 -q -O /dev/null "$SPOTIFY_CHECK_URL" >/dev/null 2>&1 || return 1
+    else
+        wget -T 4 -t 1 -q -O /dev/null "$SPOTIFY_CHECK_URL" >/dev/null 2>&1 || return 1
+    fi
+}
+
+# 4. Wait for valid system time (year >= 2026) and initial Wi-Fi IPv4 readiness (up to 30s if year is already >= 2026)
 wait_for_ntp() {
-    echo "[$(date -Iseconds 2>/dev/null || date)] Waiting for NTP clock sync (year >= 2026)..." >> "$LOGFILE"
+    echo "[$(date -Iseconds 2>/dev/null || date)] Waiting for NTP clock sync (year >= 2026) and $IFACE IPv4..." >> "$LOGFILE"
     local count=0
     while true; do
         YEAR=$(date +%Y 2>/dev/null || echo 2015)
         if [ "$YEAR" -ge 2026 ]; then
-            echo "[$(date -Iseconds 2>/dev/null || date)] NTP clock synchronized cleanly: year $YEAR" >> "$LOGFILE"
-            # Ensure waiting LED blink is off
-            i2cset -y 0 0x3c 0x00 0x00 2>/dev/null || true
-            break
+            if network_ipv4_ready || [ "$count" -ge 30 ]; then
+                echo "[$(date -Iseconds 2>/dev/null || date)] Boot readiness OK: year=$YEAR net_wait=${count}s" >> "$LOGFILE"
+                # Ensure waiting LED blink is off
+                i2cset -y 0 0x3c 0x00 0x00 2>/dev/null || true
+                break
+            fi
         fi
 
         # Visual signal: blink upper LED (0.5s on, 0.5s off) to indicate waiting for NTP/network
-        i2cset -y 0 0x3c 0x00 0x01 2>/dev/null || true
-        sleep 0.5
-        i2cset -y 0 0x3c 0x00 0x00 2>/dev/null || true
-        sleep 0.5
+        if [ "$YEAR" -lt 2026 ]; then
+            i2cset -y 0 0x3c 0x00 0x01 2>/dev/null || true
+            sleep 0.5
+            i2cset -y 0 0x3c 0x00 0x00 2>/dev/null || true
+            sleep 0.5
+        else
+            sleep 1
+        fi
 
         count=$((count + 1))
         # Every 5 seconds, attempt to force chrony stepping
         if [ $((count % 5)) -eq 0 ]; then
-            echo "[$(date -Iseconds 2>/dev/null || date)] NTP wait tick $count (current year: $YEAR); kicking chrony..." >> "$LOGFILE"
+            echo "[$(date -Iseconds 2>/dev/null || date)] Boot wait tick $count (year=$YEAR); kicking chrony..." >> "$LOGFILE"
             chronyc -a 'burst 4/4' 2>/dev/null || true
             chronyc makestep 2>/dev/null || true
         fi
@@ -64,6 +94,8 @@ wait_for_ntp
 # 5. Continuous background watchdog for dependent daemons & hardware settings
 # Runs concurrently with the main voice daemon, checking health every 4 seconds.
 watchdog_loop() {
+    local soloist_wait_logged=0
+    local soloist_token_synced=0
     while true; do
         sleep 4
         # Hardware memory barrier
@@ -81,10 +113,25 @@ watchdog_loop() {
             killall -TERM mini-assistant 2>/dev/null || true
         fi
 
-        # Watchdog: Spotify Soloist engine
-        if [ -x "$DIR/soloist-env/soloist-run.sh" ] && ! ps | grep -v grep | grep -q "soloist-env/soloist"; then
-            echo "[$(date -Iseconds 2>/dev/null || date)] Watchdog: Spotify Soloist not running; starting..." >> "$LOGFILE"
-            nohup "$DIR/soloist-env/soloist-run.sh" > "$DIR/soloist.log" 2>&1 &
+        # Watchdog: Spotify Soloist engine (do not start until IPv4, DNS, and HTTPS reachability succeed,
+        # otherwise Soloist fails with CURL error 6 and invalidates its persisted OAuth session on disk).
+        if [ -x "$DIR/soloist-env/soloist-run.sh" ]; then
+            if ! ps | grep -v grep | grep -q "soloist-env/soloist"; then
+                soloist_token_synced=0
+                if spotify_network_ready; then
+                    echo "[$(date -Iseconds 2>/dev/null || date)] Watchdog: Network/DNS/HTTPS ready; starting Spotify Soloist..." >> "$LOGFILE"
+                    soloist_wait_logged=0
+                    nohup "$DIR/soloist-env/soloist-run.sh" > "$DIR/soloist.log" 2>&1 &
+                elif [ "$soloist_wait_logged" -eq 0 ]; then
+                    echo "[$(date -Iseconds 2>/dev/null || date)] Watchdog: Delaying Spotify Soloist startup until $IFACE IPv4, DNS, and HTTPS are ready" >> "$LOGFILE"
+                    soloist_wait_logged=1
+                fi
+            elif [ "$soloist_token_synced" -eq 0 ] && [ -x "$DIR/soloist-ctl" ]; then
+                if "$DIR/soloist-ctl" status 2>/dev/null | grep -q "logged in: yes"; then
+                    sync 2>/dev/null || true
+                    soloist_token_synced=1
+                fi
+            fi
         fi
 
         # Watchdog: Bluetooth attach
