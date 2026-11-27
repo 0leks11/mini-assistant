@@ -11,17 +11,18 @@ struct NormScratch {
 }
 
 impl NormScratch {
-    fn normalize_prefix(&mut self, frames: &[Vec<f32>], max_len: usize) -> (usize, usize) {
+    fn normalize_suffix(&mut self, frames: &[Vec<f32>], max_len: usize) -> (usize, usize) {
         let num_frames = frames.len().min(max_len);
         if num_frames == 0 {
             return (0, 0);
         }
-        let dim = frames[0].len();
+        let start = frames.len() - num_frames;
+        let dim = frames[start].len();
         self.mean.resize(dim, 0.0);
         self.mean.fill(0.0);
         self.data.resize(num_frames * dim, 0.0);
 
-        for (i, frame) in frames.iter().take(num_frames).enumerate() {
+        for (i, frame) in frames[start..].iter().take(num_frames).enumerate() {
             let base = i * dim;
             for (j, &val) in frame.iter().take(dim).enumerate() {
                 self.data[base + j] = val;
@@ -116,7 +117,7 @@ impl WakewordDetector for WakewordComparator {
         if let Some(ref wakeword_samples_avg_features) = self.avg_features {
             if avg_threshold != 0. {
                 let target_len = wakeword_samples_avg_features.len();
-                let (q_frames, dim) = self.norm_scratch.normalize_prefix(mfcc_frame, target_len);
+                let (q_frames, dim) = self.norm_scratch.normalize_suffix(mfcc_frame, target_len);
                 cached_len = Some((target_len, q_frames, dim));
                 avg_score = self.mfcc_comparator.compare_flat(
                     wakeword_samples_avg_features,
@@ -137,7 +138,7 @@ impl WakewordDetector for WakewordComparator {
             let (q_frames, dim) = match cached_len {
                 Some((prev_target, qf, d)) if prev_target == target_len => (qf, d),
                 _ => {
-                    let (qf, d) = self.norm_scratch.normalize_prefix(mfcc_frame, target_len);
+                    let (qf, d) = self.norm_scratch.normalize_suffix(mfcc_frame, target_len);
                     cached_len = Some((target_len, qf, d));
                     (qf, d)
                 }
@@ -214,5 +215,79 @@ impl WakewordDetector for WakewordComparator {
     fn update_config(&mut self, score_ref: f32, band_size: u16, score_mode: ScoreMode) {
         self.score_mode = score_mode;
         self.mfcc_comparator = MfccComparator::new(score_ref, band_size);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_mean_pattern(len: usize, freq_scale: f32) -> Vec<Vec<f32>> {
+        let raw: Vec<Vec<f32>> = (0..len)
+            .map(|i| {
+                (0..16)
+                    .map(|j| ((i as f32 * freq_scale) + (j as f32 * 0.4)).sin() * 12.0)
+                    .collect()
+            })
+            .collect();
+        let mut mean = [0.0f32; 16];
+        for frame in &raw {
+            for (j, &v) in frame.iter().enumerate() {
+                mean[j] += v;
+            }
+        }
+        let inv = 1.0 / len as f32;
+        raw.into_iter()
+            .map(|frame| {
+                frame
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, v)| v - mean[j] * inv)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn short_template_aligns_on_latest_frames_without_prefix_lag() {
+        let short_tmpl = zero_mean_pattern(20, 0.35);
+        let long_tmpl = zero_mean_pattern(40, 0.75);
+        let noise = zero_mean_pattern(20, 1.9);
+
+        let mut samples_features = HashMap::new();
+        samples_features.insert("short".to_string(), short_tmpl.clone());
+        samples_features.insert("long".to_string(), long_tmpl);
+
+        let wakeword = WakewordRef {
+            name: "test".to_string(),
+            avg_features: None,
+            samples_features,
+            threshold: Some(0.5),
+            avg_threshold: Some(0.0),
+            rms_level: 0.01,
+            mfcc_size: 16,
+        };
+        let mut comp =
+            WakewordComparator::new(&wakeword, MfccComparator::new(0.21, 5), ScoreMode::Max);
+
+        // Stream ends right on `short_tmpl` (frames[20..40]): must fire immediately with no lag.
+        let mut end_aligned = noise.clone();
+        end_aligned.extend(short_tmpl.clone());
+        let det = comp
+            .run_detection(&end_aligned, 0.0, 0.5)
+            .expect("short template should match suffix of window immediately");
+        assert!(
+            det.scores["short"] > 0.70,
+            "expected near-exact suffix match > 0.70, got {}",
+            det.scores["short"]
+        );
+
+        // Stream has `short_tmpl` only in the stale prefix followed by noise: must not fire.
+        let mut stale_prefix = short_tmpl;
+        stale_prefix.extend(noise);
+        assert!(
+            comp.run_detection(&stale_prefix, 0.0, 0.5).is_none(),
+            "stale prefix frames must not trigger once newer audio arrives"
+        );
     }
 }

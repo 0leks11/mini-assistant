@@ -18,7 +18,7 @@ use tracing::info;
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MIN_SAMPLES: usize = 4_800; // 300 ms
-pub const MAX_SAMPLES: usize = 64_000; // 4000 ms
+pub const MAX_SAMPLES: usize = 48_000; // 3000 ms (matches rustpotter MfccWavFileExtractor)
 pub const TARGET_STEPS: usize = 30;
 pub const MIN_STEPS: usize = 3;
 pub const MAX_TEMPLATES: usize = 8;
@@ -300,16 +300,21 @@ pub fn encode_wav_pcm16(samples: &[i16]) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-/// Trims leading and trailing silence using dynamic RMS energy threshold.
-pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
-    ensure!(!samples.is_empty(), "Empty audio buffer");
-
-    let rms: Vec<f64> = samples
+/// Computes 10 ms frame RMS energies over a PCM16 slice.
+fn frame_rms_10ms(samples: &[i16]) -> Vec<f64> {
+    samples
         .chunks(160)
         .map(|frame| {
             (frame.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / frame.len() as f64).sqrt()
         })
-        .collect();
+        .collect()
+}
+
+/// Computes speech boundaries `(start, end)` in sample indices using dynamic RMS energy threshold.
+fn trim_enrollment_bounds(samples: &[i16]) -> Result<(usize, usize)> {
+    ensure!(!samples.is_empty(), "Empty audio buffer");
+
+    let rms = frame_rms_10ms(samples);
 
     ensure!(!rms.is_empty(), "Audio too short for analysis");
 
@@ -324,7 +329,7 @@ pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
         "В записи не обнаружено отчётливого голоса (слишком тихо или фоновый шум)"
     );
 
-    let threshold = (peak * 0.25).max(noise * 2.5).min(peak * 0.65);
+    let threshold = (peak * 0.30).max(noise * 3.0).min(peak * 0.65);
 
     let peak_index = rms
         .iter()
@@ -338,7 +343,7 @@ pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
         if rms[i] >= threshold {
             first = i;
         }
-        if first.saturating_sub(i) >= 40 {
+        if first.saturating_sub(i) >= 36 {
             break;
         }
     }
@@ -348,28 +353,35 @@ pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
         if *value >= threshold {
             last = i;
         }
-        if i.saturating_sub(last) >= 40 {
+        if i.saturating_sub(last) >= 36 {
             break;
         }
     }
 
-    // Add 15 frames (150 ms) before and 20 frames (200 ms) after for natural envelope
-    let start = first.saturating_sub(15) * 160;
-    let end = ((last + 1 + 20) * 160).min(samples.len());
+    // Add 10 frames (100 ms) before and 12 frames (120 ms) after for natural envelope
+    let start = first.saturating_sub(10) * 160;
+    let end = ((last + 1 + 12) * 160).min(samples.len());
+    let len = end.saturating_sub(start);
 
-    let trimmed = &samples[start..end];
     ensure!(
-        trimmed.len() >= MIN_SAMPLES,
+        len >= MIN_SAMPLES,
         "Произнесённое слово слишком короткое ({:.1} с). Говорите чётко не менее 0.3 с.",
-        trimmed.len() as f64 / 16000.0
+        len as f64 / 16000.0
     );
     ensure!(
-        trimmed.len() <= MAX_SAMPLES,
-        "Запись слишком длинная ({:.1} с). Произносите только слово вызова (до 4 сек).",
-        trimmed.len() as f64 / 16000.0
+        len <= MAX_SAMPLES,
+        "Запись слишком длинная ({:.1} с). Произносите только слово вызова (до 3 сек).",
+        len as f64 / 16000.0
     );
 
-    Ok(trimmed.to_vec())
+    Ok((start, end))
+}
+
+/// Trims leading and trailing silence using dynamic RMS energy threshold.
+#[cfg(test)]
+pub fn trim_enrollment(samples: &[i16]) -> Result<Vec<i16>> {
+    let (start, end) = trim_enrollment_bounds(samples)?;
+    Ok(samples[start..end].to_vec())
 }
 
 /// Evaluates a raw recording, trims silence, calculates metrics, and returns an `EnrollmentSample`.
@@ -399,16 +411,30 @@ pub fn process_sample(
         "Запись искажена клиппингом (слишком близко или громко). Повторите спокойнее."
     );
 
-    let trimmed = trim_enrollment(raw_pcm)?;
+    let (start, end) = trim_enrollment_bounds(raw_pcm)?;
+    let trimmed = raw_pcm[start..end].to_vec();
     let duration_ms = (trimmed.len() as f64 / 16.0).round() as u32;
 
-    // Quality check SNR
+    // Quality check SNR from quiet background frames outside the trimmed speech envelope
     let mut trimmed_sum_sq = 0.0f64;
     for &s in &trimmed {
         trimmed_sum_sq += f64::from(s).powi(2);
     }
     let trimmed_rms = (trimmed_sum_sq / trimmed.len() as f64).sqrt() as f32;
-    let noise_rms = total_rms.min(trimmed_rms * 0.3).max(1.0);
+    let mut outside_rms = frame_rms_10ms(&raw_pcm[..start]);
+    outside_rms.extend(frame_rms_10ms(&raw_pcm[end..]));
+    let noise_rms = if outside_rms.len() >= 5 {
+        outside_rms.sort_by(f64::total_cmp);
+        (outside_rms[outside_rms.len() / 2] as f32).max(1.0)
+    } else {
+        let mut all_rms = frame_rms_10ms(raw_pcm);
+        all_rms.sort_by(f64::total_cmp);
+        all_rms
+            .get(all_rms.len() / 20)
+            .copied()
+            .unwrap_or(f64::from(total_rms))
+            .max(1.0) as f32
+    };
     let snr = 20.0 * (trimmed_rms / noise_rms).log10();
 
     Ok(EnrollmentSample {
@@ -499,7 +525,10 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
                     let mut dtw = rustpotter::mfcc::Dtw::new(
                         rustpotter::mfcc::MfccComparator::calculate_distance,
                     );
-                    let cost = dtw.compute_optimal_path_with_window(&a_refs, &b_refs, 5);
+                    let band = 5usize
+                        .max(a_refs.len().abs_diff(b_refs.len()) + 5)
+                        .min(usize::from(u16::MAX)) as u16;
+                    let cost = dtw.compute_optimal_path_with_window(&a_refs, &b_refs, band);
                     let norm_cost = cost / (a_refs.len() + b_refs.len()) as f32;
                     let val = (1.0 - norm_cost).clamp(0.0, 1.0);
                     (val * 100.0).round() / 100.0
@@ -579,39 +608,92 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
         overall_consistency
     };
 
-    // 5. Outlier Detection: low similarity (< 0.45), low SNR (< 8 dB), or >2σ below mean
-    let mean_c = centralities.iter().sum::<f32>() / n as f32;
-    let var_c = centralities
+    // 5. Outlier Detection: MFCC failure, severe noise (< 6 dB), duration drift, or acoustic isolation
+    let mut valid_durations: Vec<u32> = samples
         .iter()
-        .map(|&c| (c - mean_c).powi(2))
-        .sum::<f32>()
-        / n as f32;
-    let _std_c = var_c.sqrt(); // retained for future 2σ outlier reporting if needed
+        .enumerate()
+        .filter(|(i, s)| features_list[*i].is_some() && s.snr >= 6.0)
+        .map(|(_, s)| s.duration_ms)
+        .collect();
+    valid_durations.sort_unstable();
+    let median_duration_ms = if valid_durations.len() >= 5 {
+        Some(valid_durations[valid_durations.len() / 2])
+    } else {
+        None
+    };
+
+    let mut is_outlier_vec = vec![false; n];
+    let mut outlier_reasons: Vec<Option<String>> = vec![None; n];
+
+    for (i, s) in samples.iter().enumerate() {
+        if features_list[i].is_none() {
+            is_outlier_vec[i] = true;
+            outlier_reasons[i] = Some("Ошибка извлечения акустических признаков MFCC".to_string());
+        } else if s.snr < 6.0 {
+            is_outlier_vec[i] = true;
+            outlier_reasons[i] = Some(format!(
+                "Слишком высокий фоновый шум: SNR {:.1} дБ (< 6 дБ)",
+                s.snr
+            ));
+        } else if let Some(med) = median_duration_ms {
+            let min_dur = ((med as f32) * 0.55).round() as u32;
+            let max_dur = ((med as f32) * 1.50).round() as u32;
+            if s.duration_ms < min_dur || s.duration_ms > max_dur {
+                is_outlier_vec[i] = true;
+                outlier_reasons[i] = Some(format!(
+                    "Длительность сильно отличается от остальных сэмплов ({} мс при медиане {} мс)",
+                    s.duration_ms, med
+                ));
+            }
+        }
+    }
+
+    let remaining_valid = is_outlier_vec.iter().filter(|&&flagged| !flagged).count();
+    if remaining_valid >= 5 {
+        let mut valid_max_peers: Vec<f32> = Vec::with_capacity(remaining_valid);
+        let mut valid_cents: Vec<f32> = Vec::with_capacity(remaining_valid);
+        let mut peer_max_per_idx = vec![0.0f32; n];
+        for i in 0..n {
+            if is_outlier_vec[i] {
+                continue;
+            }
+            let max_peer_sim = matrix[i]
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i && !is_outlier_vec[*j])
+                .map(|(_, &v)| v)
+                .fold(0.0f32, f32::max);
+            peer_max_per_idx[i] = max_peer_sim;
+            valid_max_peers.push(max_peer_sim);
+            valid_cents.push(centralities[i]);
+        }
+        valid_max_peers.sort_by(f32::total_cmp);
+        valid_cents.sort_by(f32::total_cmp);
+        let med_max_peer = valid_max_peers[valid_max_peers.len() / 2];
+        let med_cent = valid_cents[valid_cents.len() / 2];
+        let min_allowed_peer = (med_max_peer - 0.25).max(0.35);
+        let min_allowed_cent = med_cent * 0.65;
+
+        for i in 0..n {
+            if is_outlier_vec[i] {
+                continue;
+            }
+            let max_peer_sim = peer_max_per_idx[i];
+            if max_peer_sim < min_allowed_peer || centralities[i] < min_allowed_cent {
+                is_outlier_vec[i] = true;
+                outlier_reasons[i] = Some(format!(
+                    "Акустическая сигнатура не совпадает с остальными дублями (макс. {:.2}, центр. {:.2})",
+                    max_peer_sim, centralities[i]
+                ));
+            }
+        }
+    }
 
     let mut sample_reports = Vec::with_capacity(n);
     let mut outlier_count = 0usize;
 
     for (i, s) in samples.iter().enumerate() {
-        let c = centralities[i];
-        let mut is_outlier = false;
-        let mut outlier_reason = None;
-
-        if features_list[i].is_none() {
-            is_outlier = true;
-            outlier_reason = Some("Ошибка извлечения акустических признаков MFCC".to_string());
-        } else if s.snr < 6.0 {
-            // Only reject samples with severe noise — variations in tone/intonation are DESIRABLE.
-            // A lower similarity to others does NOT mean bad quality; it means phonetic diversity,
-            // which improves generalization. Threshold lowered from 8 dB to 6 dB.
-            is_outlier = true;
-            outlier_reason = Some(format!(
-                "Слишком высокий фоновый шум: SNR {:.1} дБ (< 6 дБ)",
-                s.snr
-            ));
-        }
-        // NOTE: Removed centrality < 0.45 filter — low centrality = high variation = good for robustness.
-        // NOTE: Removed 2σ outlier filter — it eliminates exactly the diverse samples we need.
-
+        let is_outlier = is_outlier_vec[i];
         if is_outlier {
             outlier_count += 1;
         }
@@ -623,22 +705,13 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
             duration_ms: s.duration_ms,
             peak_rms: s.peak_rms,
             snr: s.snr,
-            centrality_score: c,
+            centrality_score: centralities[i],
             is_outlier,
-            outlier_reason,
+            outlier_reason: outlier_reasons[i].clone(),
         });
     }
 
-    // 6. Diversity-first Template Selection (Target: 8 templates across 3 distance zones)
-    //
-    // KEY INSIGHT: For wake-word robustness we want MAXIMUM PHONETIC DIVERSITY among templates,
-    // NOT samples that sound most similar to each other (centroids).
-    // Rustpotter matches if ANY template scores above threshold → more varied templates = better
-    // generalization across different speaking styles, distances, and tones.
-    //
-    // Algorithm: greedy max-spread selection — pick the first valid sample, then repeatedly
-    // pick the sample whose MINIMUM pairwise similarity to already-selected set is lowest
-    // (i.e., most different from everything already chosen).
+    // 6. Centrality-constrained diversity selection (Target: up to 8 templates across 3 zones)
     let mut non_outliers: Vec<(usize, &EnrollmentSample, f32)> = sample_reports
         .iter()
         .zip(samples.iter())
@@ -646,7 +719,16 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
         .map(|(r, s)| (s.id, s, r.centrality_score))
         .collect();
 
-    // If too few non-outliers, use all samples regardless
+    // If too few non-outliers, fall back to all valid-MFCC samples (or all samples if needed)
+    if non_outliers.len() < MIN_STEPS {
+        non_outliers = sample_reports
+            .iter()
+            .zip(samples.iter())
+            .enumerate()
+            .filter(|(i, _)| features_list[*i].is_some())
+            .map(|(_, (r, s))| (s.id, s, r.centrality_score))
+            .collect();
+    }
     if non_outliers.len() < MIN_STEPS {
         non_outliers = sample_reports
             .iter()
@@ -661,10 +743,9 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
 
     let target_total = MAX_TEMPLATES.min(non_outliers.len()).max(MIN_STEPS);
 
-    // Greedy max-spread: start from the sample with highest centrality (most representative anchor)
     let mut selected_ids: Vec<usize> = Vec::with_capacity(target_total);
     {
-        // Phase-aware seeding: seed one sample from each phase first (most central per phase)
+        // Phase-aware seeding: seed one most-central sample from each phase first
         for phase in [1u8, 2, 3] {
             if selected_ids.len() >= target_total {
                 break;
@@ -681,27 +762,35 @@ pub fn analyze_samples(samples: &[EnrollmentSample]) -> SignatureAnalysisReport 
             }
         }
 
-        // Greedy spread: keep adding the sample most unlike all already selected
-        while selected_ids.len() < target_total {
-            let best = non_outliers
-                .iter()
-                .filter(|(id, _, _)| !selected_ids.contains(id))
-                .map(|(id, _, _c)| {
-                    // min similarity to any already-selected template = spread score
-                    let min_sim = selected_ids
-                        .iter()
-                        .filter_map(|sel_id| {
-                            let ri = id_to_idx.get(id)?;
-                            let rj = id_to_idx.get(sel_id)?;
-                            Some(matrix[*ri][*rj])
-                        })
-                        .fold(f32::INFINITY, f32::min);
-                    (*id, if min_sim.is_infinite() { 0.0 } else { min_sim })
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1)); // pick sample with LOWEST min-sim = most different
+        let mean_candidate_c =
+            non_outliers.iter().map(|(_, _, c)| *c).sum::<f32>() / non_outliers.len().max(1) as f32;
+        let min_spread_c = mean_candidate_c * 0.70;
 
-            match best {
-                Some((id, _)) => selected_ids.push(id),
+        // Centrality-guarded greedy spread: maximize acoustic span without selecting isolated quirks
+        while selected_ids.len() < target_total {
+            let pick_among = |require_floor: bool| -> Option<usize> {
+                non_outliers
+                    .iter()
+                    .filter(|(id, _, c)| {
+                        !selected_ids.contains(id) && (!require_floor || *c >= min_spread_c)
+                    })
+                    .map(|(id, _, c)| {
+                        let min_sim = selected_ids
+                            .iter()
+                            .filter_map(|sel_id| {
+                                let ri = id_to_idx.get(id)?;
+                                let rj = id_to_idx.get(sel_id)?;
+                                Some(matrix[*ri][*rj])
+                            })
+                            .fold(f32::INFINITY, f32::min);
+                        (*id, if min_sim.is_infinite() { 0.0 } else { min_sim }, *c)
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.2.total_cmp(&a.2)))
+                    .map(|(id, _, _)| id)
+            };
+
+            match pick_among(true).or_else(|| pick_among(false)) {
+                Some(id) => selected_ids.push(id),
                 None => break,
             }
         }
@@ -806,15 +895,10 @@ pub fn compile_reference(
         buffers.insert(format!("sample-{idx:02}"), wav_bytes);
     }
 
-    // Build Rustpotter WakewordRef with 16 MFCC filters
-    let reference = WakewordRef::new_from_sample_buffers(
-        name.to_lowercase(),
-        Some(0.48),
-        Some(0.32),
-        buffers,
-        16,
-    )
-    .map_err(anyhow::Error::msg)?;
+    // Build Rustpotter WakewordRef with 16 MFCC filters (runtime detector supplies thresholds)
+    let reference =
+        WakewordRef::new_from_sample_buffers(name.to_lowercase(), None, None, buffers, 16)
+            .map_err(anyhow::Error::msg)?;
 
     reference
         .validate_personal_reference()
@@ -1099,5 +1183,62 @@ mod tests {
             err_msg.contains("клиппингом"),
             "Expected clipping error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_process_sample_rejects_stationary_background_noise_by_real_snr() {
+        // 3.5 seconds of broadband-like multi-tone stationary noise (no distinct clean silence floor)
+        let pcm: Vec<i16> = (0..56_000)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                ((t * 310.0).sin() * 1400.0
+                    + (t * 733.0).sin() * 1400.0
+                    + (t * 1411.0).sin() * 1200.0) as i16
+            })
+            .collect();
+        // Either trimming rejects uniform floor (peak < 1.5*noise), or SNR is below 6 dB
+        if let Ok(sample) = process_sample(&pcm, 1, 1, "near") {
+            assert!(
+                sample.snr < 6.0,
+                "stationary continuous noise must not get artificial >6dB SNR, got {}",
+                sample.snr
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_samples_flags_duration_and_isolated_outliers() {
+        let mut session = EnrollmentSession::new("shtuchka".to_string());
+        for _ in 0..8 {
+            let mut audio = vec![0i16; 2400];
+            audio.extend(generate_synthetic_keyword(440.0, 1.0));
+            audio.extend(vec![0i16; 2400]);
+            session.add_pcm_sample(&audio).expect("normal sample");
+        }
+        // Too short duration outlier (0.35s vs 1.0s median -> id=9)
+        let mut short_audio = vec![0i16; 2400];
+        short_audio.extend(generate_synthetic_keyword(440.0, 0.35));
+        short_audio.extend(vec![0i16; 2400]);
+        session.add_pcm_sample(&short_audio).expect("short outlier");
+
+        // Acoustic pitch outlier matching normal duration (id=10)
+        let mut weird_audio = vec![0i16; 2400];
+        weird_audio.extend(generate_synthetic_keyword(3600.0, 1.0));
+        weird_audio.extend(vec![0i16; 2400]);
+        session.add_pcm_sample(&weird_audio).expect("weird outlier");
+
+        let report = session.analyze_signature();
+        let short_report = report.samples.iter().find(|s| s.id == 9).unwrap();
+        let weird_report = report.samples.iter().find(|s| s.id == 10).unwrap();
+        assert!(
+            short_report.is_outlier,
+            "short duration fragment must be flagged"
+        );
+        assert!(
+            weird_report.is_outlier,
+            "isolated signature must be flagged"
+        );
+        assert!(!report.selected_template_ids.contains(&9));
+        assert!(!report.selected_template_ids.contains(&10));
     }
 }
