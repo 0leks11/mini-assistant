@@ -4277,19 +4277,45 @@ impl ControlCenterServer {
             }
         };
 
-        // Visual indicator: pulse amber LED
+        // Play brief Ready chime and let speaker decay settle before opening mic capture
+        let ready_cue = crate::acoustics::jobs::CueRequestDto {
+            kind: crate::acoustics::jobs::CueKind::Ready,
+            freq_hz: None,
+            duration_ms: None,
+            volume_dbfs: Some(-14.0),
+            volume_pct: Some(45),
+        };
+        if let Err(e) = self.job_runner.play_cue(&ready_cue, None).await {
+            tracing::debug!("Wakeword pre-record cue skipped: {e}");
+        } else {
+            tokio::time::sleep(Duration::from_millis(160)).await;
+        }
+
+        // Visual indicator: switch LED ring to bright green (distinct from idle amber) while recording
         let prev_color = self.current_led_color.read().await.clone();
-        set_led_hardware("amber");
+        set_led_hardware("emerald");
 
         // Record 3.8 seconds of audio from Mini's hardware microphone (accommodates compound words up to 5 syllables)
         let record_res = recorder.record(Duration::from_millis(3800)).await;
 
-        // Restore LED
+        // Restore LED and play soft completion tick asynchronously
         set_led_hardware(&prev_color);
+        let runner = self.job_runner.clone();
+        tokio::spawn(async move {
+            let ack_cue = crate::acoustics::jobs::CueRequestDto {
+                kind: crate::acoustics::jobs::CueKind::Ack,
+                freq_hz: None,
+                duration_ms: None,
+                volume_dbfs: Some(-18.0),
+                volume_pct: Some(45),
+            };
+            let _ = runner.play_cue(&ack_cue, None).await;
+        });
 
         let pcm = match record_res {
             Ok(p) => p,
             Err(e) => {
+                tracing::warn!(error = %e, "Hardware wakeword capture failed");
                 let err = serde_json::json!({
                     "status": "error",
                     "message": format!("Ошибка записи микрофона: {e}")
@@ -4302,6 +4328,13 @@ impl ControlCenterServer {
 
         match sess.add_pcm_sample(&pcm) {
             Ok(sample) => {
+                tracing::info!(
+                    sample_id = sample.id,
+                    duration_ms = sample.duration_ms,
+                    snr_db = sample.snr,
+                    peak_rms = sample.peak_rms,
+                    "Wakeword sample accepted"
+                );
                 let (phase, phase_name) = EnrollmentSession::phase_for_step(sess.current_step);
                 let resp = serde_json::json!({
                     "status": "ok",
@@ -4316,6 +4349,17 @@ impl ControlCenterServer {
                 self.send_json(stream, &resp).await
             }
             Err(e) => {
+                let raw_rms = crate::acoustics::pcm_rms(
+                    &pcm.iter()
+                        .flat_map(|s| s.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                );
+                tracing::warn!(
+                    error = %e,
+                    raw_samples = pcm.len(),
+                    raw_rms,
+                    "Wakeword sample rejected"
+                );
                 let err = serde_json::json!({
                     "status": "error",
                     "message": format!("{e}")

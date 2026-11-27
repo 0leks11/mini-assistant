@@ -300,23 +300,82 @@ pub fn encode_wav_pcm16(samples: &[i16]) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-/// Computes 10 ms frame RMS energies over a PCM16 slice.
+/// Computes DC-removed 10 ms frame RMS energies over a PCM16 slice.
 fn frame_rms_10ms(samples: &[i16]) -> Vec<f64> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let dc_mean = samples.iter().map(|&v| f64::from(v)).sum::<f64>() / samples.len() as f64;
     samples
         .chunks(160)
         .map(|frame| {
-            (frame.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / frame.len() as f64).sqrt()
+            (frame
+                .iter()
+                .map(|&v| (f64::from(v) - dc_mean).powi(2))
+                .sum::<f64>()
+                / frame.len() as f64)
+                .sqrt()
         })
         .collect()
 }
 
-/// Computes speech boundaries `(start, end)` in sample indices using dynamic RMS energy threshold.
+/// Applies a 5-frame (50 ms) sliding median filter to suppress isolated 10-20 ms clicks and rustles.
+fn median_filter_5(values: &[f64]) -> Vec<f64> {
+    let n = values.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let lo = i.saturating_sub(2);
+        let hi = (i + 2).min(n - 1);
+        let mut win = [0.0f64; 5];
+        let count = hi - lo + 1;
+        win[..count].copy_from_slice(&values[lo..=hi]);
+        win[..count].sort_by(f64::total_cmp);
+        out.push(win[count / 2]);
+    }
+    out
+}
+
+fn span_from_threshold(
+    rms: &[f64],
+    peak_index: usize,
+    threshold: f64,
+    max_gap: usize,
+    pad_pre: usize,
+    pad_post: usize,
+    total_samples: usize,
+) -> (usize, usize) {
+    let mut first = peak_index;
+    for i in (0..peak_index).rev() {
+        if rms[i] >= threshold {
+            first = i;
+        }
+        if first.saturating_sub(i) >= max_gap {
+            break;
+        }
+    }
+
+    let mut last = peak_index;
+    for (i, value) in rms.iter().enumerate().skip(peak_index + 1) {
+        if *value >= threshold {
+            last = i;
+        }
+        if i.saturating_sub(last) >= max_gap {
+            break;
+        }
+    }
+
+    let start = first.saturating_sub(pad_pre) * 160;
+    let end = ((last + 1 + pad_post) * 160).min(total_samples);
+    (start, end)
+}
+
+/// Computes speech boundaries `(start, end)` in sample indices using DC-free, click-filtered RMS energy.
 fn trim_enrollment_bounds(samples: &[i16]) -> Result<(usize, usize)> {
     ensure!(!samples.is_empty(), "Empty audio buffer");
 
-    let rms = frame_rms_10ms(samples);
-
-    ensure!(!rms.is_empty(), "Audio too short for analysis");
+    let raw_rms = frame_rms_10ms(samples);
+    ensure!(!raw_rms.is_empty(), "Audio too short for analysis");
+    let rms = median_filter_5(&raw_rms);
 
     let mut sorted = rms.clone();
     sorted.sort_by(f64::total_cmp);
@@ -329,8 +388,6 @@ fn trim_enrollment_bounds(samples: &[i16]) -> Result<(usize, usize)> {
         "В записи не обнаружено отчётливого голоса (слишком тихо или фоновый шум)"
     );
 
-    let threshold = (peak * 0.30).max(noise * 3.0).min(peak * 0.65);
-
     let peak_index = rms
         .iter()
         .enumerate()
@@ -338,30 +395,46 @@ fn trim_enrollment_bounds(samples: &[i16]) -> Result<(usize, usize)> {
         .map(|(i, _)| i)
         .context("Empty recording")?;
 
-    let mut first = peak_index;
-    for i in (0..peak_index).rev() {
-        if rms[i] >= threshold {
-            first = i;
-        }
-        if first.saturating_sub(i) >= 36 {
-            break;
+    let primary_thr = (peak * 0.30).max(noise * 3.5).min(peak * 0.65);
+    let (mut start, mut end) =
+        span_from_threshold(&rms, peak_index, primary_thr, 36, 10, 12, samples.len());
+
+    // If low-level rustling/breathing bridged beyond 3.0s, tighten around the vocal core before failing.
+    if end.saturating_sub(start) > MAX_SAMPLES {
+        for &(pct_peak, noise_mult, max_cap, max_gap, pad_pre, pad_post) in &[
+            (0.36_f64, 3.5_f64, 0.65_f64, 28_usize, 8_usize, 10_usize),
+            (0.42, 4.0, 0.65, 20, 6, 8),
+        ] {
+            let thr = (peak * pct_peak)
+                .max(noise * noise_mult)
+                .min(peak * max_cap);
+            let (cand_start, cand_end) = span_from_threshold(
+                &rms,
+                peak_index,
+                thr,
+                max_gap,
+                pad_pre,
+                pad_post,
+                samples.len(),
+            );
+            start = cand_start;
+            end = cand_end;
+            if end.saturating_sub(start) <= MAX_SAMPLES {
+                break;
+            }
         }
     }
 
-    let mut last = peak_index;
-    for (i, value) in rms.iter().enumerate().skip(peak_index + 1) {
-        if *value >= threshold {
-            last = i;
-        }
-        if i.saturating_sub(last) >= 36 {
-            break;
-        }
-    }
-
-    // Add 10 frames (100 ms) before and 12 frames (120 ms) after for natural envelope
-    let start = first.saturating_sub(10) * 160;
-    let end = ((last + 1 + 12) * 160).min(samples.len());
     let len = end.saturating_sub(start);
+    tracing::debug!(
+        raw_samples = samples.len(),
+        ac_peak_rms = peak as f32,
+        ac_noise_p10 = noise as f32,
+        trimmed_start_ms = (start as f64 / 16.0).round() as u32,
+        trimmed_end_ms = (end as f64 / 16.0).round() as u32,
+        trimmed_ms = (len as f64 / 16.0).round() as u32,
+        "Enrollment trim computed"
+    );
 
     ensure!(
         len >= MIN_SAMPLES,
@@ -370,7 +443,7 @@ fn trim_enrollment_bounds(samples: &[i16]) -> Result<(usize, usize)> {
     );
     ensure!(
         len <= MAX_SAMPLES,
-        "Запись слишком длинная ({:.1} с). Произносите только слово вызова (до 3 сек).",
+        "Речь или фоновый шум заняли {:.1} с (допустимо до 3.0 с). Говорите короче и соблюдайте тишину после фразы.",
         len as f64 / 16000.0
     );
 
@@ -1240,5 +1313,46 @@ mod tests {
         );
         assert!(!report.selected_template_ids.contains(&9));
         assert!(!report.selected_template_ids.contains(&10));
+    }
+
+    #[test]
+    fn test_trim_enrollment_ignores_laptop_clicks_and_dc_offset() {
+        // 3.8 s buffer with +500 DC bias, one 1.0 s spoken phrase, and periodic 20 ms key clicks
+        let mut pcm = vec![500i16; 60_800];
+        let word = generate_synthetic_keyword(480.0, 1.0);
+        for (idx, s) in word.into_iter().enumerate() {
+            pcm[8_000 + idx] = s.saturating_add(500);
+        }
+        // Inject 20 ms (320 samples) high-amplitude laptop key clicks every 250 ms across the buffer
+        for click_start in (400..59_000).step_by(4_000) {
+            for j in 0..320 {
+                let sign = if j % 2 == 0 { 1 } else { -1 };
+                pcm[click_start + j] = 9_000 * sign + 500;
+            }
+        }
+
+        let trimmed =
+            trim_enrollment(&pcm).expect("key clicks and DC offset must not reject speech");
+        assert!(
+            trimmed.len() >= 14_000 && trimmed.len() <= 24_000,
+            "expected ~1.0-1.4s trimmed word, got {} samples ({:.2}s)",
+            trimmed.len(),
+            trimmed.len() as f32 / 16000.0
+        );
+    }
+
+    #[test]
+    fn test_trim_enrollment_still_rejects_sustained_speech_over_3s() {
+        let mut pcm = vec![0i16; 3200];
+        pcm.extend(generate_synthetic_keyword(440.0, 3.5));
+        pcm.extend(vec![0i16; 3200]);
+
+        let err = trim_enrollment(&pcm)
+            .expect_err("3.5s continuous utterance must still exceed 3.0s limit")
+            .to_string();
+        assert!(
+            err.contains("3.0 с"),
+            "expected max 3.0s message, got: {err}"
+        );
     }
 }
