@@ -157,11 +157,7 @@ async fn run_preflight_check(
         .with_context(|| format!("Preflight FAIL: {} is not configured", provider.key_env()))?;
 
     // 3. Home Assistant authentication check (read-only verification)
-    if let Some(ha_cfg) = config
-        .ha
-        .as_ref()
-        .filter(|_| !conversation_only && provider == VoiceProvider::Gemini)
-    {
+    if let Some(ha_cfg) = config.ha.as_ref().filter(|_| !conversation_only) {
         if let Some(ref token) = ha_cfg.token {
             if !token.trim().is_empty() && !ha_cfg.allowed_entities.is_empty() {
                 eprintln!("⏳ Testing Home Assistant connection to {}...", ha_cfg.url);
@@ -409,7 +405,7 @@ async fn main() -> Result<()> {
                 provider.name(),
                 voice.voice
             );
-            let tools_allowed = !conversation_only && provider == VoiceProvider::Gemini;
+            let tools_allowed = !conversation_only;
             let alarm_tools_enabled = alarms_enabled && tools_allowed;
 
             // 4. Initialize Home Assistant client if configured
@@ -941,7 +937,7 @@ async fn main() -> Result<()> {
                         }
 
                         if req.function_name == "enable_bluetooth" {
-                            info!("Gemini requested enable_bluetooth");
+                            info!("Assistant requested enable_bluetooth");
                             match crate::bluetooth::enable_discoverable(0).await {
                                 Ok(msg) => {
                                     let _ = req.reply_tx.send(json!({

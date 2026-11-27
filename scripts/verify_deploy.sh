@@ -121,7 +121,13 @@ REMOTE "grep -q . /proc/asound/card0/pcm0p/sub0/status"; check "ALSA playback PC
 
 # 6. Runtime log markers
 LOG_TAIL="$(REMOTE "tail -n 2000 $MINI_DEPLOY_DIR/assistant.log 2>/dev/null")"
-grep -q "setupComplete confirmed" <<< "$LOG_TAIL"; check "Gemini Live setupComplete" $?
+EXPECTED_PROVIDER="$(REMOTE "grep -E '^\s*provider\s*=' $MINI_DEPLOY_DIR/config.toml 2>/dev/null | head -n1 | cut -d'\"' -f2 | tr '[:upper:]' '[:lower:]' | tr -d ' ' || echo gemini")"
+[ -z "$EXPECTED_PROVIDER" ] && EXPECTED_PROVIDER="gemini"
+if [ "$EXPECTED_PROVIDER" = "openai" ]; then
+    grep -q "OpenAI Realtime setup handshake completed successfully" <<< "$LOG_TAIL"; check "OpenAI Realtime setup handshake" $?
+else
+    grep -q "setupComplete confirmed" <<< "$LOG_TAIL"; check "Gemini Live setupComplete" $?
+fi
 grep -q "spotify_tools: true" <<< "$LOG_TAIL"; check "spotify tools registered" $?
 grep -q "volume_tools: true" <<< "$LOG_TAIL"; check "volume tools registered" $?
 grep -q "VL53L0 proximity gesture volume reader active" <<< "$LOG_TAIL"; check "VL53 reader active" $?
