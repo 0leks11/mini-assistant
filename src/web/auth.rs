@@ -265,7 +265,8 @@ impl AuthManager {
                 | "/api/v1/calibration/tokens"
                 | "/api/v1/calibration/tokens/revoke"
                 | "/api/v1/calibration/lease/revoke"
-        ) || path.starts_with("/api/spotify")
+        ) || path.starts_with("/api/v1/auth")
+            || path.starts_with("/api/spotify")
             || path.starts_with("/spotify")
             || path.starts_with("/api/v1/wakeword");
 
@@ -780,6 +781,9 @@ mod tests {
             "/api/v1/voice",
             "/api/v1/volume",
             "/api/v1/led",
+            "/api/v1/auth/status",
+            "/api/v1/auth/key",
+            "/api/v1/auth/openai/device/start",
             "/api/spotify/play",
             "/api/spotify/pause",
             "/api/v1/wakeword/session/start",

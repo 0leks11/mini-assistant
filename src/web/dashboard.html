@@ -215,6 +215,74 @@
       border-color: #58a6ff;
       color: #58a6ff;
     }
+    .provider-sub {
+      display: block;
+      font-size: 11px;
+      font-weight: 500;
+      margin-top: 2px;
+      opacity: 0.85;
+    }
+    .auth-box {
+      margin-top: 10px;
+      background: rgba(13, 17, 23, 0.72);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .auth-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .auth-pill {
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .auth-pill.ok { background: rgba(46,160,67,0.18); color: #3fb950; border: 1px solid rgba(46,160,67,0.35); }
+    .auth-pill.warn { background: rgba(210,153,34,0.18); color: #e3b341; border: 1px solid rgba(210,153,34,0.35); }
+    .auth-pill.err { background: rgba(218,54,51,0.18); color: #f85149; border: 1px solid rgba(218,54,51,0.35); }
+    .device-code-box {
+      background: #0d1117;
+      border: 1px dashed #58a6ff;
+      border-radius: 8px;
+      padding: 10px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .device-code-val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: 3px;
+      color: #fff;
+    }
+    .btn-sm {
+      padding: 7px 12px;
+      background: #21262d;
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+    }
+    .btn-sm.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+    .btn-sm.danger { color: #f85149; border-color: rgba(218,54,51,0.4); }
+    .auth-note { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
     .voice-select-wrap { display: flex; flex-direction: column; gap: 10px; }
     .voice-grid {
       display: grid;
@@ -664,17 +732,31 @@
     </div>
   </div>
 
-  <!-- Voice & Provider Selector -->
+  <!-- Voice & Provider Selector (Mutually Exclusive) -->
   <div class="card">
     <div class="card-title">
-      <span>Голосовая модель & провайдер</span>
+      <span>Кто отвечает сейчас (Активный ИИ)</span>
       <span id="current-voice-badge" style="color: var(--accent); font-weight: normal;">Gemini (Callirrhoe)</span>
     </div>
 
-    <!-- Provider Tabs -->
-    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-      <button class="provider-tab active" id="tab-gemini" onclick="switchProvider('gemini')">✨ Google Gemini Live</button>
-      <button class="provider-tab" id="tab-openai" onclick="switchProvider('openai')">⚡ OpenAI ChatGPT Voice</button>
+    <div id="voice-runtime-banner" class="auth-row" style="margin-bottom: 10px;">
+      <span style="color: var(--text-muted);">Состояние облака:</span>
+      <span id="voice-runtime-pill" class="auth-pill warn">Подключение...</span>
+    </div>
+
+    <!-- Mutually Exclusive Provider Toggle -->
+    <div style="display: flex; gap: 8px; margin-bottom: 6px;">
+      <button class="provider-tab active" id="tab-gemini" onclick="switchProvider('gemini')">
+        ✨ Google Gemini Live
+        <span class="provider-sub" id="tab-sub-gemini">Проверка...</span>
+      </button>
+      <button class="provider-tab" id="tab-openai" onclick="switchProvider('openai')">
+        ⚡ OpenAI ChatGPT Voice
+        <span class="provider-sub" id="tab-sub-openai">Проверка...</span>
+      </button>
+    </div>
+    <div class="auth-note" style="margin-bottom: 10px;">
+      Одновременно работает только один движок. При переключении текущий останавливается, а выбранный запускается после проверки доступа.
     </div>
 
     <div class="voice-select-wrap">
@@ -746,7 +828,54 @@
         </div>
       </div>
 
-      <button class="btn-apply-voice" id="btn-save-voice" onclick="applyVoice()">Сохранить модель и голос</button>
+      <button class="btn-apply-voice" id="btn-save-voice" onclick="applyVoice()">Переключить ассистента и голос</button>
+
+      <!-- OpenAI Account & Key Panel -->
+      <div class="auth-box" id="auth-panel-openai" style="display: none;">
+        <div class="auth-row">
+          <span><b>Доступ OpenAI:</b> <span id="openai-auth-info">Не подключён</span></span>
+          <button class="btn-sm danger" id="btn-logout-openai" style="display: none;" onclick="logoutProvider('openai')">Выйти</button>
+        </div>
+
+        <div style="display: flex; gap: 6px;">
+          <button class="btn-sm primary" style="flex: 1;" onclick="startOpenAiDeviceLogin()">🔐 Войти по коду ChatGPT (OAuth)</button>
+          <button class="btn-sm" onclick="startOpenAiPkceLoopback()">🌐 PKCE</button>
+        </div>
+
+        <div id="openai-device-box" class="device-code-box" style="display: none;">
+          <div class="auth-note">1. Нажмите ссылку, войдите в ChatGPT и введите код:</div>
+          <div class="device-code-val" id="openai-user-code">----</div>
+          <a id="openai-verify-link" href="https://auth.openai.com/codex/device" target="_blank" class="btn-sm primary">Открыть auth.openai.com/codex/device ↗</a>
+          <div class="auth-note" id="openai-device-poll-msg">Ожидаем подтверждения... (в ChatGPT Settings → Security должен быть включён Device code sign-in)</div>
+        </div>
+
+        <div id="openai-pkce-box" style="display: none; flex-direction: column; gap: 6px;">
+          <div class="auth-note">Откройте ссылку, войдите, а затем вставьте финальный URL из адресной строки (даже если браузер написал «не удаётся подключиться к localhost»):</div>
+          <a id="openai-pkce-link" href="#" target="_blank" class="btn-sm primary">Открыть страницу входа OpenAI ↗</a>
+          <div class="ww-input-row">
+            <input type="text" id="openai-pkce-input" class="ww-input" style="font-size: 12px;" placeholder="http://localhost:1455/auth/callback?code=...">
+            <button class="btn-sm primary" onclick="completeOpenAiPkce()">Готово</button>
+          </div>
+        </div>
+
+        <div class="ww-input-row">
+          <input type="password" id="openai-key-input" class="ww-input" style="font-size: 12px;" placeholder="Или вставьте API-ключ OpenAI (sk-...)">
+          <button class="btn-sm primary" onclick="saveProviderKey('openai')">Сохранить</button>
+        </div>
+      </div>
+
+      <!-- Gemini Account & Key Panel -->
+      <div class="auth-box" id="auth-panel-gemini">
+        <div class="auth-row">
+          <span><b>Доступ Gemini Live:</b> <span id="gemini-auth-info">Проверка...</span></span>
+          <button class="btn-sm danger" id="btn-logout-gemini" style="display: none;" onclick="logoutProvider('gemini')">Сбросить</button>
+        </div>
+        <div class="ww-input-row">
+          <input type="password" id="gemini-key-input" class="ww-input" style="font-size: 12px;" placeholder="Ключ Google AI Studio (AIza...)">
+          <button class="btn-sm primary" onclick="saveProviderKey('gemini')">Проверить и сохранить</button>
+        </div>
+        <div class="auth-note">Если ключ уже задан в <code>.env</code>, он сохраняется; новый ключ здесь проверяется на лету и перекрывает его.</div>
+      </div>
     </div>
   </div>
 
@@ -917,6 +1046,29 @@
       <button class="sp-btn" id="btn-sp-activate" onclick="spActivate()" style="display: none; width: 100%; border-color: #1db954; color: #1db954; font-weight: 600;">
         🔊 Переключить Spotify на GPT Mini
       </button>
+
+      <!-- Spotify OAuth & Client ID Setup -->
+      <div class="auth-box" style="margin-top: 6px;">
+        <div class="auth-row">
+          <span><b>Аккаунт Web API:</b> <span id="spotify-auth-detail">Проверка...</span></span>
+          <button class="btn-sm danger" id="btn-logout-spotify" style="display: none;" onclick="logoutProvider('spotify')">Сбросить</button>
+        </div>
+        <div class="ww-input-row">
+          <input type="text" id="spotify-client-id-input" class="ww-input" style="font-size: 12px;" placeholder="Spotify Client ID (из Dashboard)">
+          <button class="btn-sm" onclick="saveSpotifyClientId()">Сохранить ID</button>
+        </div>
+        <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+          <a href="/spotify/login" class="btn-sm primary" style="flex: 1;">🔗 Войти через Spotify</a>
+          <button class="btn-sm" onclick="openSpotifyLoopback()">Loopback + ссылка</button>
+        </div>
+        <div id="spotify-paste-box" style="display: none; flex-direction: column; gap: 6px;">
+          <div class="auth-note">Вставьте адрес после редиректа Spotify (<code>http://127.0.0.1:8080/spotify/callback?code=...</code>):</div>
+          <div class="ww-input-row">
+            <input type="text" id="spotify-paste-input" class="ww-input" style="font-size: 12px;" placeholder="http://127.0.0.1:8080/spotify/callback?code=...">
+            <button class="btn-sm primary" onclick="completeSpotifyPaste()">Применить</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -960,18 +1112,40 @@
   }
 
   let voiceDirty = false;
+  let openAiPollTimer = null;
 
-  function switchProvider(prov) {
-    voiceDirty = true;
-    selectedProvider = prov;
+  (function checkUrlAuthNotice() {
+    const p = new URLSearchParams(window.location.search);
+    const st = p.get("status");
+    if (st === "openai_success") {
+      showToast("OpenAI успешно подключён!");
+      history.replaceState({}, "", "/");
+    } else if (st === "spotify_success") {
+      showToast("Spotify успешно авторизован!");
+      history.replaceState({}, "", "/");
+    }
+  })();
+
+  function updateProviderPanelsVisibility(prov) {
     const isGemini = prov === "gemini";
     document.getElementById("tab-gemini").classList.toggle("active", isGemini);
     document.getElementById("tab-openai").classList.toggle("active", !isGemini);
     document.getElementById("grid-gemini").style.display = isGemini ? "grid" : "none";
     document.getElementById("grid-openai").style.display = isGemini ? "none" : "grid";
+    const panelGemini = document.getElementById("auth-panel-gemini");
+    const panelOpenai = document.getElementById("auth-panel-openai");
+    if (panelGemini) panelGemini.style.display = isGemini ? "flex" : "none";
+    if (panelOpenai) panelOpenai.style.display = isGemini ? "none" : "flex";
+  }
+
+  function switchProvider(prov) {
+    voiceDirty = true;
+    selectedProvider = prov;
+    updateProviderPanelsVisibility(prov);
 
     const geminiVoices = ["Callirrhoe", "Autonoe", "Puck", "Charon", "Kore", "Fenrir", "Aoede"];
     const openaiVoices = ["alloy", "echo", "coral", "sage", "ash", "shimmer", "ballad", "verse"];
+    const isGemini = prov === "gemini";
     if (isGemini && !geminiVoices.some(v => v.toLowerCase() === selectedVoice.toLowerCase())) {
       selectedVoice = "Callirrhoe";
     } else if (!isGemini && !openaiVoices.some(v => v.toLowerCase() === selectedVoice.toLowerCase())) {
@@ -993,7 +1167,7 @@
   async function applyVoice() {
     const btn = document.getElementById("btn-save-voice");
     btn.disabled = true;
-    btn.innerText = "Сохранение...";
+    btn.innerText = "Проверка и применение...";
     try {
       const res = await fetch("/api/v1/voice", {
         method: "POST",
@@ -1002,18 +1176,201 @@
       });
       const data = await res.json();
       if (!res.ok || data.status === "error") {
-        showToast("Ошибка: " + (data.message || "Не удалось сохранить"));
+        showToast("Ошибка: " + (data.message || "Не удалось переключить"));
         return;
       }
       voiceDirty = false;
-      showToast(data.message || "Голосовая модель успешно обновлена!");
+      showToast(data.message || "Активный ассистент обновлён!");
       const provLabel = selectedProvider === "openai" ? "OpenAI" : "Gemini";
       document.getElementById("current-voice-badge").innerText = `${provLabel} (${selectedVoice})`;
+      setTimeout(fetchStatus, 1800);
     } catch (e) {
       showToast("Ошибка сохранения: " + e.message);
     } finally {
       btn.disabled = false;
-      btn.innerText = "Сохранить модель и голос";
+      btn.innerText = "Переключить ассистента и голос";
+    }
+  }
+
+  async function saveProviderKey(prov) {
+    const inp = document.getElementById(prov === "openai" ? "openai-key-input" : "gemini-key-input");
+    const secret = (inp ? inp.value : "").trim();
+    if (!secret) {
+      showToast("Вставьте API-ключ");
+      return;
+    }
+    showToast("Проверяем ключ...");
+    try {
+      const res = await fetch("/api/v1/auth/key", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: prov, secret: secret, verify: true })
+      });
+      const data = await res.json();
+      if (!res.ok || data.status === "error") {
+        showToast("Отклонено: " + (data.message || "Неверный ключ"));
+        return;
+      }
+      if (inp) inp.value = "";
+      showToast(data.message || "Ключ сохранён!");
+      fetchStatus();
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
+  async function logoutProvider(prov) {
+    if (!confirm("Удалить сохранённый токен для " + prov + "?")) return;
+    try {
+      const res = await fetch("/api/v1/auth/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: prov })
+      });
+      const data = await res.json();
+      showToast(data.message || "Выход выполнен");
+      fetchStatus();
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
+  async function startOpenAiDeviceLogin() {
+    if (openAiPollTimer) { clearInterval(openAiPollTimer); openAiPollTimer = null; }
+    showToast("Запрашиваем код входа OpenAI...");
+    try {
+      const res = await fetch("/api/v1/auth/openai/device/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      const data = await res.json();
+      if (!res.ok || data.status === "error") {
+        showToast("Ошибка OAuth: " + (data.message || "Не удалось начать вход"));
+        return;
+      }
+      document.getElementById("openai-device-box").style.display = "flex";
+      document.getElementById("openai-pkce-box").style.display = "none";
+      document.getElementById("openai-user-code").innerText = data.user_code;
+      document.getElementById("openai-verify-link").href = data.verification_url;
+      const pollMsg = document.getElementById("openai-device-poll-msg");
+      pollMsg.innerText = "Ожидаем подтверждения в браузере...";
+
+      const sid = data.session_id;
+      const stepMs = Math.max(3000, (data.interval_secs || 5) * 1000);
+      openAiPollTimer = setInterval(async () => {
+        try {
+          const pr = await fetch("/api/v1/auth/openai/device/poll?session_id=" + encodeURIComponent(sid), { cache: "no-store" });
+          const pd = await pr.json();
+          if (pd.status === "authorized") {
+            clearInterval(openAiPollTimer);
+            openAiPollTimer = null;
+            document.getElementById("openai-device-box").style.display = "none";
+            if (pd.realtime_verified) {
+              showToast("Вход OpenAI выполнен и проверен для Realtime!");
+            } else {
+              showToast("OAuth-токен OpenAI сохранён, но Realtime WS не принял его: " + (pd.realtime_detail || "проверьте биллинг/план"));
+            }
+            fetchStatus();
+          } else if (pd.status === "expired" || pd.status === "error") {
+            clearInterval(openAiPollTimer);
+            openAiPollTimer = null;
+            pollMsg.innerText = pd.message || "Сессия истекла";
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }, stepMs);
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
+  async function startOpenAiPkceLoopback() {
+    try {
+      const res = await fetch("/api/v1/auth/openai/login?mode=loopback&json=1", { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok || !data.authorize_url) {
+        showToast(data.message || "Ошибка запуска PKCE");
+        return;
+      }
+      document.getElementById("openai-pkce-box").style.display = "flex";
+      document.getElementById("openai-device-box").style.display = "none";
+      document.getElementById("openai-pkce-link").href = data.authorize_url;
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
+  async function completeOpenAiPkce() {
+    const inp = document.getElementById("openai-pkce-input");
+    const val = (inp ? inp.value : "").trim();
+    if (!val) { showToast("Вставьте URL после редиректа"); return; }
+    try {
+      const res = await fetch("/api/v1/auth/openai/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input: val })
+      });
+      const data = await res.json();
+      if (!res.ok || data.status === "error") {
+        showToast("Ошибка: " + (data.message || "Код не принят"));
+        return;
+      }
+      if (inp) inp.value = "";
+      document.getElementById("openai-pkce-box").style.display = "none";
+      showToast(data.realtime_verified ? "OpenAI OAuth авторизован!" : ("Токен сохранён, Realtime check: " + (data.realtime_detail || "предупреждение")));
+      fetchStatus();
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
+  async function saveSpotifyClientId() {
+    const inp = document.getElementById("spotify-client-id-input");
+    const cid = (inp ? inp.value : "").trim();
+    if (!cid) { showToast("Введите Spotify Client ID"); return; }
+    try {
+      const res = await fetch("/api/v1/auth/key", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "spotify", client_id: cid })
+      });
+      const data = await res.json();
+      showToast(data.message || "Сохранено");
+      fetchStatus();
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    }
+  }
+
+  function openSpotifyLoopback() {
+    document.getElementById("spotify-paste-box").style.display = "flex";
+    const uri = "http://127.0.0.1:8080/spotify/callback";
+    window.open("/spotify/login?redirect_uri=" + encodeURIComponent(uri), "_blank");
+  }
+
+  async function completeSpotifyPaste() {
+    const inp = document.getElementById("spotify-paste-input");
+    const val = (inp ? inp.value : "").trim();
+    if (!val) { showToast("Вставьте ссылку редиректа"); return; }
+    try {
+      const res = await fetch("/api/v1/auth/spotify/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input: val })
+      });
+      const data = await res.json();
+      if (!res.ok || data.status === "error") {
+        showToast("Ошибка: " + (data.message || "Не удалось подключить Spotify"));
+        return;
+      }
+      if (inp) inp.value = "";
+      document.getElementById("spotify-paste-box").style.display = "none";
+      showToast(data.message || "Spotify подключён!");
+      fetchStatus();
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
     }
   }
 
@@ -1149,14 +1506,59 @@
       if (!voiceDirty) {
         if (data.provider) {
           selectedProvider = data.provider.toLowerCase();
-          const isGemini = selectedProvider === "gemini";
-          document.getElementById("tab-gemini").classList.toggle("active", isGemini);
-          document.getElementById("tab-openai").classList.toggle("active", !isGemini);
-          document.getElementById("grid-gemini").style.display = isGemini ? "grid" : "none";
-          document.getElementById("grid-openai").style.display = isGemini ? "none" : "grid";
+          updateProviderPanelsVisibility(selectedProvider);
         }
         if (data.voice) {
           selectVoice(data.voice, true);
+        }
+      }
+
+      // Voice Runtime & Auth Status
+      if (data.voice_runtime) {
+        const vrPill = document.getElementById("voice-runtime-pill");
+        if (vrPill) {
+          const s = data.voice_runtime.status || "starting";
+          const curLabel = (data.provider || "gemini") === "openai" ? "OpenAI" : "Gemini";
+          if (s === "ready") {
+            vrPill.className = "auth-pill ok";
+            vrPill.innerText = `Активен: ${curLabel}`;
+          } else if (s === "connecting" || s === "starting") {
+            vrPill.className = "auth-pill warn";
+            vrPill.innerText = `Подключение ${curLabel}...`;
+          } else if (s === "needs_auth" || s === "auth_error") {
+            vrPill.className = "auth-pill err";
+            vrPill.innerText = data.voice_runtime.detail || "Требуется авторизация";
+          } else {
+            vrPill.className = "auth-pill warn";
+            vrPill.innerText = data.voice_runtime.detail || s;
+          }
+        }
+      }
+      if (data.auth) {
+        const g = data.auth.gemini;
+        const o = data.auth.openai;
+        const sp = data.auth.spotify;
+        const subG = document.getElementById("tab-sub-gemini");
+        const subO = document.getElementById("tab-sub-openai");
+        if (subG && g) subG.innerText = g.configured ? `✓ Подключён (${g.masked_hint || "ключ"})` : "○ Нет ключа";
+        if (subO && o) subO.innerText = o.configured ? `✓ ${o.auth_mode === "oauth" ? "OAuth" : "Ключ"} (${o.masked_hint || "ок"})` : "○ Не подключён";
+        const gInfo = document.getElementById("gemini-auth-info");
+        if (gInfo && g) {
+          gInfo.innerText = g.configured ? `Подключён (${g.masked_hint}, ${g.source || "config"})` : "Не настроен";
+          document.getElementById("btn-logout-gemini").style.display = (g.source === "credentials.json") ? "inline-flex" : "none";
+        }
+        const oInfo = document.getElementById("openai-auth-info");
+        if (oInfo && o) {
+          const modeLabel = o.auth_mode === "oauth" ? (o.account_label || "ChatGPT OAuth") : "API Key";
+          oInfo.innerText = o.configured ? `Подключён (${modeLabel}, ${o.masked_hint})` : "Не подключён";
+          document.getElementById("btn-logout-openai").style.display = (o.source === "credentials.json") ? "inline-flex" : "none";
+        }
+        const spDetail = document.getElementById("spotify-auth-detail");
+        if (spDetail && sp) {
+          spDetail.innerText = sp.has_refresh_token
+            ? `Подключён (ID ${sp.masked_client_id || "ок"})`
+            : (sp.client_id_set ? `ID задан (${sp.masked_client_id}), требуется вход` : "Client ID не задан");
+          document.getElementById("btn-logout-spotify").style.display = sp.has_refresh_token ? "inline-flex" : "none";
         }
       }
 

@@ -10,7 +10,9 @@
 
 use crate::audio::volume;
 use crate::config::{Config, VoiceProvider};
-use crate::credentials::{CredentialsStore, VoiceRuntimeState};
+use crate::credentials::{
+    AuthMode, CredentialsStore, ProviderCredentials, SpotifyCredentials, VoiceRuntimeState,
+};
 use crate::spotify::crypto::pkce_code_challenge;
 use crate::spotify::web_api::SpotifyApiClient;
 use crate::spotify::{
@@ -19,7 +21,14 @@ use crate::spotify::{
 };
 use crate::wakeword::enrollment::{decode_wav_pcm16, EnrollmentSession, HardwareRecorder};
 pub mod auth;
+pub mod auth_providers;
 use auth::{AuthManager, CalibrationLease, RequestIdentity, Scope};
+use auth_providers::{
+    build_openai_pkce_authorize_url, default_openai_client_id, ensure_fresh_voice_credential,
+    exchange_openai_code_for_tokens, now_unix_secs, openai_auth_base_url,
+    parse_pasted_oauth_callback, poll_openai_device_auth, start_openai_device_auth,
+    verify_provider_credential, DeviceAuthSession, DevicePollOutcome, PendingOAuthPkce,
+};
 
 use anyhow::{Context, Result};
 use rustpotter::{WakewordLoad, WakewordRef, WakewordSave};
@@ -50,9 +59,13 @@ pub struct ControlCenterServer {
     soloist_client: Option<Arc<SoloistClient>>,
     ducker: Arc<MusicDucker>,
     token_path: Option<PathBuf>,
-    client_id: String,
+    client_id: Arc<RwLock<String>>,
     redirect_uri: String,
     pending_auths: Arc<RwLock<HashMap<String, PendingAuth>>>,
+    pending_openai_pkce: Arc<RwLock<HashMap<String, PendingOAuthPkce>>>,
+    pending_openai_device: Arc<RwLock<HashMap<String, DeviceAuthSession>>>,
+    openai_auth_base_override: Option<String>,
+    verify_endpoint_override: Arc<RwLock<Option<String>>>,
     start_time: Instant,
     current_led_color: Arc<RwLock<String>>,
     wakeword_session: Arc<RwLock<Option<EnrollmentSession>>>,
@@ -69,6 +82,7 @@ pub struct ControlCenterServer {
     credentials_store: Option<CredentialsStore>,
     voice_runtime_state: Arc<RwLock<VoiceRuntimeState>>,
     exit_on_restart: bool,
+    run_live_handshake: bool,
 }
 
 impl ControlCenterServer {
@@ -140,9 +154,13 @@ impl ControlCenterServer {
             soloist_client,
             ducker,
             token_path: None,
-            client_id,
+            client_id: Arc::new(RwLock::new(client_id)),
             redirect_uri,
             pending_auths: Arc::new(RwLock::new(HashMap::new())),
+            pending_openai_pkce: Arc::new(RwLock::new(HashMap::new())),
+            pending_openai_device: Arc::new(RwLock::new(HashMap::new())),
+            openai_auth_base_override: None,
+            verify_endpoint_override: Arc::new(RwLock::new(None)),
             start_time: Instant::now(),
             current_led_color: Arc::new(RwLock::new("azure".to_string())),
             wakeword_session: Arc::new(RwLock::new(None)),
@@ -159,7 +177,22 @@ impl ControlCenterServer {
             credentials_store,
             voice_runtime_state: Arc::new(RwLock::new(VoiceRuntimeState::new("starting", None))),
             exit_on_restart: !cfg!(test),
+            run_live_handshake: !cfg!(test),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_openai_auth_base_override(mut self, base_url: String) -> Self {
+        self.openai_auth_base_override = Some(base_url);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_verify_endpoint_override(self, endpoint: String) -> Self {
+        if let Ok(mut guard) = self.verify_endpoint_override.try_write() {
+            *guard = Some(endpoint);
+        }
+        self
     }
 
     pub fn with_credentials_store(mut self, store: CredentialsStore) -> Self {
@@ -893,14 +926,71 @@ impl ControlCenterServer {
                 }
             }
 
+            // Auth & Onboarding API (Owner-only via auth.rs)
+            ("GET", "/api/v1/auth/status") => {
+                self.handle_api_auth_status(&mut stream).await?;
+            }
+            ("POST", "/api/v1/auth/key") => {
+                self.handle_api_auth_key(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/auth/logout") => {
+                self.handle_api_auth_logout(&mut stream, body).await?;
+            }
+            ("POST", "/api/v1/auth/openai/device/start") => {
+                self.handle_api_openai_device_start(&mut stream, body)
+                    .await?;
+            }
+            ("GET", "/api/v1/auth/openai/device/poll") => {
+                self.handle_api_openai_device_poll(&mut stream, query)
+                    .await?;
+            }
+            ("GET", "/api/v1/auth/openai/login") => {
+                self.handle_api_openai_pkce_login(&mut stream, query, host.as_deref())
+                    .await?;
+            }
+            ("GET", "/api/v1/auth/openai/callback") => {
+                self.handle_api_openai_pkce_callback(&mut stream, query)
+                    .await?;
+            }
+            ("POST", "/api/v1/auth/openai/complete") => {
+                self.handle_api_openai_pkce_complete(&mut stream, body)
+                    .await?;
+            }
+            ("POST", "/api/v1/auth/spotify/complete") => {
+                self.handle_api_spotify_complete(&mut stream, body).await?;
+            }
+
             // Spotify OAuth PKCE Flow
             ("GET", "/spotify/login") => {
-                let (auth_url, state) = self.create_authorization_url(&active_redirect_uri).await;
-                info!(%state, "Initiated Spotify PKCE authorization");
-                let redirect_header = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {auth_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                stream.write_all(redirect_header.as_bytes()).await?;
+                let qmap = parse_query(query.unwrap_or(""));
+                let chosen_redirect = qmap
+                    .get("redirect_uri")
+                    .filter(|u| {
+                        u.starts_with("http://127.0.0.1")
+                            || u.starts_with("http://localhost")
+                            || host
+                                .as_deref()
+                                .is_some_and(|h| u.starts_with(&format!("http://{h}/")))
+                    })
+                    .cloned()
+                    .unwrap_or(active_redirect_uri);
+                let client_id_val = self.client_id.read().await.clone();
+                if client_id_val.trim().is_empty() {
+                    self.send_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/html; charset=utf-8",
+                        b"<h1>Spotify Client ID \xD0\xBD\xD0\xB5 \xD0\xB7\xD0\xB0\xD0\xB4\xD0\xB0\xD0\xBD</h1><p>\xD0\xA3\xD0\xBA\xD0\xB0\xD0\xB6\xD0\xB8\xD1\x82\xD0\xB5 Spotify Client ID \xD0\xB2 \xD0\xBF\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBB\xD0\xB8 <a href='/'>\xD1\x83\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBB\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F</a>.</p>",
+                    )
+                    .await?;
+                } else {
+                    let (auth_url, state) = self.create_authorization_url(&chosen_redirect).await;
+                    info!(%state, "Initiated Spotify PKCE authorization");
+                    let redirect_header = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {auth_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream.write_all(redirect_header.as_bytes()).await?;
+                }
             }
             ("GET", "/spotify/callback") => {
                 self.handle_spotify_callback(&mut stream, query).await?;
@@ -1052,6 +1142,8 @@ impl ControlCenterServer {
         struct VoiceReq {
             provider: Option<String>,
             voice: Option<String>,
+            #[serde(default)]
+            skip_verify: Option<bool>,
         }
         let req: VoiceReq = serde_json::from_str(body).context("Invalid JSON body")?;
 
@@ -1059,8 +1151,20 @@ impl ControlCenterServer {
         let target_provider = req
             .provider
             .as_deref()
-            .map(|p| p.to_lowercase())
+            .map(|p| p.trim().to_ascii_lowercase())
             .unwrap_or(cur_provider);
+
+        let provider_enum = match target_provider.as_str() {
+            "openai" => VoiceProvider::Openai,
+            "gemini" => VoiceProvider::Gemini,
+            other => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": format!("Неподдерживаемый провайдер: {other}")
+                });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
 
         let valid_gemini_voices = [
             "Callirrhoe",
@@ -1077,37 +1181,23 @@ impl ControlCenterServer {
 
         let target_voice = if let Some(ref v) = req.voice {
             v.trim().to_string()
-        } else if target_provider == "openai" {
+        } else if provider_enum == VoiceProvider::Openai {
             "alloy".to_string()
         } else {
             "Callirrhoe".to_string()
         };
 
-        let cred_store = self.resolve_credentials_store();
-        let parsed_cfg = self
-            .resolve_config_path()
-            .and_then(|p| Config::load_from(Some(&p)).ok());
-
-        let matched_voice = match target_provider.as_str() {
-            "openai" => {
-                let cfg_openai_key = parsed_cfg
-                    .as_ref()
-                    .and_then(|c| c.openai.as_ref()?.api_key.as_deref());
-                let has_openai_cred = cred_store
-                    .resolve_voice_credential(VoiceProvider::Openai, cfg_openai_key)
-                    .is_some();
-                if !has_openai_cred {
-                    let err = serde_json::json!({
-                        "status": "error",
-                        "message": "Для использования OpenAI выполните вход или укажите API-ключ на этой странице"
-                    });
-                    return self.send_json_status(stream, "400 Bad Request", &err).await;
-                }
+        let matched_voice = match provider_enum {
+            VoiceProvider::Openai => {
                 if !valid_openai_voices
                     .iter()
                     .any(|v| v.eq_ignore_ascii_case(&target_voice))
                 {
-                    anyhow::bail!("Unsupported OpenAI voice: {}", target_voice);
+                    let err = serde_json::json!({
+                        "status": "error",
+                        "message": format!("Неподдерживаемый голос OpenAI: {target_voice}")
+                    });
+                    return self.send_json_status(stream, "400 Bad Request", &err).await;
                 }
                 valid_openai_voices
                     .iter()
@@ -1115,12 +1205,16 @@ impl ControlCenterServer {
                     .unwrap()
                     .to_string()
             }
-            _ => {
+            VoiceProvider::Gemini => {
                 if !valid_gemini_voices
                     .iter()
                     .any(|v| v.eq_ignore_ascii_case(&target_voice))
                 {
-                    anyhow::bail!("Unsupported Gemini voice: {}", target_voice);
+                    let err = serde_json::json!({
+                        "status": "error",
+                        "message": format!("Неподдерживаемый голос Gemini: {target_voice}")
+                    });
+                    return self.send_json_status(stream, "400 Bad Request", &err).await;
                 }
                 valid_gemini_voices
                     .iter()
@@ -1129,6 +1223,83 @@ impl ControlCenterServer {
                     .to_string()
             }
         };
+
+        let cred_store = self.resolve_credentials_store();
+        let parsed_cfg = self
+            .resolve_config_path()
+            .and_then(|p| Config::load_from(Some(&p)).ok());
+        let cfg_key = match provider_enum {
+            VoiceProvider::Openai => parsed_cfg
+                .as_ref()
+                .and_then(|c| c.openai.as_ref()?.api_key.as_deref()),
+            VoiceProvider::Gemini => parsed_cfg
+                .as_ref()
+                .and_then(|c| c.gemini.as_ref()?.api_key.as_deref()),
+        };
+
+        let Some(resolved) = cred_store.resolve_voice_credential(provider_enum, cfg_key) else {
+            let err = serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "Для использования {} выполните вход или укажите API-ключ на этой странице",
+                    provider_enum.name()
+                )
+            });
+            return self.send_json_status(stream, "400 Bad Request", &err).await;
+        };
+
+        let fresh = match ensure_fresh_voice_credential(
+            provider_enum,
+            resolved,
+            &cred_store,
+            self.openai_auth_base_override.as_deref(),
+        )
+        .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": format!("Не удалось обновить токен {}: {e:#}. Текущий ассистент остаётся активным.", provider_enum.name())
+                });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        };
+
+        let verify_override = self.verify_endpoint_override.read().await.clone();
+        let should_verify = !req.skip_verify.unwrap_or(false)
+            && (self.run_live_handshake || verify_override.is_some());
+        if should_verify {
+            let target_model = match provider_enum {
+                VoiceProvider::Gemini => parsed_cfg
+                    .as_ref()
+                    .and_then(|c| c.gemini.as_ref().map(|g| g.model.as_str()))
+                    .unwrap_or("models/gemini-3.8-live"),
+                VoiceProvider::Openai => parsed_cfg
+                    .as_ref()
+                    .and_then(|c| c.openai.as_ref().map(|o| o.model.as_str()))
+                    .unwrap_or("gpt-4o-realtime-preview"),
+            };
+
+            if let Err(e) = verify_provider_credential(
+                provider_enum,
+                &fresh.secret,
+                target_model,
+                &matched_voice,
+                verify_override.as_deref(),
+            )
+            .await
+            {
+                let err = serde_json::json!({
+                    "status": "error",
+                    "message": format!(
+                        "Проверка {} не пройдена ({e:#}). Текущий активный движок сохранён без изменений.",
+                        provider_enum.name()
+                    )
+                });
+                return self.send_json_status(stream, "400 Bad Request", &err).await;
+            }
+        }
 
         let config_path = self.resolve_config_path();
         if let Some(ref path) = config_path {
@@ -1156,7 +1327,7 @@ impl ControlCenterServer {
                 "status": "ok",
                 "provider": target_provider,
                 "voice": matched_voice,
-                "message": format!("Модель {} ({}) применена. Ассистент перезапускается...", target_provider, matched_voice)
+                "message": format!("Активен {} ({}). Применяем настройки...", provider_enum.name(), matched_voice)
             }),
         )
         .await
@@ -4056,9 +4227,10 @@ impl ControlCenterServer {
             },
         );
 
+        let client_id = self.client_id.read().await.clone();
         let url = format!(
             "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&state={}&scope={}&code_challenge_method=S256&code_challenge={}",
-            urlencoding::encode(&self.client_id),
+            urlencoding::encode(&client_id),
             urlencoding::encode(redirect_uri),
             urlencoding::encode(&state),
             urlencoding::encode(SPOTIFY_SCOPES),
@@ -4118,12 +4290,13 @@ impl ControlCenterServer {
                 .context("Expired or invalid OAuth state")?;
             (pending.verifier, pending.redirect_uri)
         };
+        let client_id = self.client_id.read().await.clone();
 
         let params = [
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", &redirect_uri),
-            ("client_id", &self.client_id),
+            ("client_id", &client_id),
             ("code_verifier", &verifier),
         ];
 
@@ -4158,11 +4331,660 @@ impl ControlCenterServer {
             std::fs::write(path, refresh_token.as_bytes())
                 .context("Failed to save spotify refresh token")?;
         }
+        let store = self.resolve_credentials_store();
+        let _ = store.set_spotify(SpotifyCredentials {
+            client_id: Some(client_id.clone()),
+            refresh_token: Some(refresh_token.clone()),
+            account_label: None,
+        });
 
-        let new_client = SpotifyApiClient::new(self.client_id.clone(), refresh_token);
+        let new_client = SpotifyApiClient::new(client_id, refresh_token);
         *self.spotify_client.write().await = Some(new_client);
 
         Ok(())
+    }
+
+    async fn handle_api_auth_status(&self, stream: &mut TcpStream) -> Result<()> {
+        let cred_store = self.resolve_credentials_store();
+        let parsed_cfg = self
+            .resolve_config_path()
+            .and_then(|p| Config::load_from(Some(&p)).ok());
+        let mut summary = cred_store.auth_summary(parsed_cfg.as_ref());
+        let active_sp_id = self.client_id.read().await.clone();
+        if !summary.spotify.client_id_set && !active_sp_id.trim().is_empty() {
+            summary.spotify.client_id_set = true;
+            summary.spotify.masked_client_id = Some(crate::credentials::mask_secret(&active_sp_id));
+        }
+        if !summary.spotify.has_refresh_token && self.spotify_client.read().await.is_some() {
+            summary.spotify.has_refresh_token = true;
+        }
+        let voice_runtime = self.voice_runtime_state.read().await.clone();
+        let (active_provider, active_voice) = self.read_current_voice_and_provider();
+        let active_devices = self.pending_openai_device.read().await.len();
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "active_provider": active_provider,
+                "active_voice": active_voice,
+                "voice_runtime": voice_runtime,
+                "auth": summary,
+                "openai_device_sessions": active_devices,
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_auth_key(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct AuthKeyReq {
+            provider: String,
+            #[serde(default)]
+            secret: Option<String>,
+            #[serde(default)]
+            api_key: Option<String>,
+            #[serde(default)]
+            client_id: Option<String>,
+            #[serde(default)]
+            verify: Option<bool>,
+        }
+
+        let req: AuthKeyReq = serde_json::from_str(body).context("Invalid JSON body")?;
+        let provider_norm = req.provider.trim().to_ascii_lowercase();
+        let store = self.resolve_credentials_store();
+        let parsed_cfg = self
+            .resolve_config_path()
+            .and_then(|p| Config::load_from(Some(&p)).ok());
+
+        if provider_norm == "spotify" {
+            let cid = req
+                .client_id
+                .or(req.secret)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if cid.is_empty() {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": "Укажите непустой Spotify Client ID"
+                        }),
+                    )
+                    .await;
+            }
+            let mut cur = store.load().unwrap_or_default().spotify.unwrap_or_default();
+            cur.client_id = Some(cid.clone());
+            store.set_spotify(cur)?;
+            *self.client_id.write().await = cid;
+            return self
+                .send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "provider": "spotify",
+                        "message": "Spotify Client ID сохранён. Теперь нажмите «Войти через Spotify»."
+                    }),
+                )
+                .await;
+        }
+
+        let prov = match provider_norm.as_str() {
+            "openai" => VoiceProvider::Openai,
+            "gemini" => VoiceProvider::Gemini,
+            _ => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": "Провайдер должен быть openai, gemini или spotify"
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        let key = req
+            .secret
+            .or(req.api_key)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if key.is_empty() {
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "API-ключ не может быть пустым"
+                    }),
+                )
+                .await;
+        }
+
+        let verify_override = self.verify_endpoint_override.read().await.clone();
+        let should_verify =
+            req.verify.unwrap_or(true) && (self.run_live_handshake || verify_override.is_some());
+        let mut verified = false;
+        if should_verify {
+            let (target_model, default_voice) = match prov {
+                VoiceProvider::Gemini => (
+                    parsed_cfg
+                        .as_ref()
+                        .and_then(|c| c.gemini.as_ref().map(|g| g.model.as_str()))
+                        .unwrap_or("models/gemini-3.8-live"),
+                    "Aoede",
+                ),
+                VoiceProvider::Openai => (
+                    parsed_cfg
+                        .as_ref()
+                        .and_then(|c| c.openai.as_ref().map(|o| o.model.as_str()))
+                        .unwrap_or("gpt-4o-realtime-preview"),
+                    "alloy",
+                ),
+            };
+            if let Err(e) = verify_provider_credential(
+                prov,
+                &key,
+                target_model,
+                default_voice,
+                verify_override.as_deref(),
+            )
+            .await
+            {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Проверка ключа {} не пройдена: {e:#}", prov.name())
+                        }),
+                    )
+                    .await;
+            }
+            verified = true;
+        }
+
+        store.set_provider(
+            prov,
+            ProviderCredentials {
+                auth_mode: AuthMode::ApiKey,
+                api_key: Some(key.clone()),
+                access_token: None,
+                refresh_token: None,
+                client_id: None,
+                expires_at: None,
+                account_label: None,
+            },
+        )?;
+
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "provider": provider_norm,
+                "verified": verified,
+                "masked_hint": crate::credentials::mask_secret(&key),
+                "message": format!("Ключ {} сохранён{}", prov.name(), if verified { " и проверен" } else { "" })
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_auth_logout(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LogoutReq {
+            provider: String,
+        }
+        let req: LogoutReq = serde_json::from_str(body).context("Invalid JSON body")?;
+        let store = self.resolve_credentials_store();
+        match req.provider.trim().to_ascii_lowercase().as_str() {
+            "openai" => {
+                store.clear_provider(VoiceProvider::Openai)?;
+                self.pending_openai_device.write().await.clear();
+            }
+            "gemini" => {
+                store.clear_provider(VoiceProvider::Gemini)?;
+            }
+            "spotify" => {
+                store.clear_spotify()?;
+                *self.spotify_client.write().await = None;
+                if let Some(ref tp) = self.token_path {
+                    let _ = std::fs::remove_file(tp);
+                }
+            }
+            other => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "status": "error",
+                            "message": format!("Неизвестный провайдер: {other}")
+                        }),
+                    )
+                    .await;
+            }
+        }
+        self.send_json(
+            stream,
+            &serde_json::json!({
+                "status": "ok",
+                "message": "Учётные данные удалены из хранилища устройства"
+            }),
+        )
+        .await
+    }
+
+    async fn handle_api_openai_device_start(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct DeviceStartReq {
+            client_id: Option<String>,
+        }
+        let req: DeviceStartReq = if body.trim().is_empty() {
+            DeviceStartReq::default()
+        } else {
+            serde_json::from_str(body).unwrap_or_default()
+        };
+
+        match start_openai_device_auth(
+            req.client_id.as_deref(),
+            self.openai_auth_base_override.as_deref(),
+        )
+        .await
+        {
+            Ok(sess) => {
+                let sid = sess.session_id.clone();
+                let mut map = self.pending_openai_device.write().await;
+                map.retain(|_, v| v.created_at.elapsed() < Duration::from_secs(900));
+                map.insert(sid, sess.clone());
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "session_id": sess.session_id,
+                        "user_code": sess.user_code,
+                        "verification_url": sess.verification_url,
+                        "interval_secs": sess.interval_secs,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "502 Bad Gateway",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("{e:#}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_openai_device_poll(
+        &self,
+        stream: &mut TcpStream,
+        query: Option<&str>,
+    ) -> Result<()> {
+        let params = parse_query(query.unwrap_or(""));
+        let session_id = params.get("session_id").cloned().unwrap_or_default();
+        let sess = {
+            let map = self.pending_openai_device.read().await;
+            map.get(&session_id).cloned()
+        };
+        let Some(session) = sess else {
+            return self
+                .send_json_status(
+                    stream,
+                    "404 Not Found",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "Сессия входа OpenAI не найдена или истекла"
+                    }),
+                )
+                .await;
+        };
+
+        let store = self.resolve_credentials_store();
+        let verify_override = self.verify_endpoint_override.read().await.clone();
+        match poll_openai_device_auth(
+            &session,
+            &store,
+            self.openai_auth_base_override.as_deref(),
+            if self.run_live_handshake || verify_override.is_some() {
+                verify_override.as_deref()
+            } else {
+                None
+            },
+        )
+        .await
+        {
+            Ok(DevicePollOutcome::Pending { interval_secs }) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "pending",
+                        "interval_secs": interval_secs
+                    }),
+                )
+                .await
+            }
+            Ok(DevicePollOutcome::Expired) => {
+                self.pending_openai_device.write().await.remove(&session_id);
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "expired",
+                        "message": "Срок кода OpenAI истёк — запросите новый код"
+                    }),
+                )
+                .await
+            }
+            Ok(DevicePollOutcome::Authorized {
+                account_label,
+                realtime_verified,
+                realtime_detail,
+            }) => {
+                self.pending_openai_device.write().await.remove(&session_id);
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "authorized",
+                        "account_label": account_label,
+                        "realtime_verified": realtime_verified,
+                        "realtime_detail": realtime_detail,
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("{e:#}")
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_openai_pkce_login(
+        &self,
+        stream: &mut TcpStream,
+        query: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<()> {
+        let params = parse_query(query.unwrap_or(""));
+        let mode = params.get("mode").map(String::as_str).unwrap_or("lan");
+        let want_json = params.get("json").is_some_and(|v| v == "1" || v == "true");
+        let client_id = params
+            .get("client_id")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(default_openai_client_id);
+
+        let redirect_uri = if mode == "loopback" {
+            "http://localhost:1455/auth/callback".to_string()
+        } else if let Some(h) = host.filter(|s| !s.is_empty()) {
+            format!("http://{h}/api/v1/auth/openai/callback")
+        } else {
+            "http://localhost:1455/auth/callback".to_string()
+        };
+
+        let (auth_url, state, pending) = build_openai_pkce_authorize_url(
+            &client_id,
+            &redirect_uri,
+            self.openai_auth_base_override.as_deref(),
+        );
+        {
+            let mut map = self.pending_openai_pkce.write().await;
+            map.retain(|_, v| v.created_at.elapsed() < Duration::from_secs(600));
+            map.insert(state.clone(), pending);
+        }
+
+        if want_json {
+            self.send_json(
+                stream,
+                &serde_json::json!({
+                    "status": "ok",
+                    "authorize_url": auth_url,
+                    "state": state,
+                    "redirect_uri": redirect_uri,
+                }),
+            )
+            .await
+        } else {
+            let redirect_header = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {auth_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(redirect_header.as_bytes()).await?;
+            Ok(())
+        }
+    }
+
+    async fn finish_openai_pkce(
+        &self,
+        code: &str,
+        state: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let pending = {
+            let mut map = self.pending_openai_pkce.write().await;
+            match state {
+                Some(s) => map.remove(s),
+                None if map.len() == 1 => {
+                    let key = map.keys().next().cloned();
+                    key.and_then(|k| map.remove(&k))
+                }
+                _ => None,
+            }
+        }
+        .context("OAuth state не найден или устарел")?;
+
+        let base = openai_auth_base_url(self.openai_auth_base_override.as_deref());
+        let (access_token, refresh_token, expires_in, account_label) =
+            exchange_openai_code_for_tokens(
+                &base,
+                &pending.client_id,
+                code,
+                &pending.redirect_uri,
+                Some(&pending.verifier),
+            )
+            .await?;
+
+        let expires_at = expires_in.map(|s| now_unix_secs().saturating_add(s));
+        let store = self.resolve_credentials_store();
+        store.set_provider(
+            VoiceProvider::Openai,
+            ProviderCredentials {
+                auth_mode: AuthMode::Oauth,
+                api_key: None,
+                access_token: Some(access_token.clone()),
+                refresh_token,
+                client_id: Some(pending.client_id),
+                expires_at,
+                account_label: account_label.clone(),
+            },
+        )?;
+
+        let verify_override = self.verify_endpoint_override.read().await.clone();
+        let (realtime_verified, realtime_detail) =
+            if self.run_live_handshake || verify_override.is_some() {
+                match verify_provider_credential(
+                    VoiceProvider::Openai,
+                    &access_token,
+                    "gpt-4o-realtime-preview",
+                    "alloy",
+                    verify_override.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(format!("{e:#}"))),
+                }
+            } else {
+                (true, None)
+            };
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "account_label": account_label,
+            "realtime_verified": realtime_verified,
+            "realtime_detail": realtime_detail,
+        }))
+    }
+
+    async fn handle_api_openai_pkce_callback(
+        &self,
+        stream: &mut TcpStream,
+        query: Option<&str>,
+    ) -> Result<()> {
+        let params = parse_query(query.unwrap_or(""));
+        let code = params.get("code").map(String::as_str);
+        let state = params.get("state").map(String::as_str);
+        match code {
+            Some(c) => match self.finish_openai_pkce(c, state).await {
+                Ok(_) => {
+                    let redirect = "HTTP/1.1 302 Found\r\nLocation: /?status=openai_success\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    stream.write_all(redirect.as_bytes()).await?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let html = format!(
+                        "<h1>Ошибка входа OpenAI</h1><p>{e:#}</p><p><a href='/'>Назад</a></p>"
+                    );
+                    self.send_response(
+                        stream,
+                        "400 Bad Request",
+                        "text/html; charset=utf-8",
+                        html.as_bytes(),
+                    )
+                    .await
+                }
+            },
+            None => {
+                self.send_response(stream, "400 Bad Request", "text/plain", b"Missing code")
+                    .await
+            }
+        }
+    }
+
+    async fn handle_api_openai_pkce_complete(
+        &self,
+        stream: &mut TcpStream,
+        body: &str,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct CompleteReq {
+            input: String,
+        }
+        let req: CompleteReq = serde_json::from_str(body).context("Invalid JSON body")?;
+        let (code, state) = match parse_pasted_oauth_callback(&req.input) {
+            Ok(res) => res,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({ "status": "error", "message": format!("{e:#}") }),
+                    )
+                    .await;
+            }
+        };
+        match self.finish_openai_pkce(&code, state.as_deref()).await {
+            Ok(resp) => self.send_json(stream, &resp).await,
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({ "status": "error", "message": format!("{e:#}") }),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_api_spotify_complete(&self, stream: &mut TcpStream, body: &str) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct CompleteReq {
+            input: String,
+        }
+        let req: CompleteReq = serde_json::from_str(body).context("Invalid JSON body")?;
+        let (code, state_opt) = match parse_pasted_oauth_callback(&req.input) {
+            Ok(res) => res,
+            Err(e) => {
+                return self
+                    .send_json_status(
+                        stream,
+                        "400 Bad Request",
+                        &serde_json::json!({ "status": "error", "message": format!("{e:#}") }),
+                    )
+                    .await;
+            }
+        };
+        let state = match state_opt {
+            Some(s) => s,
+            None => {
+                let auths = self.pending_auths.read().await;
+                if auths.len() == 1 {
+                    auths.keys().next().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        if state.is_empty() {
+            return self
+                .send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": "Вставьте полную ссылку редиректа (с параметрами code и state)"
+                    }),
+                )
+                .await;
+        }
+        match self.exchange_code_for_token(&code, &state).await {
+            Ok(()) => {
+                self.send_json(
+                    stream,
+                    &serde_json::json!({
+                        "status": "ok",
+                        "message": "Spotify успешно авторизован!"
+                    }),
+                )
+                .await
+            }
+            Err(e) => {
+                self.send_json_status(
+                    stream,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": format!("{e:#}")
+                    }),
+                )
+                .await
+            }
+        }
     }
 
     async fn send_not_found(&self, stream: &mut TcpStream) -> Result<()> {
@@ -7289,6 +8111,431 @@ channels = 1
         let updated_cfg = std::fs::read_to_string(&cfg_file).unwrap();
         assert!(updated_cfg.contains("provider = \"openai\""));
 
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_phase3_auth_provider_toggle_and_verify() {
+        use base64::Engine as _;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("mini_test_p3_auth_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_file = temp_dir.join("config.toml");
+        std::fs::write(
+            &cfg_file,
+            r#"[assistant]
+name = "Мини"
+provider = "gemini"
+voice = "Aoede"
+languages = ["ru-RU"]
+
+[gemini]
+model = "models/gemini-3.8-live"
+
+[openai]
+model = "gpt-4o-realtime-preview"
+
+[audio]
+capture_device = "hw:0,2"
+playback_device = "default"
+sample_rate = 16000
+channels = 1
+"#,
+        )
+        .unwrap();
+
+        // Mock auth.openai.com HTTP server (deviceauth + oauth/token)
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth_addr = auth_listener.local_addr().unwrap();
+        let auth_poll_counter = poll_count.clone();
+        let (mock_stop_tx, mut mock_stop_rx) = tokio::sync::watch::channel(false);
+        let auth_mock_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = mock_stop_rx.changed() => break,
+                    accept_res = auth_listener.accept() => {
+                        let Ok((mut s, _)) = accept_res else { break; };
+                        let counter = auth_poll_counter.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 8192];
+                            let n = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                s.read(&mut buf),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let target = req
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .unwrap_or("");
+                            let (status, body) = if target.contains("/api/accounts/deviceauth/usercode") {
+                                (
+                                    "200 OK",
+                                    serde_json::json!({
+                                        "device_auth_id": "dev-auth-p3",
+                                        "user_code": "P3CD-9876",
+                                        "interval": "1"
+                                    })
+                                    .to_string(),
+                                )
+                            } else if target.contains("/api/accounts/deviceauth/token") {
+                                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                                if attempt == 0 {
+                                    (
+                                        "403 Forbidden",
+                                        serde_json::json!({
+                                            "error": { "code": "authorization_pending" }
+                                        })
+                                        .to_string(),
+                                    )
+                                } else {
+                                    (
+                                        "200 OK",
+                                        serde_json::json!({
+                                            "authorization_code": "code-from-device-flow",
+                                            "code_verifier": "verifier-from-device-flow"
+                                        })
+                                        .to_string(),
+                                    )
+                                }
+                            } else if target.contains("/oauth/token") {
+                                let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode(br#"{"alg":"none","typ":"JWT"}"#);
+                                let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode(br#"{"email":"tester@example.com"}"#);
+                                let id_token = format!("{header}.{payload}.sig");
+                                (
+                                    "200 OK",
+                                    serde_json::json!({
+                                        "access_token": "oa-oauth-access-secret-9999",
+                                        "refresh_token": "oa-oauth-refresh-secret-8888",
+                                        "id_token": id_token,
+                                        "expires_in": 3600
+                                    })
+                                    .to_string(),
+                                )
+                            } else {
+                                ("404 Not Found", r#"{"error":"not_found"}"#.to_string())
+                            };
+                            let resp = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = s.write_all(resp.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        // Mock OpenAI Realtime WebSocket verifier server
+        let ws_should_fail = Arc::new(AtomicBool::new(true));
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let ws_fail_flag = ws_should_fail.clone();
+        let mut ws_stop_rx = mock_stop_tx.subscribe();
+        let ws_mock_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = ws_stop_rx.changed() => break,
+                    accept_res = ws_listener.accept() => {
+                        let Ok((stream, _)) = accept_res else { break; };
+                        let fail_now = ws_fail_flag.load(Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                                return;
+                            };
+                            if fail_now {
+                                let _ = ws
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                                        r#"{"type":"error","error":{"message":"insufficient_quota"}}"#
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                let _ = ws.close(None).await;
+                                return;
+                            }
+                            let _ = ws
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    r#"{"type":"session.created","session":{"id":"sess_mock"}}"#
+                                        .to_string(),
+                                ))
+                                .await;
+                            while let Some(Ok(msg)) = ws.next().await {
+                                if msg.is_text() {
+                                    let _ = ws
+                                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                                            r#"{"type":"session.updated","session":{"id":"sess_mock"}}"#
+                                                .to_string(),
+                                        ))
+                                        .await;
+                                    break;
+                                }
+                            }
+                            let _ = ws.close(None).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let cred_store = CredentialsStore::new(temp_dir.join("credentials.json"));
+        let runtime_state = Arc::new(RwLock::new(VoiceRuntimeState::new("connected", None)));
+        let auth_manager = Arc::new(AuthManager::new(Some("owner-p3-secret".into())));
+        let (_, cal_token) = auth_manager.issue_calibration_token(
+            "calib_p3_agent".into(),
+            Duration::from_secs(3600),
+            crate::web::auth::Scope::all(),
+            crate::web::auth::CalibrationLease {
+                max_volume_pct: 50,
+                ..Default::default()
+            },
+        );
+        let cal_secret = cal_token.token;
+
+        let srv = Arc::new(
+            ControlCenterServer::new(
+                Some(cfg_file.clone()),
+                String::new(),
+                "http://127.0.0.1:8080/spotify/callback".into(),
+                Arc::new(RwLock::new(None)),
+                None,
+                Arc::new(MusicDucker::new()),
+            )
+            .with_auth_manager(auth_manager)
+            .with_credentials_store(cred_store.clone())
+            .with_voice_runtime_state(runtime_state)
+            .with_openai_auth_base_override(format!("http://{auth_addr}"))
+            .with_verify_endpoint_override(format!("ws://{ws_addr}/v1/realtime")),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _ = srv.run(listener, shutdown_rx).await;
+        });
+
+        async fn send_raw(addr: std::net::SocketAddr, req: &str) -> (u16, String) {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            let txt = String::from_utf8_lossy(&buf);
+            let code = txt
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let body = txt.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            (code, body)
+        }
+
+        async fn send_json_req(addr: std::net::SocketAddr, req: &str) -> (u16, serde_json::Value) {
+            let (code, body) = send_raw(addr, req).await;
+            (code, serde_json::from_str(&body).unwrap_or_default())
+        }
+
+        // 1. Anonymous (401) & Calibration token (403) cannot access /api/v1/auth/*
+        for (method, path, body) in [
+            ("GET", "/api/v1/auth/status", None),
+            (
+                "POST",
+                "/api/v1/auth/key",
+                Some(r#"{"provider":"spotify","client_id":"cid"}"#),
+            ),
+            ("POST", "/api/v1/auth/openai/device/start", Some("{}")),
+        ] {
+            let anon_req = match body {
+                Some(b) => format!(
+                    "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                    b.len()
+                ),
+                None => format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+            };
+            let (code_anon, _) = send_json_req(addr, &anon_req).await;
+            assert_eq!(code_anon, 401, "expected 401 anon on {method} {path}");
+
+            let cal_req = match body {
+                Some(b) => format!(
+                    "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {cal_secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                    b.len()
+                ),
+                None => format!(
+                    "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {cal_secret}\r\nConnection: close\r\n\r\n"
+                ),
+            };
+            let (code_cal, _) = send_json_req(addr, &cal_req).await;
+            assert_eq!(code_cal, 403, "expected 403 calib on {method} {path}");
+        }
+
+        // 2. Rejected WS handshake prevents POST /api/v1/auth/key and keeps Gemini in config.toml
+        let bad_key_body = r#"{"provider":"openai","api_key":"sk-proj-bad-key-12345"}"#;
+        let (code, err_key) = send_json_req(
+            addr,
+            &format!(
+                "POST /api/v1/auth/key HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bad_key_body}",
+                bad_key_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 400);
+        assert_eq!(err_key["status"], "error");
+
+        // 3. Device Code Flow: start -> poll (pending -> authorized), saving OAuth credentials
+        let (code, start_resp) = send_json_req(
+            addr,
+            &format!(
+                "POST /api/v1/auth/openai/device/start HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(start_resp["user_code"], "P3CD-9876");
+        let sid = start_resp["session_id"].as_str().unwrap().to_string();
+
+        let (code, poll1) = send_json_req(
+            addr,
+            &format!(
+                "GET /api/v1/auth/openai/device/poll?session_id={sid} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(poll1["status"], "pending");
+
+        let (code, poll2) = send_json_req(
+            addr,
+            &format!(
+                "GET /api/v1/auth/openai/device/poll?session_id={sid} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(poll2["status"], "authorized");
+        assert_eq!(poll2["account_label"], "tester@example.com");
+        // First mock WS still rejects, so pre-switch/realtime verification stays honest
+        assert_eq!(poll2["realtime_verified"], false);
+
+        // 4. Switching provider while mock WS fails rejects cleanly (400) and keeps provider = "gemini"
+        let switch_body = r#"{"provider":"openai","voice":"alloy"}"#;
+        let (code, switch_err) = send_json_req(
+            addr,
+            &format!(
+                "POST /api/v1/voice HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{switch_body}",
+                switch_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 400);
+        assert_eq!(switch_err["status"], "error");
+        let cfg_before = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(cfg_before.contains("provider = \"gemini\""));
+
+        // 5. Once mock WS passes handshake, POST /api/v1/voice switches mutually exclusively to openai
+        ws_should_fail.store(false, Ordering::SeqCst);
+        let (code, switch_ok) = send_json_req(
+            addr,
+            &format!(
+                "POST /api/v1/voice HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{switch_body}",
+                switch_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(switch_ok["provider"], "openai");
+        assert_eq!(switch_ok["voice"], "alloy");
+        let cfg_after = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(cfg_after.contains("provider = \"openai\""));
+        assert!(!cfg_after.contains("provider = \"gemini\""));
+
+        // 6. Save Spotify Client ID and inspect masked /api/v1/auth/status
+        let sp_body = r#"{"provider":"spotify","client_id":"spotify-client-id-123456"}"#;
+        let (code, sp_ok) = send_json_req(
+            addr,
+            &format!(
+                "POST /api/v1/auth/key HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sp_body}",
+                sp_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(sp_ok["provider"], "spotify");
+
+        let (code, auth_st) = send_json_req(
+            addr,
+            &format!(
+                "GET /api/v1/auth/status HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(auth_st["active_provider"], "openai");
+        assert_eq!(auth_st["auth"]["openai"]["configured"], true);
+        assert_eq!(
+            auth_st["auth"]["openai"]["account_label"],
+            "tester@example.com"
+        );
+        assert_eq!(auth_st["auth"]["spotify"]["client_id_set"], true);
+        let auth_st_str = auth_st.to_string();
+        assert!(!auth_st_str.contains("oa-oauth-access-secret-9999"));
+        assert!(!auth_st_str.contains("oa-oauth-refresh-secret-8888"));
+        assert!(!auth_st_str.contains("spotify-client-id-123456"));
+
+        // 7. Logout clears OpenAI credentials
+        let logout_body = r#"{"provider":"openai"}"#;
+        let (code, logout_ok) = send_json_req(
+            addr,
+            &format!(
+                "POST /api/v1/auth/logout HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{logout_body}",
+                logout_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(logout_ok["status"], "ok");
+
+        let (code, auth_after_logout) = send_json_req(
+            addr,
+            &format!(
+                "GET /api/v1/auth/status HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer owner-p3-secret\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(auth_after_logout["auth"]["openai"]["configured"], false);
+
+        // 8. Dashboard HTML serves mutually exclusive switcher & UI login controls
+        let (code, html) = send_raw(
+            addr,
+            &format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(html.contains("Кто отвечает сейчас"));
+        assert!(html.contains("tab-gemini"));
+        assert!(html.contains("tab-openai"));
+        assert!(html.contains("startOpenAiDeviceLogin"));
+        assert!(html.contains("saveSpotifyClientId"));
+
+        let _ = mock_stop_tx.send(true);
+        let _ = auth_mock_task.await;
+        let _ = ws_mock_task.await;
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_dir_all(&temp_dir);

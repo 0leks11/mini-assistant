@@ -403,9 +403,32 @@ async fn main() -> Result<()> {
                     }
                 });
             let cred_store = credentials::CredentialsStore::for_config(cfg_path_buf.as_deref());
-            let voice = config.voice_settings_with_store(&cred_store)?;
+            let mut voice = config.voice_settings_with_store(&cred_store)?;
             let provider = voice.provider;
-            let cloud_api_key = voice.api_key.clone();
+            let cfg_key_fallback = match provider {
+                VoiceProvider::Gemini => config.gemini.as_ref().and_then(|g| g.api_key.as_deref()),
+                VoiceProvider::Openai => config.openai.as_ref().and_then(|o| o.api_key.as_deref()),
+            };
+            let cloud_api_key = if let Some(resolved) =
+                cred_store.resolve_voice_credential(provider, cfg_key_fallback)
+            {
+                match web::auth_providers::ensure_fresh_voice_credential(
+                    provider,
+                    resolved,
+                    &cred_store,
+                    None,
+                )
+                .await
+                {
+                    Ok(fresh) => Some(fresh.secret),
+                    Err(e) => {
+                        warn!("OAuth token refresh check error: {:#}", e);
+                        voice.api_key.take()
+                    }
+                }
+            } else {
+                voice.api_key.clone()
+            };
             if cloud_api_key.is_none() {
                 warn!(
                     "{} is not configured; Web UI :8080 and local services will start in setup mode",
