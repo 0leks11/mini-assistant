@@ -914,6 +914,9 @@
         <button class="sp-btn sp-btn-play" id="btn-sp-playpause" onclick="spTogglePlay()">⏯️ Плей/Пауза</button>
         <button class="sp-btn" onclick="spAction('next')">⏭️</button>
       </div>
+      <button class="sp-btn" id="btn-sp-activate" onclick="spActivate()" style="display: none; width: 100%; border-color: #1db954; color: #1db954; font-weight: 600;">
+        🔊 Переключить Spotify на GPT Mini
+      </button>
     </div>
   </div>
 
@@ -1063,10 +1066,35 @@
 
   async function spAction(action) {
     try {
-      await fetch("/api/spotify/" + action, { method: "POST" });
+      const res = await fetch("/api/spotify/" + action, { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || (data && data.status === "error")) {
+        showToast((data && data.message) || "Ошибка управления Spotify");
+      } else if (data && data.message && action !== "pause") {
+        showToast(data.message);
+      }
       setTimeout(fetchStatus, 300);
     } catch (e) {
       console.error(e);
+    }
+  }
+
+  async function spActivate() {
+    const btn = document.getElementById("btn-sp-activate");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch("/api/spotify/activate", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || (data && data.status === "error")) {
+        showToast((data && data.message) || "Не удалось переключить на GPT Mini");
+      } else {
+        showToast((data && data.message) || "GPT Mini активна в Spotify");
+      }
+      setTimeout(fetchStatus, 250);
+    } catch (e) {
+      showToast("Ошибка: " + e.message);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -1151,9 +1179,34 @@
 
       // Spotify
       if (data.spotify) {
+        const spBadge = document.getElementById("spotify-login-status");
+        const spActivateBtn = document.getElementById("btn-sp-activate");
+        const reachable = data.spotify.reachable !== undefined ? !!data.spotify.reachable : !!data.spotify.authorized;
+        const activeOnMini = !!data.spotify.is_active;
+
+        if (spBadge) {
+          if (!reachable) {
+            spBadge.innerText = "Не подключена";
+            spBadge.style.color = "#8b949e";
+          } else if (activeOnMini) {
+            spBadge.innerText = "Активна на Mini";
+            spBadge.style.color = "#1db954";
+          } else {
+            spBadge.innerText = "Другое устройство";
+            spBadge.style.color = "#d29922";
+          }
+        }
+        if (spActivateBtn) {
+          spActivateBtn.style.display = (reachable && !activeOnMini) ? "block" : "none";
+        }
         if (data.spotify.track) {
           document.getElementById("sp-track-title").innerText = data.spotify.track;
           document.getElementById("sp-track-artist").innerText = data.spotify.artist || "Spotify";
+        } else {
+          document.getElementById("sp-track-title").innerText = "Трек не воспроизводится";
+          document.getElementById("sp-track-artist").innerText = (reachable && !activeOnMini)
+            ? "Сейчас выбрано другое устройство — нажмите «Переключить» или «Играть»"
+            : "Spotify Soloist готов к подключению";
         }
         isSpotifyPlaying = !!data.spotify.is_playing;
         document.getElementById("btn-sp-playpause").innerText = isSpotifyPlaying ? "⏸️ Пауза" : "▶️ Играть";

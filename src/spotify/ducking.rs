@@ -6,7 +6,7 @@
 //! restoration if the user explicitly changed volume or paused).
 
 use crate::audio::volume;
-use crate::spotify::{PlaybackState, SoloistClient};
+use crate::spotify::SoloistClient;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::time::{sleep, Duration};
 use tracing::info;
@@ -53,7 +53,7 @@ impl MusicDucker {
         // Query status from Soloist to check playback state and volume
         let status = soloist.get_status().await;
         let is_playing = match &status {
-            Ok(s) => s.state == PlaybackState::Playing,
+            Ok(s) => s.is_actually_playing(),
             Err(_) => false,
         };
 

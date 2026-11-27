@@ -11,7 +11,10 @@
 use crate::audio::volume;
 use crate::spotify::crypto::pkce_code_challenge;
 use crate::spotify::web_api::SpotifyApiClient;
-use crate::spotify::{MusicDucker, PlaybackState, SoloistClient};
+use crate::spotify::{
+    ensure_local_device_active, handle_web_playback_action, MusicDucker, PlaybackState,
+    SoloistClient, WebSpotifyAction,
+};
 use crate::wakeword::enrollment::{decode_wav_pcm16, EnrollmentSession, HardwareRecorder};
 pub mod auth;
 use auth::{AuthManager, CalibrationLease, RequestIdentity, Scope};
@@ -878,42 +881,29 @@ impl ControlCenterServer {
                 self.handle_spotify_callback(&mut stream, query).await?;
             }
 
-            // Spotify Playback API (legacy & backward-compatible)
-            ("POST", "/api/spotify/pause") => {
-                if let Some(ref soloist) = self.soloist_client {
-                    let _ = soloist.pause().await;
-                } else if let Some(client) = self.spotify_client.write().await.as_mut() {
-                    let _ = client.pause(None).await;
-                }
-                self.send_json(&mut stream, &serde_json::json!({ "status": "ok" }))
-                    .await?;
-            }
-            ("POST", "/api/spotify/play") => {
-                if let Some(ref soloist) = self.soloist_client {
-                    let _ = soloist.resume().await;
-                } else if let Some(client) = self.spotify_client.write().await.as_mut() {
-                    let _ = client.play(None, None, None).await;
-                }
-                self.send_json(&mut stream, &serde_json::json!({ "status": "ok" }))
-                    .await?;
-            }
-            ("POST", "/api/spotify/next") => {
-                if let Some(ref soloist) = self.soloist_client {
-                    let _ = soloist.next().await;
-                } else if let Some(client) = self.spotify_client.write().await.as_mut() {
-                    let _ = client.next(None).await;
-                }
-                self.send_json(&mut stream, &serde_json::json!({ "status": "ok" }))
-                    .await?;
-            }
-            ("POST", "/api/spotify/previous") => {
-                if let Some(ref soloist) = self.soloist_client {
-                    let _ = soloist.previous().await;
-                } else if let Some(client) = self.spotify_client.write().await.as_mut() {
-                    let _ = client.previous(None).await;
-                }
-                self.send_json(&mut stream, &serde_json::json!({ "status": "ok" }))
-                    .await?;
+            // Spotify Playback API (prioritizes GPT Mini receiver over external devices)
+            (
+                "POST",
+                p @ ("/api/spotify/pause"
+                | "/api/spotify/play"
+                | "/api/spotify/next"
+                | "/api/spotify/previous"
+                | "/api/spotify/activate"),
+            ) => {
+                let action = match p {
+                    "/api/spotify/pause" => WebSpotifyAction::Pause,
+                    "/api/spotify/play" => WebSpotifyAction::Play,
+                    "/api/spotify/next" => WebSpotifyAction::Next,
+                    "/api/spotify/previous" => WebSpotifyAction::Previous,
+                    _ => WebSpotifyAction::Activate,
+                };
+                let res = handle_web_playback_action(
+                    self.soloist_client.as_deref(),
+                    &self.spotify_client,
+                    action,
+                )
+                .await;
+                self.send_json(&mut stream, &serde_json::json!(res)).await?;
             }
             ("GET", "/api/spotify/status") => {
                 let is_auth = self.spotify_client.read().await.is_some();
@@ -939,6 +929,8 @@ impl ControlCenterServer {
         // Query Spotify Soloist track
         let mut spotify_info = serde_json::json!({
             "authorized": self.spotify_client.read().await.is_some(),
+            "reachable": false,
+            "is_active": false,
             "is_playing": false,
             "track": null,
             "artist": null,
@@ -946,11 +938,13 @@ impl ControlCenterServer {
 
         if let Some(ref soloist) = self.soloist_client {
             if let Ok(st) = soloist.get_status().await {
-                let is_playing = st.state == PlaybackState::Playing;
+                let is_playing = st.is_actually_playing();
                 let track_name = st.track.as_ref().map(|t| t.name.clone());
                 let artist_name = st.track.as_ref().map(|t| t.artist.clone());
                 spotify_info = serde_json::json!({
                     "authorized": true,
+                    "reachable": true,
+                    "is_active": st.is_active,
                     "is_playing": is_playing,
                     "track": track_name,
                     "artist": artist_name,
@@ -3421,6 +3415,7 @@ impl ControlCenterServer {
 
             let op_res = match action.as_str() {
                 "play" | "resume" => {
+                    ensure_local_device_active(soloist, &self.spotify_client, false).await;
                     if let Some(ref uri) = req.uri {
                         soloist.play_uri(uri).await
                     } else {
@@ -3428,8 +3423,14 @@ impl ControlCenterServer {
                     }
                 }
                 "pause" => soloist.pause().await,
-                "next" => soloist.next().await,
-                "prev" | "previous" => soloist.previous().await,
+                "next" => {
+                    ensure_local_device_active(soloist, &self.spotify_client, false).await;
+                    soloist.next().await
+                }
+                "prev" | "previous" => {
+                    ensure_local_device_active(soloist, &self.spotify_client, false).await;
+                    soloist.previous().await
+                }
                 _ => Ok(()),
             };
 
@@ -5442,6 +5443,7 @@ capture_device = "hw:0,2"
             "/api/v1/volume",
             "/api/v1/led",
             "/api/spotify/play",
+            "/api/spotify/activate",
             "/api/v1/wakeword/session/start",
             "/api/v1/acoustics/tokens",
         ];
@@ -5524,6 +5526,110 @@ capture_device = "hw:0,2"
         // Cleanup
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_http_spotify_activate_and_status_routing() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir = std::env::temp_dir().join(format!("http_sp_route_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let state_file = temp_dir.join("state.txt");
+        let ctl_path = temp_dir.join("soloist-ctl");
+        std::fs::write(&state_file, "playing false").unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+STATE_FILE="{state}"
+read CUR_STATUS CUR_ACTIVE < "$STATE_FILE"
+case "$1" in
+  now)
+    echo "{{\"type\":\"playback_state\",\"status\":\"$CUR_STATUS\",\"volume\":42,\"is_active\":$CUR_ACTIVE,\"position\":{{\"position_ms\":1000,\"speed\":0}},\"item\":{{\"uri\":\"spotify:track:1\",\"playback\":{{\"duration_ms\":180000}}}}}}"
+    ;;
+  activate)
+    echo "$CUR_STATUS true" > "$STATE_FILE"
+    ;;
+  play)
+    echo "playing $CUR_ACTIVE" > "$STATE_FILE"
+    ;;
+esac
+"#,
+            state = state_file.display()
+        );
+        std::fs::write(&ctl_path, script).unwrap();
+        let mut perms = std::fs::metadata(&ctl_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ctl_path, perms).unwrap();
+
+        let ducker = Arc::new(crate::spotify::ducking::MusicDucker::new());
+        let auth_manager = Arc::new(crate::web::auth::AuthManager::new(Some(
+            "owner-secret".to_string(),
+        )));
+        let soloist = Arc::new(SoloistClient::new(&ctl_path, "127.0.0.1:9090"));
+
+        let server = Arc::new(
+            ControlCenterServer::new(
+                None,
+                "test-client".to_string(),
+                "http://127.0.0.1:8080/spotify/callback".to_string(),
+                Arc::new(RwLock::new(None)),
+                Some(soloist),
+                ducker,
+            )
+            .with_auth_manager(auth_manager),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(server.run(listener, shutdown_rx));
+
+        async fn send_req(addr: std::net::SocketAddr, raw: &str) -> (u16, serde_json::Value) {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(raw.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.unwrap();
+            let text = String::from_utf8_lossy(&resp);
+            let status_code = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("{}");
+            (status_code, serde_json::from_str(body).unwrap_or_default())
+        }
+
+        // Before activation, MacBook is playing externally (`is_active: false`), so Mini reports not playing locally
+        let (code, st_before) = send_req(
+            local_addr,
+            &format!(
+                "GET /api/v1/status HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(st_before["spotify"]["reachable"], true);
+        assert_eq!(st_before["spotify"]["is_active"], false);
+        assert_eq!(st_before["spotify"]["is_playing"], false);
+
+        // Owner activates GPT Mini
+        let (code, act_resp) = send_req(
+            local_addr,
+            &format!(
+                "POST /api/spotify/activate HTTP/1.1\r\nHost: {local_addr}\r\nAuthorization: Bearer owner-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(act_resp["status"], "ok");
+        assert_eq!(act_resp["is_active"], true);
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]

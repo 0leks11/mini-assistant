@@ -52,9 +52,9 @@ impl SoloistStatus {
         self.duration_ms > 0 && self.position_ms + 3000 >= self.duration_ms
     }
 
-    /// True if Soloist is actively emitting audio (playing and not past track end).
+    /// True if Soloist is actively emitting audio on this device (active, playing, and not past track end).
     pub fn is_actually_playing(&self) -> bool {
-        self.state == PlaybackState::Playing && !self.is_at_eof()
+        self.is_active && self.state == PlaybackState::Playing && !self.is_at_eof()
     }
 }
 
@@ -106,6 +106,13 @@ impl SoloistClient {
     pub async fn pause(&self) -> Result<()> {
         info!("Soloist: pausing playback");
         self.run_ctl(&["pause"]).await?;
+        Ok(())
+    }
+
+    /// Claim active Spotify Connect playback status for GPT Mini.
+    pub async fn activate(&self) -> Result<()> {
+        info!("Soloist: activating GPT Mini as Spotify Connect device");
+        self.run_ctl(&["activate"]).await?;
         Ok(())
     }
 
@@ -344,6 +351,38 @@ mod tests {
         assert_eq!(status.state, PlaybackState::Playing);
         assert_eq!(status.volume, 50);
         assert!(!status.is_active);
+        assert!(!status.is_actually_playing());
         assert!(status.track.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_soloist_activate_invokes_ctl_activate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("soloist_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl_path = dir.join("soloist-ctl");
+        let args_log = dir.join("args.log");
+
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"now\" ]; then\n  echo '{{\"type\":\"playback_state\",\"status\":\"paused\",\"volume\":40,\"is_active\":true}}'\nfi\n",
+            args_log.display()
+        );
+        std::fs::write(&ctl_path, script).unwrap();
+        let mut perms = std::fs::metadata(&ctl_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ctl_path, perms).unwrap();
+
+        let client = SoloistClient::new(&ctl_path, "127.0.0.1:9090");
+        client.activate().await.expect("activate should succeed");
+        let status = client.get_status().await.expect("status should succeed");
+        assert!(status.is_active);
+
+        let recorded = std::fs::read_to_string(&args_log).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines, vec!["activate", "now --json"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

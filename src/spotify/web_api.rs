@@ -31,19 +31,24 @@ pub struct DeviceInfo {
     pub volume_percent: Option<u32>,
 }
 
+fn is_mini_device_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    name.eq_ignore_ascii_case("GPT Mini") || lower.contains("gpt-mini") || lower.contains("mini")
+}
+
+/// Returns the local GPT Mini receiver from the Spotify Connect device list, if present.
+pub fn find_mini_device(devices: &[DeviceInfo]) -> Option<&DeviceInfo> {
+    devices
+        .iter()
+        .find(|d| d.id.is_some() && is_mini_device_name(&d.name))
+}
+
 /// Selects the best target device for playback:
 /// 1. Prefer local GPT Mini ("GPT Mini" or containing "mini").
 /// 2. Prefer an already active device.
 /// 3. Fallback to any available device with an ID.
 pub fn select_target_device(devices: &[DeviceInfo]) -> Option<&DeviceInfo> {
-    devices
-        .iter()
-        .find(|d| {
-            d.id.is_some()
-                && (d.name.eq_ignore_ascii_case("GPT Mini")
-                    || d.name.to_lowercase().contains("gpt-mini")
-                    || d.name.to_lowercase().contains("mini"))
-        })
+    find_mini_device(devices)
         .or_else(|| devices.iter().find(|d| d.is_active && d.id.is_some()))
         .or_else(|| devices.iter().find(|d| d.id.is_some()))
 }
@@ -90,6 +95,12 @@ struct PlayBody<'a> {
     context_uri: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     uris: Option<&'a [&'a str]>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TransferBody<'a> {
+    device_ids: [&'a str; 1],
+    play: bool,
 }
 
 pub struct SpotifyApiClient {
@@ -437,6 +448,38 @@ impl SpotifyApiClient {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Transfer Spotify Connect playback to a specific device (`PUT /v1/me/player`).
+    pub async fn transfer_playback(&mut self, device_id: &str, play: bool) -> Result<()> {
+        let url = format!("{}/v1/me/player", self.api_base_url);
+        let body = TransferBody {
+            device_ids: [device_id],
+            play,
+        };
+        self.send_authenticated_request(reqwest::Method::PUT, &url, Some(&body))
+            .await
+            .context("Spotify transfer playback failed")
+    }
+
+    /// Locate GPT Mini in `/v1/me/player/devices` and transfer playback to it.
+    pub async fn transfer_playback_to_mini(&mut self, play: bool) -> Result<String> {
+        let devices = self.get_devices().await?;
+        let target = find_mini_device(&devices).context(
+            "Устройство GPT Mini не найдено в списке доступных устройств Spotify Connect",
+        )?;
+        let target_id = target
+            .id
+            .as_deref()
+            .context("Устройство GPT Mini не имеет device_id")?;
+        info!(
+            device_name = %target.name,
+            is_active = target.is_active,
+            play,
+            "Transferring Spotify Connect playback to GPT Mini via Web API"
+        );
+        self.transfer_playback(target_id, play).await?;
+        Ok(target_id.to_string())
     }
 
     pub async fn get_devices(&mut self) -> Result<Vec<DeviceInfo>> {
@@ -912,5 +955,72 @@ mod tests {
         let no_mini = vec![phone.clone(), macbook.clone()];
         let target2 = select_target_device(&no_mini).expect("found target");
         assert_eq!(target2.id.as_deref(), Some("macbook-id"));
+        assert!(find_mini_device(&no_mini).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_transfer_playback_to_mini_overrides_active_laptop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // 1. GET /v1/me/player/devices returns MacBook as active and GPT Mini as inactive
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("GET /v1/me/player/devices"));
+
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "devices": [
+                        { "id": "macbook-id", "name": "MacBook Pro", "is_active": true, "volume_percent": 75 },
+                        { "id": "mini-id", "name": "GPT Mini", "is_active": false, "volume_percent": 40 }
+                    ]
+                }))
+                .unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+
+            // 2. PUT /v1/me/player must explicitly transfer playback to mini-id
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("PUT /v1/me/player "));
+                let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                let parsed: serde_json::Value = serde_json::from_str(body_part).unwrap();
+                assert_eq!(parsed["device_ids"], serde_json::json!(["mini-id"]));
+                assert_eq!(parsed["play"], serde_json::json!(false));
+
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut client = SpotifyApiClient::with_custom_endpoints(
+            "client-id".into(),
+            "refresh-token".into(),
+            format!("http://{addr}/token"),
+            format!("http://{addr}"),
+        );
+        client.access_token = Some("mock-token".into());
+        client.expires_at = Some(Instant::now() + Duration::from_secs(3600));
+
+        let chosen = client
+            .transfer_playback_to_mini(false)
+            .await
+            .expect("transfer to mini should succeed");
+        assert_eq!(chosen, "mini-id");
+
+        let _ = server.await;
     }
 }
